@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "engine"
+version = "0.1.0"
+description = "Motor de ingenieria estructural (secciones de fibras, materiales, diagramas de interaccion) sobre OpenSeesPy"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "openseespy>=3.7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
