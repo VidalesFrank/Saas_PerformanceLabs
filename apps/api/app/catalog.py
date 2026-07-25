@@ -26,7 +26,7 @@ CATALOG = [
             {
                 "id": "generador-espectros",
                 "name": "Generador de espectros y parametros sismicos",
-                "nivel": "free", "estado": "idea", "route": None,
+                "nivel": "free", "estado": "en_desarrollo", "route": "/seismic",
             },
         ],
     },

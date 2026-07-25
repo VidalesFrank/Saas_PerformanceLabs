@@ -83,6 +83,17 @@ class SectionCreate(BaseModel):
     bar_id: str = "#8"
     cover_to_bar_centroid: float | None = None
 
+    # Refuerzo rectangular avanzado por cara (Section Designer)
+    corner_bar_id: str | None = None
+    n_top: int | None = None
+    bar_id_top: str | None = None
+    n_bottom: int | None = None
+    bar_id_bottom: str | None = None
+    n_left: int | None = None
+    bar_id_left: str | None = None
+    n_right: int | None = None
+    bar_id_right: str | None = None
+
 
 class SectionOut(BaseModel):
     id: str

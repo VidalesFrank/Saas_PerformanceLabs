@@ -15,7 +15,7 @@ from engine.materials.concrete import (
 )
 from engine.materials.steel import SteelMaterialParams, reinforcing_steel
 from engine.sections.geometry import CircularSection, PointFiberSpec, PolygonSection, RectangularSection
-from engine.sections.reinforcement import bar_area, circ_perimeter_bars, rect_perimeter_bars
+from engine.sections.reinforcement import bar_area, circ_perimeter_bars, rect_perimeter_bars, rect_layout_bars
 
 from app.models import ShapeType
 from app.schemas import SectionCreate

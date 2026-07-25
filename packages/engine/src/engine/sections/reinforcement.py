@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 from engine.sections.geometry import CircularSection, PointFiberSpec, RectangularSection
 
 BAR_AREAS_MM2: dict[str, float] = {
@@ -78,6 +80,55 @@ def circ_perimeter_bars(
         z = radius * math.sin(theta)
         bars.append(PointFiberSpec(mat_tag, y, z, area_per_bar))
     return bars
+
+
+def rect_layout_bars(
+    height: float,
+    width: float,
+    cover_to_bar_centroid: float,
+    corner_bar_id: str,
+    top_n: int, top_bar_id: str,
+    bottom_n: int, bottom_bar_id: str,
+    left_n: int, left_bar_id: str,
+    right_n: int, right_bar_id: str,
+    mat_tag: int,
+) -> list[PointFiberSpec]:
+    """Distribucion de refuerzo rectangular por cara (estilo Section Designer).
+    top_n/bottom_n/left_n/right_n son barras INTERIORES (sin contar esquinas)."""
+    yc = height / 2 - cover_to_bar_centroid
+    zc = width / 2 - cover_to_bar_centroid
+    fibers: list[PointFiberSpec] = []
+
+    # 4 corners
+    ca = bar_area(corner_bar_id)
+    for y, z in [(yc, zc), (yc, -zc), (-yc, zc), (-yc, -zc)]:
+        fibers.append(PointFiberSpec(mat_tag, y, z, ca))
+
+    # Top face (y = +yc), interior bars distributed between corners
+    if top_n > 0:
+        a = bar_area(top_bar_id)
+        for z in np.linspace(-zc, zc, top_n + 2)[1:-1]:
+            fibers.append(PointFiberSpec(mat_tag, yc, float(z), a))
+
+    # Bottom face (y = -yc)
+    if bottom_n > 0:
+        a = bar_area(bottom_bar_id)
+        for z in np.linspace(-zc, zc, bottom_n + 2)[1:-1]:
+            fibers.append(PointFiberSpec(mat_tag, -yc, float(z), a))
+
+    # Left face (z = -zc), interior bars
+    if left_n > 0:
+        a = bar_area(left_bar_id)
+        for y in np.linspace(-yc, yc, left_n + 2)[1:-1]:
+            fibers.append(PointFiberSpec(mat_tag, float(y), -zc, a))
+
+    # Right face (z = +zc), interior bars
+    if right_n > 0:
+        a = bar_area(right_bar_id)
+        for y in np.linspace(-yc, yc, right_n + 2)[1:-1]:
+            fibers.append(PointFiberSpec(mat_tag, float(y), zc, a))
+
+    return fibers
 
 
 def total_steel_area(bars: list[PointFiberSpec]) -> float:

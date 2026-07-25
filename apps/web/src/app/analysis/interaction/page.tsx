@@ -1,8 +1,8 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import { AppHeader } from "@/components/app-header";
-import { InteractionChart } from "@/components/interaction-chart";
+import { InteractionChart, type LoadCombination } from "@/components/interaction-chart";
 import { SectionPreview } from "@/components/section-preview";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
@@ -37,6 +37,12 @@ const DEFAULT_FORM = {
   n_bars: 8,
   bar_id: "#8",
   cover_to_bar_centroid: 52,
+  // by-face rebar designer
+  rebarMode: "uniform" as "uniform" | "perFace",
+  perFaceTop: 2,
+  perFaceBottom: 2,
+  perFaceLeft: 1,
+  perFaceRight: 1,
 };
 
 type FormState = typeof DEFAULT_FORM;
@@ -53,6 +59,60 @@ function parsePairs(text: string): [number, number][] {
     .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b));
 }
 
+function parseLoadCombinations(text: string): LoadCombination[] {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [pu, mu] = line.split(",").map((v) => parseFloat(v.trim()));
+      return { puKn: pu, muKnm: mu };
+    })
+    .filter((lc) => Number.isFinite(lc.puKn) && Number.isFinite(lc.muKnm));
+}
+
+function linspace(start: number, end: number, n: number): number[] {
+  if (n < 2) return [];
+  return Array.from({ length: n }, (_, i) => start + ((end - start) * i) / (n - 1));
+}
+
+function computeByFaceBars(
+  height: number,
+  width: number,
+  coverToBarCentroid: number,
+  topN: number,
+  bottomN: number,
+  leftN: number,
+  rightN: number,
+): [number, number][] {
+  const yc = height / 2 - coverToBarCentroid;
+  const zc = width / 2 - coverToBarCentroid;
+  const bars: [number, number][] = [];
+
+  // 4 corner bars
+  bars.push([yc, zc], [yc, -zc], [-yc, -zc], [-yc, zc]);
+
+  // Interior bars per face (slice removes corner positions)
+  if (topN > 0)
+    linspace(-zc, zc, topN + 2)
+      .slice(1, -1)
+      .forEach((z) => bars.push([yc, z]));
+  if (bottomN > 0)
+    linspace(-zc, zc, bottomN + 2)
+      .slice(1, -1)
+      .forEach((z) => bars.push([-yc, z]));
+  if (leftN > 0)
+    linspace(-yc, yc, leftN + 2)
+      .slice(1, -1)
+      .forEach((y) => bars.push([y, -zc]));
+  if (rightN > 0)
+    linspace(-yc, yc, rightN + 2)
+      .slice(1, -1)
+      .forEach((y) => bars.push([y, zc]));
+
+  return bars;
+}
+
 export default function InteractionDiagramPage() {
   const ready = useRequireAuth();
   const [form, setForm] = useState<FormState>(DEFAULT_FORM);
@@ -60,10 +120,49 @@ export default function InteractionDiagramPage() {
   const [error, setError] = useState<string | null>(null);
   const [section, setSection] = useState<SectionOut | null>(null);
   const [result, setResult] = useState<InteractionResultOut | null>(null);
+  const [loadCombsText, setLoadCombsText] = useState("");
+
+  const loadCombinations = useMemo(() => parseLoadCombinations(loadCombsText), [loadCombsText]);
 
   function update<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((f) => ({ ...f, [key]: value }));
   }
+
+  const isRectLike =
+    form.shape_type === "rectangular" || form.shape_type === "square";
+
+  const sectionWidth = form.shape_type === "square" ? form.side : form.width;
+  const sectionHeight = form.shape_type === "square" ? form.side : form.height;
+
+  const byFaceBars = useMemo(() => {
+    if (!isRectLike || form.rebarMode !== "perFace") return undefined;
+    return computeByFaceBars(
+      sectionHeight,
+      sectionWidth,
+      form.cover_to_bar_centroid,
+      form.perFaceTop,
+      form.perFaceBottom,
+      form.perFaceLeft,
+      form.perFaceRight,
+    );
+  }, [
+    isRectLike,
+    form.rebarMode,
+    sectionHeight,
+    sectionWidth,
+    form.cover_to_bar_centroid,
+    form.perFaceTop,
+    form.perFaceBottom,
+    form.perFaceLeft,
+    form.perFaceRight,
+  ]);
+
+  const byFaceVertices = useMemo((): [number, number][] | undefined => {
+    if (!isRectLike || form.rebarMode !== "perFace") return undefined;
+    const hh = sectionHeight / 2;
+    const hw = sectionWidth / 2;
+    return [[hh, hw], [hh, -hw], [-hh, -hw], [-hh, hw]];
+  }, [isRectLike, form.rebarMode, sectionHeight, sectionWidth]);
 
   function buildPayload(): SectionCreatePayload {
     const base: SectionCreatePayload = {
@@ -83,6 +182,15 @@ export default function InteractionDiagramPage() {
       is_spiral: form.is_spiral,
     };
 
+    if (isRectLike && form.rebarMode === "perFace" && byFaceBars && byFaceVertices) {
+      return {
+        ...base,
+        shape_type: "special",
+        vertices: byFaceVertices,
+        bars: byFaceBars,
+      };
+    }
+
     if (form.shape_type === "rectangular") {
       return { ...base, width: form.width, height: form.height, n_bars_y: form.n_bars_y, n_bars_z: form.n_bars_z };
     }
@@ -92,7 +200,6 @@ export default function InteractionDiagramPage() {
     if (form.shape_type === "circular") {
       return { ...base, diameter: form.diameter, n_bars: form.n_bars };
     }
-    // special
     return {
       ...base,
       vertices: parsePairs(form.verticesText),
@@ -111,7 +218,7 @@ export default function InteractionDiagramPage() {
       const createdSection = await api.post<SectionOut>("/api/v1/sections", payload);
       setSection(createdSection);
       const diagram = await api.post<InteractionResultOut>(
-        `/api/v1/sections/${createdSection.id}/interaction-diagram`
+        `/api/v1/sections/${createdSection.id}/interaction-diagram`,
       );
       setResult(diagram);
     } catch (err) {
@@ -122,6 +229,14 @@ export default function InteractionDiagramPage() {
   }
 
   if (!ready) return null;
+
+  const previewShapeType = byFaceBars ? "special" : form.shape_type;
+  const previewVertices =
+    byFaceVertices ??
+    (form.shape_type === "special" ? parsePairs(form.verticesText) : undefined);
+  const previewBars =
+    byFaceBars ??
+    (form.shape_type === "special" ? parsePairs(form.barsText) : undefined);
 
   return (
     <div className="flex flex-1 flex-col">
@@ -259,7 +374,7 @@ export default function InteractionDiagramPage() {
                         />
                       </div>
                       <div>
-                        <Label htmlFor="hoop_leg_area">Area rama estribo (mm2)</Label>
+                        <Label htmlFor="hoop_leg_area">Area rama estribo (mm²)</Label>
                         <Input
                           id="hoop_leg_area"
                           type="number"
@@ -305,9 +420,30 @@ export default function InteractionDiagramPage() {
                   </div>
 
                   <div className="border-t border-border pt-4">
-                    <p className="mb-3 text-xs font-medium uppercase tracking-wide text-text-muted">
-                      Refuerzo longitudinal
-                    </p>
+                    <div className="mb-3 flex items-center justify-between">
+                      <p className="text-xs font-medium uppercase tracking-wide text-text-muted">
+                        Refuerzo longitudinal
+                      </p>
+                      {isRectLike && (
+                        <div className="flex rounded-md border border-border overflow-hidden text-xs">
+                          {(["uniform", "perFace"] as const).map((mode) => (
+                            <button
+                              key={mode}
+                              type="button"
+                              onClick={() => update("rebarMode", mode)}
+                              className={`px-2.5 py-1 font-medium transition-colors ${
+                                form.rebarMode === mode
+                                  ? "bg-accent text-white"
+                                  : "bg-surface text-text-muted hover:text-text"
+                              }`}
+                            >
+                              {mode === "uniform" ? "Uniforme" : "Por cara"}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
                     <div className="grid grid-cols-2 gap-3">
                       <div>
                         <Label htmlFor="bar_id">Barra</Label>
@@ -325,7 +461,7 @@ export default function InteractionDiagramPage() {
                         </select>
                       </div>
                       <div>
-                        <Label htmlFor="cover_to_bar_centroid">Recub. a centroide barra (mm)</Label>
+                        <Label htmlFor="cover_to_bar_centroid">Recub. a centroide (mm)</Label>
                         <Input
                           id="cover_to_bar_centroid"
                           type="number"
@@ -333,12 +469,15 @@ export default function InteractionDiagramPage() {
                           onChange={(e) => update("cover_to_bar_centroid", +e.target.value)}
                         />
                       </div>
-                      {form.shape_type === "circular" ? (
+
+                      {form.shape_type === "circular" && (
                         <div>
                           <Label htmlFor="n_bars">Numero de barras</Label>
                           <Input id="n_bars" type="number" value={form.n_bars} onChange={(e) => update("n_bars", +e.target.value)} />
                         </div>
-                      ) : (
+                      )}
+
+                      {isRectLike && form.rebarMode === "uniform" && (
                         <>
                           <div>
                             <Label htmlFor="n_bars_y">Barras cara sup./inf.</Label>
@@ -361,6 +500,61 @@ export default function InteractionDiagramPage() {
                         </>
                       )}
                     </div>
+
+                    {isRectLike && form.rebarMode === "perFace" && (
+                      <div className="mt-3 rounded-md border border-border bg-surface-2 p-3">
+                        <p className="mb-2 text-[11px] text-text-muted">
+                          Barras interiores por cara (sin contar esquinas). Las 4 esquinas usan la barra seleccionada arriba.
+                        </p>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <Label htmlFor="perFaceTop">Cara superior</Label>
+                            <Input
+                              id="perFaceTop"
+                              type="number"
+                              min={0}
+                              value={form.perFaceTop}
+                              onChange={(e) => update("perFaceTop", +e.target.value)}
+                            />
+                          </div>
+                          <div>
+                            <Label htmlFor="perFaceBottom">Cara inferior</Label>
+                            <Input
+                              id="perFaceBottom"
+                              type="number"
+                              min={0}
+                              value={form.perFaceBottom}
+                              onChange={(e) => update("perFaceBottom", +e.target.value)}
+                            />
+                          </div>
+                          <div>
+                            <Label htmlFor="perFaceLeft">Cara izquierda</Label>
+                            <Input
+                              id="perFaceLeft"
+                              type="number"
+                              min={0}
+                              value={form.perFaceLeft}
+                              onChange={(e) => update("perFaceLeft", +e.target.value)}
+                            />
+                          </div>
+                          <div>
+                            <Label htmlFor="perFaceRight">Cara derecha</Label>
+                            <Input
+                              id="perFaceRight"
+                              type="number"
+                              min={0}
+                              value={form.perFaceRight}
+                              onChange={(e) => update("perFaceRight", +e.target.value)}
+                            />
+                          </div>
+                        </div>
+                        {byFaceBars && (
+                          <p className="mt-2 text-[11px] text-accent">
+                            Total: {byFaceBars.length} barras
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </>
               )}
@@ -381,17 +575,17 @@ export default function InteractionDiagramPage() {
             </CardHeader>
             <CardBody className="flex justify-center">
               <SectionPreview
-                shapeType={form.shape_type}
-                width={form.shape_type === "square" ? form.side : form.width}
-                height={form.shape_type === "square" ? form.side : form.height}
+                shapeType={previewShapeType}
+                width={sectionWidth}
+                height={sectionHeight}
                 diameter={form.diameter}
                 cover={form.cover}
                 coverToBarCentroid={form.cover_to_bar_centroid}
                 nBarsY={form.n_bars_y}
                 nBarsZ={form.n_bars_z}
                 nBars={form.n_bars}
-                vertices={form.shape_type === "special" ? parsePairs(form.verticesText) : undefined}
-                bars={form.shape_type === "special" ? parsePairs(form.barsText) : undefined}
+                vertices={previewVertices}
+                bars={previewBars}
               />
             </CardBody>
           </Card>
@@ -408,10 +602,22 @@ export default function InteractionDiagramPage() {
                   Completa la seccion y calcula para ver el diagrama P-M.
                 </p>
               )}
-              {loading && <p className="text-sm text-text-muted">Ejecutando analisis en OpenSees...</p>}
+              {loading && (
+                <div className="flex items-center gap-3 text-sm text-text-muted">
+                  <svg className="h-4 w-4 animate-spin text-accent" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.25" />
+                    <path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  Ejecutando analisis en OpenSees…
+                </div>
+              )}
               {result && (
                 <>
-                  <InteractionChart points={result.points} />
+                  <InteractionChart
+                    points={result.points}
+                    isSpiral={form.is_spiral}
+                    loadCombinations={loadCombinations}
+                  />
                   <dl className="mt-4 grid grid-cols-3 gap-4 border-t border-border pt-4 text-xs">
                     <div>
                       <dt className="text-text-muted">P max. compresion</dt>
@@ -427,6 +633,34 @@ export default function InteractionDiagramPage() {
                     </div>
                   </dl>
                 </>
+              )}
+            </CardBody>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <h2 className="text-sm font-medium text-text">Combinaciones de carga (Pu/Mu)</h2>
+              <p className="mt-1 text-xs text-text-muted">
+                Una combinacion por linea: Pu (kN), Mu (kN·m). Los marcadores verdes indican OK (dentro de φ·P-M), rojos indican NG.
+              </p>
+            </CardHeader>
+            <CardBody>
+              <textarea
+                value={loadCombsText}
+                onChange={(e) => setLoadCombsText(e.target.value)}
+                rows={5}
+                placeholder={"Pu (kN), Mu (kN·m)\n1200, 180\n980, 220\n1500, 120"}
+                className="w-full rounded-md border border-border bg-surface-2 px-3 py-2 font-mono text-xs text-text placeholder:text-text-muted"
+              />
+              {loadCombinations.length > 0 && !result && (
+                <p className="mt-2 text-xs text-text-muted">
+                  Calcula el diagrama primero para ver los marcadores.
+                </p>
+              )}
+              {loadCombinations.length > 0 && result && (
+                <p className="mt-2 text-xs text-accent">
+                  {loadCombinations.length} combinacion{loadCombinations.length !== 1 ? "es" : ""} activa{loadCombinations.length !== 1 ? "s" : ""} — ver marcadores en el diagrama.
+                </p>
               )}
             </CardBody>
           </Card>

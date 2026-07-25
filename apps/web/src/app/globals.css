@@ -30,22 +30,6 @@
   --color-danger: #ef4444;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --color-bg: #0b1120;
-    --color-surface: #141b2e;
-    --color-surface-2: #1a2238;
-    --color-border: #2a3350;
-    --color-text: #e7ebf5;
-    --color-text-muted: #97a1b8;
-
-    --color-accent: #2dd4e8;
-    --color-accent-strong: #67e4f2;
-    --color-warning: #f59e0b;
-    --color-success: #10b981;
-    --color-danger: #ef4444;
-  }
-}
 
 @theme inline {
   --color-bg: var(--color-bg);

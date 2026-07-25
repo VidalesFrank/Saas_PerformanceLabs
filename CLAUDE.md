@@ -137,9 +137,12 @@ pure compression P ≈ 5424 kN, pure tension P ≈ -1714 kN, M_max ≈ 379 kN·m
 
 ## Current state / next steps
 
-Foundational slice shipped: full auth flow, dashboard driven by the real product catalog, and
-one complete working module — P-M interaction diagrams for rectangular/square/circular/special
-sections. Verified end-to-end in a real browser, not just automated tests.
+Two modules shipped end-to-end:
+1. P-M interaction diagrams (rectangular/square/circular/special sections) — verified in browser.
+2. Generador de espectros NSR-10 (`/seismic`) — mapa interactivo de Colombia (Leaflet), espectros
+   Sa/Sd/Sv en SVG, exportación CSV y PDF (jsPDF + html2canvas). Base de datos de municipios en
+   `packages/engine/src/engine/seismic/nsr10_data.py` (~100 municipios por ahora, ampliar con
+   Tabla A.2.3-1 completa del NSR-10). Tests en `packages/engine/tests/test_seismic.py`.
 
 Not yet built (see `app/catalog.py` for the full roadmap with per-item status): model import
 (ETABS/SAP2000/IFC), the other analysis engines (modal/pushover/time-history/IDA — owner has
