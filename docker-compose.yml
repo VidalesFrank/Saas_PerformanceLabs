@@ -1,0 +1,46 @@
+services:
+
+  # ── Redis (broker + result backend para Celery) ───────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Celery Worker (Linux — os.fork() disponible para pushover/dinámico) ───
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: >
+      celery -A app.tasks.celery_app.celery_app worker
+      --loglevel=info
+      --concurrency=2
+      -P solo
+    working_dir: /app/api
+    volumes:
+      # Código de la API (con hot-reload del worker)
+      - ./apps/api:/app/api
+      # Datos compartidos entre la API (Windows) y el worker (Docker)
+      - ./apps/api/data:/app/api/data
+      # Motor de secciones instalado como editable
+      - ./packages/engine:/app/engine
+    environment:
+      DATABASE_URL: "sqlite:////app/api/data/performancelabs.db"
+      REDIS_URL: "redis://redis:6379/0"
+      BASE_DATA_DIR: "/app/api/data"
+      JWT_SECRET: "${JWT_SECRET:-dev-secret-change-me}"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data:

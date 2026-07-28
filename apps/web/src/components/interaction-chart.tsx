@@ -471,6 +471,71 @@ export function InteractionChart({
           </table>
         </div>
       )}
+
+      {loadMarkers.length > 0 && (
+        <div className="mt-5 rounded-md border border-border">
+          <div className="border-b border-border px-4 py-2.5">
+            <p className="text-xs font-semibold uppercase tracking-wide" style={{ color: "var(--color-text)" }}>
+              Verificacion de combinaciones — Indice de sobreesfuerzo
+            </p>
+            <p className="mt-0.5 text-[11px]" style={{ color: "var(--color-text-muted)" }}>
+              C/D = capacidad / demanda &nbsp;·&nbsp; DCR = demanda / capacidad (D/C). Curva factored &phi;·P-M (ACI 318-19).
+            </p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-surface-2 font-mono uppercase tracking-wide" style={{ color: "var(--color-text-muted)" }}>
+                <tr>
+                  <th className="px-3 py-2">Comb.</th>
+                  <th className="px-3 py-2">Pu (kN)</th>
+                  <th className="px-3 py-2">Mu (kN·m)</th>
+                  <th className="px-3 py-2">C/D</th>
+                  <th className="px-3 py-2">DCR (D/C)</th>
+                  <th className="px-3 py-2">Estado</th>
+                </tr>
+              </thead>
+              <tbody className="font-mono">
+                {loadMarkers.map((lm, i) => {
+                  const cd = lm.cdRatio;
+                  const dcr = cd !== null ? 1 / cd : null;
+                  const ok = lm.inside;
+                  return (
+                    <tr key={i} className="border-t border-border">
+                      <td className="px-3 py-2 text-center font-semibold" style={{ color: "var(--color-text-muted)" }}>
+                        {i + 1}
+                      </td>
+                      <td className="px-3 py-2" style={{ color: "var(--color-text)" }}>
+                        {lm.puKn.toFixed(1)}
+                      </td>
+                      <td className="px-3 py-2" style={{ color: "var(--color-text)" }}>
+                        {lm.muKnm.toFixed(1)}
+                      </td>
+                      <td className="px-3 py-2 font-semibold" style={{ color: ok ? "var(--color-success)" : "var(--color-danger)" }}>
+                        {cd !== null ? cd.toFixed(3) : "—"}
+                      </td>
+                      <td className="px-3 py-2 font-semibold" style={{ color: ok ? "var(--color-success)" : "var(--color-danger)" }}>
+                        {dcr !== null ? dcr.toFixed(3) : "—"}
+                      </td>
+                      <td className="px-3 py-2">
+                        <span
+                          className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-bold"
+                          style={{
+                            background: ok ? "var(--color-success)" : "var(--color-danger)",
+                            color: "white",
+                            opacity: 0.9,
+                          }}
+                        >
+                          {ok ? "OK ✓" : "NG ✗"}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

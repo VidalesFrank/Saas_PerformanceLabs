@@ -42,12 +42,12 @@ CATALOG = [
             {
                 "id": "interaccion-biaxial",
                 "name": "Interaccion Biaxial P-M-M",
-                "nivel": "pro", "estado": "en_desarrollo", "route": None,
+                "nivel": "pro", "estado": "en_desarrollo", "route": "/analysis/pmm",
             },
             {
                 "id": "momento-curvatura",
                 "name": "Curva momento-curvatura con modelos de confinamiento",
-                "nivel": "pro", "estado": "en_desarrollo", "route": None,
+                "nivel": "pro", "estado": "en_desarrollo", "route": "/analysis/moment-curvature",
             },
             {
                 "id": "carga-axial-sobreesfuerzo",
@@ -71,21 +71,24 @@ CATALOG = [
         ],
     },
     {
-        "id": "motor-analisis",
-        "name": "Modulo 3 - Motor de Analisis",
+        "id": "analisis-no-lineal-3d",
+        "name": "Modulo 3 - Analisis No Lineal 3D de Edificios",
         "products": [
-            {"id": "analisis-modal", "name": "Analisis modal", "nivel": "pro", "estado": "listo", "route": None},
-            {"id": "analisis-espectral", "name": "Analisis espectral", "nivel": None, "estado": "idea", "route": None},
-            {"id": "analisis-estatico", "name": "Analisis estatico", "nivel": None, "estado": "idea", "route": None},
-            {"id": "pushover", "name": "Pushover", "nivel": "premium", "estado": "listo", "route": None},
-            {"id": "cronologico-no-lineal", "name": "Cronologico no lineal", "nivel": "premium", "estado": "listo", "route": None},
-            {"id": "ida", "name": "Analisis dinamico incremental (IDA)", "nivel": "premium", "estado": "listo", "route": None},
-            {"id": "analisis-ciclico", "name": "Analisis ciclico", "nivel": None, "estado": "idea", "route": None},
+            {
+                "id": "analisis-edificio",
+                "name": "Analisis no lineal 3D de edificios (Modal + Pushover + Dinamico + IDA)",
+                "nivel": "premium",
+                "estado": "en_desarrollo",
+                "route": "/building",
+            },
             {
                 "id": "seleccion-registros",
                 "name": "Seleccion y escalamiento de registros sismicos",
-                "nivel": "premium", "estado": "en_desarrollo", "route": None,
+                "nivel": "premium",
+                "estado": "en_desarrollo",
+                "route": None,
             },
+            {"id": "analisis-ciclico", "name": "Analisis ciclico", "nivel": None, "estado": "idea", "route": None},
         ],
     },
     {

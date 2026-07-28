@@ -27,5 +27,8 @@ Thumbs.db
 # Word lock files
 ~$*.docx
 
+# Logs de servidores dev
+*.log
+
 # Alembic
 apps/api/alembic/versions/__pycache__/

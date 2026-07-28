@@ -1,13 +1,22 @@
+import bisect
+import math
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from engine.analysis.interaction import compute_interaction_diagram
+from engine.analysis.moment_curvature import compute_moment_curvature
+from engine.analysis.pmm_surface import compute_pmm_surface
 
 from app.auth import get_current_user
 from app.db import get_db
-from app.engine_adapter import build_engine_inputs, split_payload
+from app.engine_adapter import build_engine_inputs, build_section_summary, split_payload
 from app.models import InteractionResult, Section, User
-from app.schemas import InteractionResultOut, SectionCreate, SectionOut
+from app.schemas import (
+    InteractionResultOut, MomentCurvatureRequest, MomentCurvatureResultOut,
+    MCPointOut, SectionCreate, SectionOut,
+    PMMSurfaceRequest, PMMSurfaceResultOut, PMMArcOut, PMMPointOut, PMMDemandOut,
+)
 
 router = APIRouter(prefix="/api/v1/sections", tags=["sections"])
 
@@ -66,6 +75,168 @@ def run_interaction_diagram(
     db.commit()
     db.refresh(result)
     return result
+
+
+@router.post("/{section_id}/moment-curvature", response_model=MomentCurvatureResultOut)
+def run_moment_curvature(
+    section_id: str,
+    body: MomentCurvatureRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> MomentCurvatureResultOut:
+    section = _get_owned_section(db, section_id, user)
+    shape, bars, core_params, cover_params, steel_params, depth = build_engine_inputs(
+        section.shape_type, section.geometry, section.materials, section.reinforcement, section.cover
+    )
+    axial_n = body.axial_load_kn * 1_000.0  # kN → N
+
+    result = compute_moment_curvature(
+        shape, bars, core_params, cover_params, steel_params,
+        axial_load_n=axial_n,
+        depth_for_curvature=depth,
+        num_incr=body.num_incr,
+        curvature_multiple=body.curvature_multiple,
+    )
+
+    material_summary, section_summary = build_section_summary(
+        section.shape_type, section.geometry, section.materials,
+        section.reinforcement, section.cover, axial_load_n=axial_n,
+    )
+
+    # Convertir unidades: mm → m  y  N·mm → kN·m  |  N·mm² → kN·m²
+    return MomentCurvatureResultOut(
+        section_id=section_id,
+        axial_load_kn=body.axial_load_kn,
+        curve=[MCPointOut(phi=pt.phi * 1_000.0, moment=pt.moment / 1_000_000.0) for pt in result.curve],
+        phi_yield=result.phi_yield * 1_000.0,
+        moment_yield=result.moment_yield / 1_000_000.0,
+        phi_max=result.phi_max * 1_000.0,
+        moment_max=result.moment_max / 1_000_000.0,
+        phi_ultimate=result.phi_ultimate * 1_000.0,
+        moment_ultimate=result.moment_ultimate / 1_000_000.0,
+        ductility=result.ductility,
+        ei_secant_kNm2=result.ei_secant / 1_000_000_000.0,
+        failure_reached=result.failure_reached,
+        material_summary=material_summary,
+        section_summary=section_summary,
+    )
+
+
+@router.post("/{section_id}/pmm-surface", response_model=PMMSurfaceResultOut)
+def run_pmm_surface(
+    section_id: str,
+    body: PMMSurfaceRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> PMMSurfaceResultOut:
+    section = _get_owned_section(db, section_id, user)
+    shape, bars, core_params, cover_params, steel_params, _ = build_engine_inputs(
+        section.shape_type, section.geometry, section.materials, section.reinforcement, section.cover
+    )
+
+    raw = compute_pmm_surface(
+        shape, bars, core_params, cover_params, steel_params,
+        num_angles=body.num_angles,
+        num_points=body.num_points,
+    )
+
+    from collections import defaultdict
+    bucket: dict[float, list] = defaultdict(list)
+    for pt in raw:
+        key = round(math.degrees(pt.theta), 4)
+        bucket[key].append(pt)
+
+    curves: list[PMMArcOut] = []
+    for theta_deg in sorted(bucket.keys()):
+        pts_sorted = sorted(bucket[theta_deg], key=lambda p: p.P, reverse=True)
+        curves.append(PMMArcOut(
+            theta_deg=theta_deg,
+            points=[
+                PMMPointOut(p=pt.P / 1_000, mx=pt.Mx / 1e6, my=pt.My / 1e6)
+                for pt in pts_sorted
+            ],
+        ))
+
+    p_max = max(pt.P for pt in raw) / 1_000
+    p_min = min(pt.P for pt in raw) / 1_000
+    m_max = max(math.sqrt(pt.Mx**2 + pt.My**2) for pt in raw) / 1e6
+
+    demands_out = [_check_demand(curves, d.p_kn, d.mx_knm, d.my_knm) for d in body.demands]
+
+    return PMMSurfaceResultOut(
+        section_id=section_id,
+        curves=curves,
+        p_max_kn=p_max,
+        p_min_kn=p_min,
+        m_max_knm=m_max,
+        demands_out=demands_out,
+    )
+
+
+def _interp_m_at_p(points: list[PMMPointOut], p_target: float) -> float:
+    for i in range(len(points) - 1):
+        p_hi, p_lo = points[i].p, points[i + 1].p
+        m_hi = math.sqrt(points[i].mx**2 + points[i].my**2)
+        m_lo = math.sqrt(points[i + 1].mx**2 + points[i + 1].my**2)
+        if p_lo <= p_target <= p_hi:
+            t = (p_target - p_lo) / (p_hi - p_lo) if abs(p_hi - p_lo) > 1e-9 else 0.0
+            return m_lo + t * (m_hi - m_lo)
+    return 0.0
+
+
+def _check_demand(
+    curves: list[PMMArcOut],
+    p_kn: float,
+    mx_knm: float,
+    my_knm: float,
+) -> PMMDemandOut:
+    m_demand = math.sqrt(mx_knm**2 + my_knm**2)
+
+    if m_demand < 1e-9:
+        inside = any(c.points[-1].p <= p_kn <= c.points[0].p for c in curves)
+        return PMMDemandOut(
+            p_kn=p_kn, mx_knm=mx_knm, my_knm=my_knm,
+            m_demand_knm=0.0, m_capacity_knm=0.0, dcr=0.0, inside=inside,
+        )
+
+    theta_u = math.atan2(my_knm, mx_knm)
+    if theta_u < 0:
+        theta_u += 2 * math.pi
+
+    angles = [c.theta_deg * math.pi / 180 for c in curves]
+    n = len(angles)
+
+    idx = bisect.bisect_right(angles, theta_u)
+    lo_idx = (idx - 1) % n
+    hi_idx = idx % n
+
+    a_lo = angles[lo_idx]
+    a_hi = angles[hi_idx]
+    if hi_idx == 0:
+        a_hi += 2 * math.pi
+
+    denom = a_hi - a_lo
+    t_ang = max(0.0, min(1.0, (theta_u - a_lo) / denom)) if abs(denom) > 1e-9 else 0.0
+
+    m_lo = _interp_m_at_p(curves[lo_idx].points, p_kn)
+    m_hi = _interp_m_at_p(curves[hi_idx].points, p_kn)
+    m_cap = m_lo + t_ang * (m_hi - m_lo)
+
+    if m_cap < 1e-6:
+        return PMMDemandOut(
+            p_kn=p_kn, mx_knm=mx_knm, my_knm=my_knm,
+            m_demand_knm=round(m_demand, 3), m_capacity_knm=0.0,
+            dcr=float("inf"), inside=False,
+        )
+
+    dcr = m_demand / m_cap
+    return PMMDemandOut(
+        p_kn=p_kn, mx_knm=mx_knm, my_knm=my_knm,
+        m_demand_knm=round(m_demand, 3),
+        m_capacity_knm=round(m_cap, 3),
+        dcr=round(dcr, 4),
+        inside=dcr <= 1.0,
+    )
 
 
 def _get_owned_section(db: Session, section_id: str, user: User) -> Section:
