@@ -13,10 +13,9 @@ Para theta=0:   (Mx, My) = (M, 0)  -- igual al diagrama P-M existente (eje fuert
 Para theta=pi/2: (Mx, My) = (0, M)  -- diagrama P-M eje debil
 
 Optimizacion de simetria:
-  - Seccion rectangular/cuadrada (doblemente simetrica): solo calcula Q1 [0..pi/2]
-    y expeja al resto de cuadrantes (aprox. 1/4 del costo computacional).
-  - Seccion circular: isotropica, un solo angulo se replica a todos.
-  - Seccion especial: barre los num_angles completos sin asumir simetria.
+  - Seccion doblemente simetrica (compiled.is_doubly_symmetric): solo calcula Q1 [0..pi/2].
+  - Seccion isotrópica circular (compiled.is_isotropic): solo calcula un angulo.
+  - Resto: barre los num_angles completos.
 """
 from __future__ import annotations
 
@@ -26,24 +25,9 @@ from dataclasses import dataclass
 import numpy as np
 import openseespy.opensees as ops
 
-from engine.materials.concrete import ConcreteMaterialParams
-from engine.materials.steel import SteelMaterialParams
-from engine.sections.geometry import (
-    CircPatchSpec,
-    CircularSection,
-    PointFiberSpec,
-    PolygonSection,
-    RectPatchSpec,
-    RectangularSection,
-)
-
-from .interaction import (
-    ELE_TAG,
-    SEC_TAG,
-    STEEL_MAT_TAG_WRAPPED,
-    Shape,
-    _define_materials,
-)
+from engine.sections.compiler import CompiledFiberSection, disc_circ, disc_rect
+from engine.sections.geometry import CircPatchSpec, PointFiberSpec, RectPatchSpec
+from .interaction import ELE_TAG, SEC_TAG, _define_materials
 
 
 # ── Dataclass de salida ───────────────────────────────────────────────────────
@@ -56,59 +40,12 @@ class PMMPoint:
     theta: float  # rad, angulo del eje neutro
 
 
-# ── Discretizacion de patches -> fibras individuales ─────────────────────────
-
-def _disc_rect(patch: RectPatchSpec) -> list[PointFiberSpec]:
-    dy = (patch.y2 - patch.y1) / patch.nf_y
-    dz = (patch.z2 - patch.z1) / patch.nf_z
-    area = abs(dy * dz)
-    return [
-        PointFiberSpec(patch.mat_tag, patch.y1 + (i + 0.5) * dy, patch.z1 + (j + 0.5) * dz, area)
-        for i in range(patch.nf_y)
-        for j in range(patch.nf_z)
-    ]
-
-
-def _disc_circ(patch: CircPatchSpec) -> list[PointFiberSpec]:
-    ang_s = math.radians(patch.ang[0])
-    ang_e = math.radians(patch.ang[1])
-    d_ang = (ang_e - ang_s) / patch.nf_circ
-    dr = (patch.r_ext - patch.r_int) / patch.nf_rad
-    fibers: list[PointFiberSpec] = []
-    for k_r in range(patch.nf_rad):
-        r_in = patch.r_int + k_r * dr
-        r_out = patch.r_int + (k_r + 1) * dr
-        r_mid = (r_in + r_out) / 2
-        area = 0.5 * (r_out**2 - r_in**2) * d_ang
-        for k_c in range(patch.nf_circ):
-            ang = ang_s + (k_c + 0.5) * d_ang
-            fibers.append(PointFiberSpec(
-                patch.mat_tag,
-                patch.y_center + r_mid * math.cos(ang),
-                patch.z_center + r_mid * math.sin(ang),
-                area,
-            ))
-    return fibers
-
-
-def _section_to_fibers(shape: Shape) -> list[PointFiberSpec]:
-    """Devuelve fibras individuales de concreto (sin barras de acero)."""
-    if isinstance(shape, RectangularSection):
-        core, covers = shape.patches(1, 2)   # CORE=1, COVER=2
-        return _disc_rect(core) + [f for cp in covers for f in _disc_rect(cp)]
-    if isinstance(shape, CircularSection):
-        core, covers = shape.patches(1, 2)
-        return _disc_circ(core) + [f for cp in covers for f in _disc_circ(cp)]
-    if isinstance(shape, PolygonSection):
-        return shape.fibers(1, 2)
-    raise TypeError(f"Forma no soportada: {type(shape)}")
-
-
 # ── Rotacion de fibras ────────────────────────────────────────────────────────
 
 def _rotate(fibers: list[PointFiberSpec], theta: float) -> list[PointFiberSpec]:
     c, s = math.cos(theta), math.sin(theta)
-    return [PointFiberSpec(f.mat_tag, f.y * c + f.z * s, -f.y * s + f.z * c, f.area) for f in fibers]
+    return [PointFiberSpec(f.mat_tag, f.y * c + f.z * s, -f.y * s + f.z * c, f.area)
+            for f in fibers]
 
 
 # ── Analisis OpenSees a angulo fijo ───────────────────────────────────────────
@@ -116,23 +53,21 @@ def _rotate(fibers: list[PointFiberSpec], theta: float) -> list[PointFiberSpec]:
 def _mc_max(
     concrete_rot: list[PointFiberSpec],
     steel_rot: list[PointFiberSpec],
-    core: ConcreteMaterialParams,
-    cover: ConcreteMaterialParams,
-    steel: SteelMaterialParams,
-    p_n: float,          # N, compresion positiva
+    compiled: CompiledFiberSection,
+    p_n: float,
     max_curv: float,
     num_incr: int = 45,
 ) -> float:
     """Momento maximo a carga axial p_n con fibras ya rotadas al angulo deseado."""
     ops.wipe()
     ops.model("basic", "-ndm", 2, "-ndf", 3)
-    _define_materials(core, cover, steel)
+    _define_materials(compiled)
 
     ops.section("Fiber", SEC_TAG)
     for f in concrete_rot:
         ops.fiber(f.y, f.z, f.area, f.mat_tag)
     for f in steel_rot:
-        ops.fiber(f.y, f.z, f.area, STEEL_MAT_TAG_WRAPPED)
+        ops.fiber(f.y, f.z, f.area, f.mat_tag)
 
     ops.node(1, 0.0, 0.0)
     ops.node(2, 0.0, 0.0)
@@ -142,7 +77,7 @@ def _mc_max(
 
     ops.timeSeries("Constant", 1)
     ops.pattern("Plain", 1, 1)
-    ops.load(2, -p_n, 0.0, 0.0)   # OpenSees: compresion = negativa
+    ops.load(2, -p_n, 0.0, 0.0)
 
     ops.system("BandGeneral")
     ops.numberer("Plain")
@@ -168,6 +103,9 @@ def _mc_max(
         if ok != 0:
             ops.algorithm("ModifiedNewton")
             ok = ops.analyze(1)
+            if ok != 0:
+                ops.algorithm("KrylovNewton")
+                ok = ops.analyze(1)
             ops.algorithm("Newton")
             if ok != 0:
                 break
@@ -183,31 +121,20 @@ def _expand_quad_symmetry(
     angles_q1: list[float],
     pm_by_angle: dict[float, list[tuple[float, float]]],
 ) -> list[tuple[float, list[tuple[float, float, float]]]]:
-    """Expande curvas del 1er cuadrante a los 4 cuadrantes.
-
-    Devuelve lista de (theta, [(P, Mx, My), ...]) ordenada por theta.
-    """
     result: list[tuple[float, list[tuple[float, float, float]]]] = []
     EPS = 1e-9
-
     for theta in angles_q1:
         pm = pm_by_angle[theta]
         c, s = math.cos(theta), math.sin(theta)
-        pmM = [(p, m * c, m * s) for p, m in pm]
+        pmM  = [(p, m * c,  m * s) for p, m in pm]
         pmQ3 = [(p, -m * c, -m * s) for p, m in pm]
-
         result.append((theta, pmM))
         result.append((math.pi + theta, pmQ3))
-
-        # Q2 y Q4 solo existen para angulos fuera de los ejes
-        if theta > EPS and theta < math.pi / 2 - EPS:
+        if EPS < theta < math.pi / 2 - EPS:
             pmQ2 = [(p, -m * c, m * s) for p, m in pm]
             pmQ4 = [(p, m * c, -m * s) for p, m in pm]
             result.append((math.pi - theta, pmQ2))
             result.append((2 * math.pi - theta, pmQ4))
-        # Eje theta=pi/2: Q3 ya es (pi + pi/2 = 3pi/2), Q4 = (2pi - pi/2 = 3pi/2) → duplicado con Q3
-        # Eje theta=0:    Q3 ya es pi, Q2 = pi (duplicado con Q3), Q4 = 2pi (= Q1) → no agregar
-
     result.sort(key=lambda x: x[0])
     return result
 
@@ -215,60 +142,55 @@ def _expand_quad_symmetry(
 # ── Funcion publica ───────────────────────────────────────────────────────────
 
 def compute_pmm_surface(
-    shape: Shape,
-    bars: list[PointFiberSpec],
-    core_params: ConcreteMaterialParams,
-    cover_params: ConcreteMaterialParams,
-    steel_params: SteelMaterialParams,
+    compiled: CompiledFiberSection,
     num_angles: int = 8,
     num_points: int = 10,
 ) -> list[PMMPoint]:
-    """Calcula la superficie P-M-M barriendo el angulo del eje neutro.
+    """Calcula la superficie P-M-M barriendo el angulo del eje neutro."""
+    ast = compiled.steel_area
+    ag  = compiled.gross_area
+    fy  = compiled.steel_params.fy
+    fpc = compiled.fpc_nominal
 
-    num_angles : numero de angulos en [0, 2pi). Recomendado: 8..16.
-    num_points : niveles de P por angulo (excluyendo puntos de contorno).
-    """
-    ast = sum(b.area for b in bars)
-    ag = shape.gross_area
-    p_abs_max = 0.85 * cover_params.fpc * (ag - ast) + steel_params.fy * ast
-    p_abs_min = -steel_params.fy * ast
-    p_levels = list(np.linspace(0.98 * p_abs_max, 0.98 * p_abs_min, num_points))
+    p_abs_max = 0.85 * fpc * (ag - ast) + fy * ast
+    p_abs_min = -fy * ast
+    p_levels  = list(np.linspace(0.98 * p_abs_max, 0.98 * p_abs_min, num_points))
 
-    concrete_fibers = _section_to_fibers(shape)
+    # Fibras ya discretizadas (para rotación)
+    concrete_fibers = compiled.all_concrete_fibers
+    bar_fibers      = compiled.all_bar_fibers
 
-    is_circ = isinstance(shape, CircularSection)
-    is_doubly_sym = isinstance(shape, RectangularSection)  # cuadrada es subclase
-
-    # ── Determinar angulos a calcular efectivamente ───────────────────────────
-    if is_circ:
+    # ── Determinar ángulos únicos según simetría ──────────────────────────────
+    if compiled.is_isotropic:
         angles_unique = [0.0]
-    elif is_doubly_sym:
+    elif compiled.is_doubly_symmetric:
         n_q1 = max(2, num_angles // 4 + 1)
         angles_unique = list(np.linspace(0.0, math.pi / 2, n_q1))
     else:
         angles_unique = list(np.linspace(0.0, 2 * math.pi, num_angles, endpoint=False))
 
-    # ── Calcular P-M para cada angulo unico ──────────────────────────────────
+    # ── Calcular P-M para cada ángulo único ──────────────────────────────────
     pm_by_angle: dict[float, list[tuple[float, float]]] = {}
     for theta in angles_unique:
         theta = float(theta)
         rot_c = _rotate(concrete_fibers, theta)
-        rot_s = _rotate(bars, theta)
+        rot_s = _rotate(bar_fibers, theta)
 
         y_vals = [f.y for f in rot_c]
-        d_eff = max(y_vals) - min(y_vals) if y_vals else 1.0
+        d_eff  = max(y_vals) - min(y_vals) if y_vals else 1.0
         max_curv = 6.0 * 0.025 / max(d_eff, 1.0)
 
         pm: list[tuple[float, float]] = []
         for p in p_levels:
-            m = _mc_max(rot_c, rot_s, core_params, cover_params, steel_params, p, max_curv)
-            pm.append((float(p), m))
+            m = _mc_max(rot_c, rot_s, compiled, p, max_curv)
+            if m > 0.0:  # skip convergence failures to avoid surface dimples
+                pm.append((float(p), m))
         pm_by_angle[theta] = pm
 
     # ── Construir lista de PMMPoint ───────────────────────────────────────────
     points: list[PMMPoint] = []
 
-    if is_circ:
+    if compiled.is_isotropic:
         angles_all = np.linspace(0.0, 2 * math.pi, num_angles, endpoint=False)
         for theta in angles_all:
             theta = float(theta)
@@ -279,7 +201,7 @@ def compute_pmm_surface(
                 points.append(PMMPoint(P=p, Mx=m * c, My=m * s, theta=theta))
             points.append(PMMPoint(P=p_abs_min, Mx=0.0, My=0.0, theta=theta))
 
-    elif is_doubly_sym:
+    elif compiled.is_doubly_symmetric:
         expanded = _expand_quad_symmetry(angles_unique, pm_by_angle)
         for theta, pm3 in expanded:
             points.append(PMMPoint(P=p_abs_max, Mx=0.0, My=0.0, theta=theta))
@@ -298,3 +220,7 @@ def compute_pmm_surface(
             points.append(PMMPoint(P=p_abs_min, Mx=0.0, My=0.0, theta=theta))
 
     return points
+
+
+# ── Re-exportar disc_rect / disc_circ (compatibilidad con imports anteriores) ─
+__all__ = ["PMMPoint", "compute_pmm_surface", "disc_rect", "disc_circ"]

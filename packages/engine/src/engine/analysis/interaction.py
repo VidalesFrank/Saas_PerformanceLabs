@@ -1,9 +1,8 @@
 """Diagrama de interaccion P-M via seccion de fibras en OpenSeesPy.
 
 Unico modulo del motor que importa OpenSeesPy directamente. Construye la fiber
-section (materiales + patches + barras) y traza la envolvente P-M barriendo
-momento-curvatura a carga axial constante, para una serie de niveles de P entre
-compresion pura y tension pura.
+section a partir de un CompiledFiberSection y traza la envolvente P-M barriendo
+momento-curvatura a carga axial constante.
 
 Convencion de signos publica (InteractionPoint): P positivo = compresion,
 M siempre positivo (magnitud de la capacidad a momento). Internamente se convierte
@@ -11,23 +10,16 @@ a la convencion de OpenSees/Concrete01 (compresion = deformacion/esfuerzo negati
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
 import openseespy.opensees as ops
 
-from engine.materials.concrete import ConcreteMaterialParams
-from engine.materials.steel import SteelMaterialParams
-from engine.sections.geometry import CircularSection, PointFiberSpec, PolygonSection, RectangularSection
+from engine.sections.compiler import CompiledFiberSection
 
-CORE_MAT_TAG = 1
-COVER_MAT_TAG = 2
-STEEL_MAT_TAG = 3
-STEEL_MAT_TAG_WRAPPED = 4
 SEC_TAG = 1
 ELE_TAG = 1
-
-Shape = RectangularSection | CircularSection | PolygonSection
 
 
 @dataclass(frozen=True)
@@ -36,67 +28,80 @@ class InteractionPoint:
     M: float  # N*mm, magnitud de capacidad a momento
 
 
-def _define_materials(core: ConcreteMaterialParams, cover: ConcreteMaterialParams, steel: SteelMaterialParams) -> None:
-    ops.uniaxialMaterial("Concrete01", CORE_MAT_TAG, -core.fpc, -core.epsc0, -core.fpcu, -core.epsU)
-    ops.uniaxialMaterial("Concrete01", COVER_MAT_TAG, -cover.fpc, -cover.epsc0, -cover.fpcu, -cover.epsU)
-    ops.uniaxialMaterial("Steel02", STEEL_MAT_TAG, steel.fy, steel.E0, steel.b, steel.R0, steel.cR1, steel.cR2)
-    ops.uniaxialMaterial(
-        "MinMax", STEEL_MAT_TAG_WRAPPED, STEEL_MAT_TAG, "-min", -steel.eps_rupture, "-max", steel.eps_rupture
-    )
+def _define_materials(compiled: CompiledFiberSection) -> None:
+    """Registra todos los materiales de la sección compilada en OpenSees."""
+    for tag, params in compiled.concrete_materials:
+        ops.uniaxialMaterial("Concrete01", tag,
+                             -params.fpc, -params.epsc0, -params.fpcu, -params.epsU)
+    s = compiled.steel_params
+    ops.uniaxialMaterial("Steel02", compiled.steel_tag,
+                         s.fy, s.E0, s.b, s.R0, s.cR1, s.cR2)
+    ops.uniaxialMaterial("MinMax", compiled.steel_wrapped_tag,
+                         compiled.steel_tag,
+                         "-min", -s.eps_rupture, "-max", s.eps_rupture)
 
 
-def _build_section(shape: Shape, bars: list[PointFiberSpec]) -> None:
+def _build_section(compiled: CompiledFiberSection) -> None:
+    """Construye la fiber section en OpenSees a partir de la sección compilada."""
     ops.section("Fiber", SEC_TAG)
-    if isinstance(shape, RectangularSection):
-        core, covers = shape.patches(CORE_MAT_TAG, COVER_MAT_TAG)
-        ops.patch("rect", core.mat_tag, core.nf_y, core.nf_z, core.y1, core.z1, core.y2, core.z2)
-        for cp in covers:
-            ops.patch("rect", cp.mat_tag, cp.nf_y, cp.nf_z, cp.y1, cp.z1, cp.y2, cp.z2)
-    elif isinstance(shape, CircularSection):
-        core, covers = shape.patches(CORE_MAT_TAG, COVER_MAT_TAG)
-        ops.patch(
-            "circ", core.mat_tag, core.nf_circ, core.nf_rad, core.y_center, core.z_center,
-            core.r_int, core.r_ext, *core.ang,
-        )
-        for cp in covers:
-            ops.patch(
-                "circ", cp.mat_tag, cp.nf_circ, cp.nf_rad, cp.y_center, cp.z_center,
-                cp.r_int, cp.r_ext, *cp.ang,
-            )
-    elif isinstance(shape, PolygonSection):
-        for f in shape.fibers(CORE_MAT_TAG, COVER_MAT_TAG):
-            ops.fiber(f.y, f.z, f.area, f.mat_tag)
-    else:
-        raise TypeError(f"Forma de seccion no soportada: {type(shape)}")
+    for p in compiled.rect_patches:
+        ops.patch("rect", p.mat_tag, p.nf_y, p.nf_z, p.y1, p.z1, p.y2, p.z2)
+    for p in compiled.circ_patches:
+        ops.patch("circ", p.mat_tag, p.nf_circ, p.nf_rad,
+                  p.y_center, p.z_center, p.r_int, p.r_ext, *p.ang)
+    for f in compiled.point_fibers:
+        ops.fiber(f.y, f.z, f.area, f.mat_tag)
+    for b in compiled.bar_fibers:
+        ops.fiber(b.y, b.z, b.area, b.mat_tag)
 
-    for bar in bars:
-        ops.fiber(bar.y, bar.z, bar.area, STEEL_MAT_TAG_WRAPPED)
+
+def _build_section_at_angle(compiled: CompiledFiberSection, theta_rad: float) -> None:
+    """Build fiber section using explicit fibers rotated by theta_rad.
+
+    Effective lever arm: y_eff = y*cos(θ) + z*sin(θ).
+    Uses all_concrete_fibers + all_bar_fibers (pre-discretized) for correct rotation.
+    """
+    cos_t = math.cos(theta_rad)
+    sin_t = math.sin(theta_rad)
+    ops.section("Fiber", SEC_TAG)
+    for f in compiled.all_concrete_fibers:
+        y_eff = f.y * cos_t + f.z * sin_t
+        ops.fiber(y_eff, 0.0, f.area, f.mat_tag)
+    for b in compiled.all_bar_fibers:
+        y_eff = b.y * cos_t + b.z * sin_t
+        ops.fiber(y_eff, 0.0, b.area, b.mat_tag)
+
+
+def _effective_depth(compiled: CompiledFiberSection, theta_rad: float) -> float:
+    """Projected depth in the bending direction (for curvature range scaling)."""
+    if abs(theta_rad) < 1e-9:
+        return compiled.depth_for_curvature
+    cos_t = math.cos(theta_rad)
+    sin_t = math.sin(theta_rad)
+    ys = [f.y * cos_t + f.z * sin_t for f in compiled.all_concrete_fibers]
+    return (max(ys) - min(ys)) if len(ys) >= 2 else compiled.depth_for_curvature
 
 
 def _moment_curvature_max(
-    shape: Shape,
-    bars: list[PointFiberSpec],
-    core_params: ConcreteMaterialParams,
-    cover_params: ConcreteMaterialParams,
-    steel_params: SteelMaterialParams,
+    compiled: CompiledFiberSection,
     axial_load_compression_positive: float,
     max_curvature: float,
     num_incr: int = 60,
+    theta_rad: float = 0.0,
 ) -> float:
     """Traza momento-curvatura a P constante y devuelve la magnitud del momento maximo.
 
-    Reconstruye el modelo (materiales + seccion + elemento) desde cero en cada
-    llamada: es mas costoso que reutilizar el dominio entre niveles de P, pero
-    evita por completo los problemas de estado residual (patrones de carga,
-    nodos) entre corridas sucesivas de OpenSees, que son una fuente comun de
-    resultados incorrectos silenciosos.
+    Reconstruye el modelo desde cero en cada llamada para evitar estado residual.
     """
-    p_ops = -axial_load_compression_positive  # OpenSees/Concrete01: compresion = negativo
+    p_ops = -axial_load_compression_positive  # OpenSees: compresion = negativo
 
     ops.wipe()
     ops.model("basic", "-ndm", 2, "-ndf", 3)
-    _define_materials(core_params, cover_params, steel_params)
-    _build_section(shape, bars)
+    _define_materials(compiled)
+    if abs(theta_rad) < 1e-9:
+        _build_section(compiled)
+    else:
+        _build_section_at_angle(compiled, theta_rad)
 
     ops.node(1, 0.0, 0.0)
     ops.node(2, 0.0, 0.0)
@@ -134,6 +139,9 @@ def _moment_curvature_max(
         if ok != 0:
             ops.algorithm("ModifiedNewton")
             ok = ops.analyze(1)
+            if ok != 0:
+                ops.algorithm("KrylovNewton")
+                ok = ops.analyze(1)
             ops.algorithm("Newton")
             if ok != 0:
                 break
@@ -144,34 +152,27 @@ def _moment_curvature_max(
 
 
 def compute_interaction_diagram(
-    shape: Shape,
-    bars: list[PointFiberSpec],
-    core_params: ConcreteMaterialParams,
-    cover_params: ConcreteMaterialParams,
-    steel_params: SteelMaterialParams,
-    depth_for_curvature: float,
+    compiled: CompiledFiberSection,
     num_points: int = 15,
+    theta_deg: float = 0.0,
 ) -> list[InteractionPoint]:
-    """Calcula la envolvente P-M completa: compresion pura -> flexion -> tension pura.
+    """Calcula la envolvente P-M completa: compresion pura → flexion → tension pura."""
+    theta_rad = math.radians(theta_deg)
 
-    `depth_for_curvature` es la dimension de la seccion en la direccion de flexion
-    analizada (altura para rectangular, diametro para circular) y se usa solo para
-    escalar la curvatura maxima del barrido.
-    """
-    ast = sum(b.area for b in bars)
-    ag = shape.gross_area
+    ast = compiled.steel_area
+    ag = compiled.gross_area
+    fy = compiled.steel_params.fy
+    fpc = compiled.fpc_nominal
 
-    p_exact_max = 0.85 * cover_params.fpc * (ag - ast) + steel_params.fy * ast
-    p_exact_min = -steel_params.fy * ast
-
-    max_curvature = 6 * 0.025 / depth_for_curvature
+    p_exact_max = 0.85 * fpc * (ag - ast) + fy * ast
+    p_exact_min = -fy * ast
+    max_curvature = 6 * 0.025 / _effective_depth(compiled, theta_rad)
 
     p_levels = np.linspace(0.98 * p_exact_max, 0.98 * p_exact_min, num_points)
     diagram = [InteractionPoint(P=p_exact_max, M=0.0)]
     for p in p_levels:
-        m = _moment_curvature_max(
-            shape, bars, core_params, cover_params, steel_params, float(p), max_curvature
-        )
-        diagram.append(InteractionPoint(P=float(p), M=m))
+        m = _moment_curvature_max(compiled, float(p), max_curvature, num_incr=120, theta_rad=theta_rad)
+        if m > 0.0:  # skip convergence failures to avoid zigzag
+            diagram.append(InteractionPoint(P=float(p), M=m))
     diagram.append(InteractionPoint(P=p_exact_min, M=0.0))
     return diagram

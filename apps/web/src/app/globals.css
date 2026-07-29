@@ -13,6 +13,8 @@
   --color-warning: #b45309;
   --color-success: #087f5b;
   --color-danger: #c81e3a;
+
+  --color-canvas-bg: #f0f2f6;
 }
 
 :root[data-theme="dark"] {
@@ -28,6 +30,8 @@
   --color-warning: #f59e0b;
   --color-success: #10b981;
   --color-danger: #ef4444;
+
+  --color-canvas-bg: #0a1120;
 }
 
 

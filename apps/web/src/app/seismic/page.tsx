@@ -1,15 +1,22 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AppHeader } from "@/components/app-header";
-import { SpectrumChart } from "@/components/seismic/SpectrumChart";
-import { Badge } from "@/components/ui/badge";
+import { SpectrumChart, interpolateSpectrum } from "@/components/seismic/SpectrumChart";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/input";
 import { api } from "@/lib/api";
-import type { EspectroResult, MunicipioInfo, SoilType, SoilTypeInfo, ZonaSismica } from "@/lib/seismic-types";
+import type {
+  EspectroMicrozonificacionResult,
+  EspectroResult,
+  MicrozonificacionInfo,
+  MunicipioInfo,
+  SoilType,
+  SoilTypeInfo,
+  ZonaSismica,
+} from "@/lib/seismic-types";
 import { useRequireAuth } from "@/lib/use-require-auth";
 
 const SeismicMap = dynamic(() => import("@/components/seismic/SeismicMap"), {
@@ -70,7 +77,6 @@ async function exportPDF(result: EspectroResult, chartsEl: HTMLElement | null) {
   const p = result.params;
   const zone = result.zona_sismica;
 
-  // Header
   doc.setFontSize(15);
   doc.setFont("helvetica", "bold");
   doc.text("Espectro Elástico de Diseño — NSR-10", margin, y);
@@ -88,12 +94,10 @@ async function exportPDF(result: EspectroResult, chartsEl: HTMLElement | null) {
   );
   y += 9;
 
-  // Divider
   doc.setDrawColor(215, 219, 228);
   doc.line(margin, y, W - margin, y);
   y += 7;
 
-  // Parameters table
   doc.setFont("helvetica", "bold");
   doc.setFontSize(10);
   doc.setTextColor(16, 21, 34);
@@ -133,7 +137,6 @@ async function exportPDF(result: EspectroResult, chartsEl: HTMLElement | null) {
   doc.line(margin, y, W - margin, y);
   y += 6;
 
-  // Charts
   if (chartsEl) {
     doc.setFont("helvetica", "bold");
     doc.setFontSize(10);
@@ -157,7 +160,6 @@ async function exportPDF(result: EspectroResult, chartsEl: HTMLElement | null) {
     y += imgH + 8;
   }
 
-  // Footer
   doc.setFontSize(8);
   doc.setFont("helvetica", "italic");
   doc.setTextColor(130, 140, 160);
@@ -186,16 +188,22 @@ export default function SeismicPage() {
   const [exporting, setExporting] = useState(false);
   const [showTable, setShowTable] = useState(false);
 
+  const [taInput, setTaInput] = useState<string>("");
+
+  // Microzonificación
+  const [microData, setMicroData] = useState<MicrozonificacionInfo | null>(null);
+  const [selectedZona, setSelectedZona] = useState<string | null>(null);
+  const [microResult, setMicroResult] = useState<EspectroMicrozonificacionResult | null>(null);
+  const [microLoading, setMicroLoading] = useState(false);
+
   const chartsRef = useRef<HTMLDivElement>(null);
   const searchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Load all municipios + soil types on mount
   useEffect(() => {
     api.get<MunicipioInfo[]>("/api/v1/seismic/municipios/all", false).then(setAllMunicipios).catch(() => {});
     api.get<SoilTypeInfo[]>("/api/v1/seismic/soil-types", false).then(setSoilTypes).catch(() => {});
   }, []);
 
-  // Debounced search
   useEffect(() => {
     if (searchDebounce.current) clearTimeout(searchDebounce.current);
     if (!query.trim()) { setSuggestions([]); return; }
@@ -207,6 +215,60 @@ export default function SeismicPage() {
     }, 280);
     return () => { if (searchDebounce.current) clearTimeout(searchDebounce.current); };
   }, [query]);
+
+  // Fetch microzonificación when municipality changes
+  useEffect(() => {
+    setMicroData(null);
+    setSelectedZona(null);
+    setMicroResult(null);
+    if (!selected) return;
+    api
+      .get<MicrozonificacionInfo>(`/api/v1/seismic/microzonificacion/${selected.id}`, false)
+      .then(setMicroData)
+      .catch(() => setMicroData(null));
+  }, [selected]);
+
+  // Compute microzonification spectrum when zone changes
+  useEffect(() => {
+    setMicroResult(null);
+    if (!selected || !selectedZona) return;
+    setMicroLoading(true);
+    api
+      .post<EspectroMicrozonificacionResult>("/api/v1/seismic/espectro/microzonificacion", {
+        municipio_id: selected.id,
+        zona_id: selectedZona,
+      })
+      .then(setMicroResult)
+      .catch(() => setMicroResult(null))
+      .finally(() => setMicroLoading(false));
+  }, [selected, selectedZona]);
+
+  const spectrumExtra = useMemo(() => {
+    if (!microResult || !selectedZona || !microData) return null;
+    const zona = microData.zonas.find((z) => z.id === selectedZona);
+    if (!zona) return null;
+    const shortLabel = zona.nombre.includes("—")
+      ? zona.nombre.split("—")[1]?.trim() ?? zona.nombre
+      : zona.nombre;
+    return {
+      puntos: microResult.puntos,
+      params: { T0: microResult.params.T0, Ts: microResult.params.Ts, TL: microResult.params.TL },
+      label: shortLabel,
+      color: zona.color,
+    };
+  }, [microResult, selectedZona, microData]);
+
+  const ta = taInput.trim() ? parseFloat(taInput) : NaN;
+  const taValid = !isNaN(ta) && ta > 0;
+
+  const saAtTa = useMemo(
+    () => (taValid && result ? interpolateSpectrum(result.puntos, ta, "Sa") : null),
+    [taValid, result, ta],
+  );
+  const saAtTaMicro = useMemo(
+    () => (taValid && microResult ? interpolateSpectrum(microResult.puntos, ta, "Sa") : null),
+    [taValid, microResult, ta],
+  );
 
   const calculateSpectrum = useCallback(
     async (mun: MunicipioInfo, soil: SoilType) => {
@@ -330,6 +392,22 @@ export default function SeismicPage() {
                   </p>
                 )}
               </div>
+
+              <div className="border-t border-border pt-3">
+                <Label htmlFor="ta-input">Período de análisis Ta (s)</Label>
+                <Input
+                  id="ta-input"
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  placeholder="ej. 0.50"
+                  value={taInput}
+                  onChange={(e) => setTaInput(e.target.value)}
+                />
+                <p className="mt-1 text-[11px] text-text-muted">
+                  Período fundamental del edificio — se marca en el espectro y se entrega Sa(Ta).
+                </p>
+              </div>
             </CardBody>
           </Card>
 
@@ -366,6 +444,89 @@ export default function SeismicPage() {
                     </div>
                   ))}
                 </dl>
+              </CardBody>
+            </Card>
+          )}
+
+          {/* Microzonificación sísmica */}
+          {microData && (
+            <Card>
+              <CardHeader>
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <h2 className="text-sm font-semibold text-text">Microzonificación sísmica</h2>
+                    <p className="mt-1 text-[11px] text-text-muted leading-relaxed">{microData.estudio}</p>
+                  </div>
+                  <span className="mt-0.5 shrink-0 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-semibold text-accent">
+                    Oficial
+                  </span>
+                </div>
+              </CardHeader>
+              <CardBody className="flex flex-col gap-2">
+                <p className="text-[11px] text-text-muted">
+                  Selecciona una zona para comparar su espectro con el NSR-10 genérico:
+                </p>
+                <div className="flex flex-col gap-1.5">
+                  {microData.zonas.map((zona) => (
+                    <button
+                      key={zona.id}
+                      type="button"
+                      onClick={() => setSelectedZona(selectedZona === zona.id ? null : zona.id)}
+                      className={`flex items-center gap-2.5 rounded-md border px-3 py-2 text-left text-[11px] transition-colors ${
+                        selectedZona === zona.id
+                          ? "font-semibold"
+                          : "border-border text-text-muted hover:text-text"
+                      }`}
+                      style={
+                        selectedZona === zona.id
+                          ? { borderColor: zona.color, color: zona.color, background: zona.color + "14" }
+                          : {}
+                      }
+                    >
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full"
+                        style={{ background: zona.color }}
+                      />
+                      <span className="leading-tight">{zona.nombre}</span>
+                    </button>
+                  ))}
+                </div>
+
+                {selectedZona && (() => {
+                  const zona = microData.zonas.find((z) => z.id === selectedZona);
+                  if (!zona) return null;
+                  return (
+                    <div className="mt-1 rounded-md bg-surface-2 p-2.5">
+                      <p className="text-[11px] text-text-muted leading-relaxed">{zona.descripcion}</p>
+                      <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 font-mono text-[10px]">
+                        <div>
+                          <dt className="text-text-muted">SDs</dt>
+                          <dd className="font-semibold text-text">{zona.SDs.toFixed(4)} g</dd>
+                        </div>
+                        <div>
+                          <dt className="text-text-muted">SD1</dt>
+                          <dd className="font-semibold text-text">{zona.SD1.toFixed(4)} g</dd>
+                        </div>
+                        <div>
+                          <dt className="text-text-muted">T₀</dt>
+                          <dd className="font-semibold text-text">{zona.T0.toFixed(4)} s</dd>
+                        </div>
+                        <div>
+                          <dt className="text-text-muted">Ts</dt>
+                          <dd className="font-semibold text-text">{zona.Ts.toFixed(4)} s</dd>
+                        </div>
+                      </dl>
+                    </div>
+                  );
+                })()}
+
+                {microLoading && (
+                  <p className="text-[11px] text-text-muted">Calculando espectro de microzonificación…</p>
+                )}
+
+                <p className="mt-1 text-[10px] text-text-muted leading-relaxed border-t border-border pt-2">
+                  {microData.nota}
+                </p>
               </CardBody>
             </Card>
           )}
@@ -419,11 +580,21 @@ export default function SeismicPage() {
           <Card>
             <CardHeader>
               <div className="flex items-center justify-between">
-                <h2 className="text-sm font-medium text-text">
-                  {result
-                    ? `Espectros — ${result.municipio.nombre}, Suelo ${result.soil_type}`
-                    : "Espectros de respuesta"}
-                </h2>
+                <div>
+                  <h2 className="text-sm font-medium text-text">
+                    {result
+                      ? `Espectros — ${result.municipio.nombre}, Suelo ${result.soil_type}`
+                      : "Espectros de respuesta"}
+                  </h2>
+                  {spectrumExtra && (
+                    <p className="mt-0.5 text-[11px] text-text-muted">
+                      Comparando con microzonificación:{" "}
+                      <span className="font-semibold" style={{ color: spectrumExtra.color }}>
+                        {spectrumExtra.label}
+                      </span>
+                    </p>
+                  )}
+                </div>
                 {result && (
                   <div className="flex gap-1">
                     {(["Sa", "Sd", "Sv"] as SpecTab[]).map((tab) => (
@@ -462,8 +633,51 @@ export default function SeismicPage() {
                       puntos={result.puntos}
                       params={result.params}
                       spectralType={activeTab}
+                      seriesExtra={spectrumExtra}
+                      tAnalisis={taValid ? ta : null}
                     />
                   </div>
+
+                  {/* Panel Sa(Ta) — resultados del período de análisis */}
+                  {taValid && saAtTa !== null && (
+                    <div className="mt-4 rounded-md border border-border bg-surface-2 px-4 py-3">
+                      <p className="text-xs font-semibold text-text">
+                        Sa en Ta = {ta.toFixed(2)} s
+                      </p>
+                      <div className="mt-2 grid grid-cols-2 gap-4 text-xs">
+                        <div>
+                          <p className="font-mono text-[10px] text-text-muted">NSR-10 (genérico)</p>
+                          <p className="mt-0.5 font-mono font-bold" style={{ color: "var(--color-danger)" }}>
+                            Sa = {saAtTa.toFixed(4)} g
+                          </p>
+                        </div>
+                        {saAtTaMicro !== null && spectrumExtra && (
+                          <div>
+                            <p className="font-mono text-[10px]" style={{ color: spectrumExtra.color }}>
+                              {spectrumExtra.label}
+                            </p>
+                            <p className="mt-0.5 font-mono font-bold" style={{ color: spectrumExtra.color }}>
+                              Sa = {saAtTaMicro.toFixed(4)} g
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                      {saAtTaMicro !== null && spectrumExtra && (
+                        <p className="mt-2 border-t border-border pt-2 text-[11px] text-text-muted">
+                          {saAtTaMicro > saAtTa
+                            ? `Microzonificación más desfavorable: +${((saAtTaMicro / saAtTa - 1) * 100).toFixed(1)}% respecto al NSR-10 genérico.`
+                            : saAtTaMicro < saAtTa
+                              ? `NSR-10 genérico más desfavorable: microzonificación ${((1 - saAtTaMicro / saAtTa) * 100).toFixed(1)}% menor.`
+                              : "Ambos espectros coinciden en Ta."}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  {taValid && result && ta > (result.puntos.at(-1)?.T ?? 4) && (
+                    <p className="mt-2 text-[11px] text-warning">
+                      Ta ({ta.toFixed(2)} s) está fuera del rango graficado — ampliar T máx en configuración avanzada.
+                    </p>
+                  )}
 
                   <button
                     type="button"

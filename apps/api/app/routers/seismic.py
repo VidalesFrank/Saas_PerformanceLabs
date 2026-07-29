@@ -3,8 +3,8 @@
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from engine.seismic import buscar_municipios, compute_spectrum, zona_sismica
-from engine.seismic.nsr10_data import MUNICIPIOS, SOIL_TYPES
+from engine.seismic import buscar_municipios, compute_spectrum, compute_spectrum_from_params, get_microzonificacion, zona_sismica
+from engine.seismic.nsr10_data import MICROZONIFICACION, MUNICIPIOS, SOIL_TYPES
 
 router = APIRouter(prefix="/api/v1/seismic", tags=["seismic"])
 
@@ -130,4 +130,98 @@ def calcular_espectro(body: EspectroRequest) -> dict:
         },
         "puntos": result["puntos"],
         "zona_sismica": result["zona_sismica"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Microzonificación
+# ---------------------------------------------------------------------------
+
+class MicrozonificacionZonaOut(BaseModel):
+    id: str
+    nombre: str
+    descripcion: str
+    color: str
+    Fa_eff: float
+    Fv_eff: float
+    SDs: float
+    SD1: float
+    T0: float
+    Ts: float
+    TL: float
+
+
+class MicrozonificacionOut(BaseModel):
+    nombre: str
+    estudio: str
+    Aa_base: float
+    Av_base: float
+    nota: str
+    zonas: list[MicrozonificacionZonaOut]
+
+
+class EspectroMicrozonificacionRequest(BaseModel):
+    municipio_id: str = Field(..., description="ID del municipio con microzonificacion (ej: 'bogota')")
+    zona_id: str = Field(..., description="ID de la zona de microzonificacion (ej: 'cerros')")
+    T_max: float = Field(default=4.0, ge=1.0, le=10.0)
+
+
+class EspectroMicrozonificacionOut(BaseModel):
+    municipio_id: str
+    zona_id: str
+    zona_nombre: str
+    params: dict
+    puntos: list[PuntoEspectro]
+
+
+@router.get("/microzonificacion/{municipio_id}", response_model=MicrozonificacionOut)
+def get_microzonificacion_municipio(municipio_id: str) -> dict:
+    """Retorna los datos de microzonificacion sismica para un municipio (si existe estudio oficial)."""
+    data = get_microzonificacion(municipio_id)
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No hay estudio de microzonificacion para '{municipio_id}'.",
+        )
+    return data
+
+
+@router.get("/microzonificacion", response_model=list[str])
+def list_municipios_con_microzonificacion() -> list[str]:
+    """Lista los IDs de municipios que tienen estudio de microzonificacion disponible."""
+    return list(MICROZONIFICACION.keys())
+
+
+@router.post("/espectro/microzonificacion", response_model=EspectroMicrozonificacionOut)
+def calcular_espectro_microzonificacion(body: EspectroMicrozonificacionRequest) -> dict:
+    """Calcula el espectro elastico para una zona especifica de microzonificacion."""
+    micro = get_microzonificacion(body.municipio_id)
+    if micro is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No hay microzonificacion para '{body.municipio_id}'.",
+        )
+
+    zona = next((z for z in micro["zonas"] if z["id"] == body.zona_id), None)
+    if zona is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Zona '{body.zona_id}' no encontrada en la microzonificacion de '{body.municipio_id}'.",
+        )
+
+    result = compute_spectrum_from_params(
+        SDs=zona["SDs"],
+        SD1=zona["SD1"],
+        T0=zona["T0"],
+        Ts=zona["Ts"],
+        TL=zona["TL"],
+        T_max=body.T_max,
+    )
+
+    return {
+        "municipio_id": body.municipio_id,
+        "zona_id": body.zona_id,
+        "zona_nombre": zona["nombre"],
+        "params": result["params"],
+        "puntos": result["puntos"],
     }

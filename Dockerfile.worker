@@ -1,0 +1,35 @@
+# ── Celery Worker — Análisis No Lineal 3D ────────────────────────────────────
+# Basado en Python 3.12 slim. OpenSeesPy requiere compiladores C/C++ presentes
+# en Debian/Ubuntu; la imagen slim los tiene via build-essential.
+FROM python:3.12-slim
+
+# Dependencias del sistema necesarias para OpenSeesPy y numpy
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libopenblas-dev \
+    liblapack-dev \
+    gfortran \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Instalar el engine de secciones (editable) ────────────────────────────────
+COPY packages/engine /app/engine
+RUN pip install --no-cache-dir -e /app/engine
+
+# ── Instalar dependencias de la API / worker ──────────────────────────────────
+COPY apps/api/requirements.txt /app/api/requirements.txt
+RUN pip install --no-cache-dir -r /app/api/requirements.txt
+
+# ── Código fuente de la API (montado como volumen en dev) ─────────────────────
+# En dev se monta ./apps/api → /app/api via volumen en docker-compose.yml.
+# El COPY aquí es para builds de producción donde no hay volumen.
+COPY apps/api /app/api
+
+# ── Variables de entorno por defecto ──────────────────────────────────────────
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/api
+
+# El comando real lo provee docker-compose.yml (celery worker ...)
+CMD ["celery", "-A", "app.tasks.celery_app.celery_app", "worker", "--loglevel=info", "-P", "solo"]

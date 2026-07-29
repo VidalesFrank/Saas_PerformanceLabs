@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ParametrosEspectro, PuntoEspectro } from "@/lib/seismic-types";
 
 const WIDTH = 620;
@@ -35,21 +35,58 @@ function niceTicks(min: number, max: number, count = 5): number[] {
   return ticks;
 }
 
+export function interpolateSpectrum(
+  puntos: PuntoEspectro[],
+  T: number,
+  type: "Sa" | "Sd" | "Sv",
+): number | null {
+  if (!puntos.length || T < 0) return null;
+  for (let i = 0; i < puntos.length - 1; i++) {
+    if (puntos[i].T <= T && T <= puntos[i + 1].T) {
+      const dt = puntos[i + 1].T - puntos[i].T;
+      const frac = dt === 0 ? 0 : (T - puntos[i].T) / dt;
+      return puntos[i][type] + frac * (puntos[i + 1][type] - puntos[i][type]);
+    }
+  }
+  return null;
+}
+
 export function SpectrumChart({
   puntos,
   params,
   spectralType,
+  seriesExtra = null,
+  tAnalisis = null,
 }: {
   puntos: PuntoEspectro[];
   params: ParametrosEspectro;
   spectralType: SpectralType;
+  seriesExtra?: {
+    puntos: PuntoEspectro[];
+    params: { T0: number; Ts: number; TL: number };
+    label: string;
+    color: string;
+  } | null;
+  tAnalisis?: number | null;
 }) {
   const [hoverT, setHoverT] = useState<number | null>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [svgClientWidth, setSvgClientWidth] = useState(WIDTH);
+
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const obs = new ResizeObserver(([entry]) => setSvgClientWidth(entry.contentRect.width));
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, []);
 
   const computed = useMemo(() => {
     const vals = puntos.map((p) => ({ T: p.T, Y: p[spectralType] }));
+    const extraVals = seriesExtra ? seriesExtra.puntos.map((p) => ({ T: p.T, Y: p[spectralType] })) : null;
     const T_max = Math.max(...vals.map((v) => v.T));
-    const Y_max = Math.max(...vals.map((v) => v.Y)) * 1.15 || 1;
+    const extraY_max = extraVals ? Math.max(...extraVals.map((v) => v.Y)) : 0;
+    const Y_max = Math.max(Math.max(...vals.map((v) => v.Y)), extraY_max) * 1.15 || 1;
 
     const innerW = WIDTH - MARGIN.left - MARGIN.right;
     const innerH = HEIGHT - MARGIN.top - MARGIN.bottom;
@@ -106,10 +143,37 @@ export function SpectrumChart({
         { T: Ts, label: "Ts" },
         ...(T_max >= TL ? [{ T: TL, label: "TL" }] : []),
       ].filter((pl) => pl.T > 0 && pl.T < T_max),
-    };
-  }, [puntos, params, spectralType, hoverT]);
 
-  const { vals, T_max, xScale, yScale, pathD, fillD, xTicks, yTicks, innerW, innerH, hoverPt, zoneX, periodLines } = computed;
+      // Segunda curva — microzonificación
+      extraPathD: extraVals
+        ? extraVals
+            .map((v, i) => `${i === 0 ? "M" : "L"}${xScale(v.T).toFixed(2)},${yScale(v.Y).toFixed(2)}`)
+            .join(" ")
+        : null,
+      extraPeriodLines: seriesExtra
+        ? [
+            { T: seriesExtra.params.T0, label: "T₀'" },
+            { T: seriesExtra.params.Ts, label: "Ts'" },
+          ].filter((pl) => pl.T > 0 && pl.T < T_max)
+        : [],
+
+      // Ta — marcador del período de análisis
+      taPoint: (() => {
+        if (tAnalisis == null || tAnalisis <= 0 || tAnalisis > T_max) return null;
+        const val = interpolateSpectrum(puntos, tAnalisis, spectralType);
+        if (val === null) return null;
+        return { x: xScale(tAnalisis), y: yScale(val), val };
+      })(),
+      taPointExtra: (() => {
+        if (tAnalisis == null || tAnalisis <= 0 || tAnalisis > T_max || !seriesExtra) return null;
+        const val = interpolateSpectrum(seriesExtra.puntos, tAnalisis, spectralType);
+        if (val === null) return null;
+        return { x: xScale(tAnalisis), y: yScale(val), val };
+      })(),
+    };
+  }, [puntos, params, spectralType, hoverT, seriesExtra, tAnalisis]);
+
+  const { vals, T_max, xScale, yScale, pathD, fillD, xTicks, yTicks, innerW, innerH, hoverPt, zoneX, periodLines, extraPathD, extraPeriodLines, taPoint, taPointExtra } = computed;
 
   function onPointerMove(e: React.PointerEvent<SVGRectElement>) {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -119,14 +183,15 @@ export function SpectrumChart({
   }
 
   const hovered = hoverPt;
+  const scale = svgClientWidth / WIDTH;
 
   return (
     <div className="relative select-none">
       <svg
-        width={WIDTH}
-        height={HEIGHT}
+        ref={svgRef}
+        width="100%"
         viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-        className="max-w-full font-mono text-[11px]"
+        className="font-mono text-[11px]"
       >
         <defs>
           <linearGradient id={`spec-grad-${spectralType}`} x1="0" y1="0" x2="0" y2="1">
@@ -232,7 +297,7 @@ export function SpectrumChart({
         {/* Fill */}
         <path d={fillD} fill={`url(#spec-grad-${spectralType})`} clipPath={`url(#clip-${spectralType})`} />
 
-        {/* Spectrum curve */}
+        {/* Spectrum curve — NSR-10 genérico */}
         <path
           d={pathD}
           fill="none"
@@ -242,6 +307,69 @@ export function SpectrumChart({
           strokeLinecap="round"
           clipPath={`url(#clip-${spectralType})`}
         />
+
+        {/* Segunda curva — microzonificación */}
+        {extraPathD && seriesExtra && (
+          <path
+            d={extraPathD}
+            fill="none"
+            stroke={seriesExtra.color}
+            strokeWidth={2}
+            strokeDasharray="7,4"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            clipPath={`url(#clip-${spectralType})`}
+            opacity={0.9}
+          />
+        )}
+
+        {/* Líneas de período de la segunda curva */}
+        {seriesExtra && extraPeriodLines.map(({ T, label }) => (
+          <g key={`epl-${T}`}>
+            <line
+              x1={xScale(T)} x2={xScale(T)}
+              y1={MARGIN.top} y2={HEIGHT - MARGIN.bottom}
+              stroke={seriesExtra.color} strokeWidth={1}
+              strokeDasharray="3,3" opacity={0.4}
+            />
+            <text
+              x={xScale(T)} y={HEIGHT - MARGIN.bottom + 42}
+              textAnchor="middle" fill={seriesExtra.color} fontSize={9} fontWeight="600"
+            >
+              {label}
+            </text>
+          </g>
+        ))}
+
+        {/* Ta — período de análisis del edificio */}
+        {taPoint && (
+          <>
+            <line
+              x1={taPoint.x} x2={taPoint.x}
+              y1={MARGIN.top} y2={HEIGHT - MARGIN.bottom}
+              stroke="var(--color-danger)" strokeWidth={1.5}
+              opacity={0.85}
+            />
+            <circle
+              cx={taPoint.x} cy={taPoint.y} r={6}
+              fill="var(--color-danger)"
+              stroke="var(--color-surface)" strokeWidth={2}
+            />
+            {taPointExtra && (
+              <circle
+                cx={taPointExtra.x} cy={taPointExtra.y} r={5}
+                fill={seriesExtra!.color}
+                stroke="var(--color-surface)" strokeWidth={2}
+              />
+            )}
+            <text
+              x={taPoint.x} y={HEIGHT - MARGIN.bottom + 30}
+              textAnchor="middle" fill="var(--color-danger)" fontSize={10} fontWeight="700"
+            >
+              Ta
+            </text>
+          </>
+        )}
 
         {/* Hover crosshair */}
         {hovered && (
@@ -270,6 +398,40 @@ export function SpectrumChart({
           width={innerW} height={innerH}
           fill="none" stroke="var(--color-border)" strokeWidth={1}
         />
+
+        {/* Leyenda de series cuando hay comparación */}
+        {seriesExtra && (
+          <g>
+            <rect
+              x={MARGIN.left + innerW - 188} y={MARGIN.top + 8}
+              width={183} height={38} rx={4}
+              fill="var(--color-surface)" stroke="var(--color-border)" strokeWidth={1}
+              opacity={0.95}
+            />
+            <line
+              x1={MARGIN.left + innerW - 180} y1={MARGIN.top + 21}
+              x2={MARGIN.left + innerW - 164} y2={MARGIN.top + 21}
+              stroke="var(--color-accent)" strokeWidth={2.5}
+            />
+            <text
+              x={MARGIN.left + innerW - 159} y={MARGIN.top + 24}
+              fill="var(--color-text)" fontSize={9}
+            >
+              NSR-10 (genérico)
+            </text>
+            <line
+              x1={MARGIN.left + innerW - 180} y1={MARGIN.top + 35}
+              x2={MARGIN.left + innerW - 164} y2={MARGIN.top + 35}
+              stroke={seriesExtra.color} strokeWidth={2} strokeDasharray="7,4"
+            />
+            <text
+              x={MARGIN.left + innerW - 159} y={MARGIN.top + 38}
+              fill="var(--color-text)" fontSize={9}
+            >
+              {seriesExtra.label}
+            </text>
+          </g>
+        )}
 
         {/* Axis labels */}
         <text
@@ -301,8 +463,8 @@ export function SpectrumChart({
         <div
           className="pointer-events-none absolute rounded-lg border border-border bg-surface px-3 py-2 text-xs shadow-lg"
           style={{
-            left: Math.min(hovered.x + 14, WIDTH - 160),
-            top: Math.max(hovered.y - 52, 8),
+            left: Math.min(hovered.x * scale + 14, svgClientWidth - 160),
+            top: Math.max(hovered.y * scale - 52, 8),
           }}
         >
           <div className="mb-1 flex items-center gap-2">

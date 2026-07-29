@@ -10,13 +10,14 @@ from engine.analysis.pmm_surface import compute_pmm_surface
 
 from app.auth import get_current_user
 from app.db import get_db
-from app.engine_adapter import build_engine_inputs, build_section_summary, split_payload
+from app.engine_adapter import build_compiled_section, build_section_summary, split_payload
 from app.models import InteractionResult, Section, User
 from app.schemas import (
     InteractionResultOut, MomentCurvatureRequest, MomentCurvatureResultOut,
     MCPointOut, SectionCreate, SectionOut,
     PMMSurfaceRequest, PMMSurfaceResultOut, PMMArcOut, PMMPointOut, PMMDemandOut,
 )
+from app.unit_converter import UnitConverter as UC
 
 router = APIRouter(prefix="/api/v1/sections", tags=["sections"])
 
@@ -27,7 +28,7 @@ def create_section(
 ) -> Section:
     geometry, materials, reinforcement = split_payload(payload)
     try:
-        build_engine_inputs(payload.shape_type, geometry, materials, reinforcement, payload.cover)
+        build_compiled_section(payload.shape_type, geometry, materials, reinforcement, payload.cover)
     except (KeyError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=f"Datos de seccion incompletos o invalidos: {exc}") from exc
 
@@ -56,10 +57,10 @@ def run_interaction_diagram(
     section_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ) -> InteractionResult:
     section = _get_owned_section(db, section_id, user)
-    shape, bars, core_params, cover_params, steel_params, depth = build_engine_inputs(
+    compiled = build_compiled_section(
         section.shape_type, section.geometry, section.materials, section.reinforcement, section.cover
     )
-    diagram = compute_interaction_diagram(shape, bars, core_params, cover_params, steel_params, depth)
+    diagram = compute_interaction_diagram(compiled)
 
     result = InteractionResult(
         section_id=section.id,
@@ -85,15 +86,14 @@ def run_moment_curvature(
     user: User = Depends(get_current_user),
 ) -> MomentCurvatureResultOut:
     section = _get_owned_section(db, section_id, user)
-    shape, bars, core_params, cover_params, steel_params, depth = build_engine_inputs(
+    compiled = build_compiled_section(
         section.shape_type, section.geometry, section.materials, section.reinforcement, section.cover
     )
-    axial_n = body.axial_load_kn * 1_000.0  # kN → N
+    axial_n = UC.kn_to_n(body.axial_load_kn)
 
     result = compute_moment_curvature(
-        shape, bars, core_params, cover_params, steel_params,
+        compiled,
         axial_load_n=axial_n,
-        depth_for_curvature=depth,
         num_incr=body.num_incr,
         curvature_multiple=body.curvature_multiple,
     )
@@ -103,19 +103,19 @@ def run_moment_curvature(
         section.reinforcement, section.cover, axial_load_n=axial_n,
     )
 
-    # Convertir unidades: mm → m  y  N·mm → kN·m  |  N·mm² → kN·m²
     return MomentCurvatureResultOut(
         section_id=section_id,
         axial_load_kn=body.axial_load_kn,
-        curve=[MCPointOut(phi=pt.phi * 1_000.0, moment=pt.moment / 1_000_000.0) for pt in result.curve],
-        phi_yield=result.phi_yield * 1_000.0,
-        moment_yield=result.moment_yield / 1_000_000.0,
-        phi_max=result.phi_max * 1_000.0,
-        moment_max=result.moment_max / 1_000_000.0,
-        phi_ultimate=result.phi_ultimate * 1_000.0,
-        moment_ultimate=result.moment_ultimate / 1_000_000.0,
+        curve=[MCPointOut(phi=UC.phi_mm_to_m(pt.phi), moment=UC.nmm_to_knm(pt.moment))
+               for pt in result.curve],
+        phi_yield=UC.phi_mm_to_m(result.phi_yield),
+        moment_yield=UC.nmm_to_knm(result.moment_yield),
+        phi_max=UC.phi_mm_to_m(result.phi_max),
+        moment_max=UC.nmm_to_knm(result.moment_max),
+        phi_ultimate=UC.phi_mm_to_m(result.phi_ultimate),
+        moment_ultimate=UC.nmm_to_knm(result.moment_ultimate),
         ductility=result.ductility,
-        ei_secant_kNm2=result.ei_secant / 1_000_000_000.0,
+        ei_secant_kNm2=UC.nmm2_to_knm2(result.ei_secant),
         failure_reached=result.failure_reached,
         material_summary=material_summary,
         section_summary=section_summary,
@@ -130,15 +130,11 @@ def run_pmm_surface(
     user: User = Depends(get_current_user),
 ) -> PMMSurfaceResultOut:
     section = _get_owned_section(db, section_id, user)
-    shape, bars, core_params, cover_params, steel_params, _ = build_engine_inputs(
+    compiled = build_compiled_section(
         section.shape_type, section.geometry, section.materials, section.reinforcement, section.cover
     )
 
-    raw = compute_pmm_surface(
-        shape, bars, core_params, cover_params, steel_params,
-        num_angles=body.num_angles,
-        num_points=body.num_points,
-    )
+    raw = compute_pmm_surface(compiled, num_angles=body.num_angles, num_points=body.num_points)
 
     from collections import defaultdict
     bucket: dict[float, list] = defaultdict(list)
@@ -152,23 +148,23 @@ def run_pmm_surface(
         curves.append(PMMArcOut(
             theta_deg=theta_deg,
             points=[
-                PMMPointOut(p=pt.P / 1_000, mx=pt.Mx / 1e6, my=pt.My / 1e6)
+                PMMPointOut(p=UC.n_to_kn(pt.P), mx=UC.nmm_to_knm(pt.Mx), my=UC.nmm_to_knm(pt.My))
                 for pt in pts_sorted
             ],
         ))
 
-    p_max = max(pt.P for pt in raw) / 1_000
-    p_min = min(pt.P for pt in raw) / 1_000
-    m_max = max(math.sqrt(pt.Mx**2 + pt.My**2) for pt in raw) / 1e6
+    p_max = max(pt.P for pt in raw)
+    p_min = min(pt.P for pt in raw)
+    m_max = max(math.sqrt(pt.Mx**2 + pt.My**2) for pt in raw)
 
     demands_out = [_check_demand(curves, d.p_kn, d.mx_knm, d.my_knm) for d in body.demands]
 
     return PMMSurfaceResultOut(
         section_id=section_id,
         curves=curves,
-        p_max_kn=p_max,
-        p_min_kn=p_min,
-        m_max_knm=m_max,
+        p_max_kn=UC.n_to_kn(p_max),
+        p_min_kn=UC.n_to_kn(p_min),
+        m_max_knm=UC.nmm_to_knm(m_max),
         demands_out=demands_out,
     )
 

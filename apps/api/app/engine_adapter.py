@@ -1,31 +1,21 @@
-"""Traduce el contrato HTTP (SectionCreate / JSON almacenado) a objetos del motor de ingenieria.
+"""Traduce el contrato HTTP (SectionCreate / JSON almacenado) a CompiledFiberSection.
 
 Es el unico punto de la API que conoce tanto el esquema HTTP como los tipos de
 `engine`. El motor en si (`packages/engine`) no tiene ninguna dependencia de FastAPI.
 """
 from __future__ import annotations
 
+from engine.sections.compiler import CompiledFiberSection, compile as compile_section, document_from_legacy
+from engine.sections.document import SectionDocument
+from engine.sections.reinforcement import bar_area, BAR_AREAS_MM2
 from engine.materials.concrete import (
-    CircConfinement,
-    ConcreteMaterialParams,
     ConfinedConcreteReport,
-    RectConfinement,
-    mander_confined_circ,
-    mander_confined_circ_report,
-    mander_confined_rect,
-    mander_confined_rect_report,
     unconfined_concrete,
 )
-from engine.materials.steel import SteelMaterialParams, reinforcing_steel
-from engine.sections.geometry import CircularSection, PointFiberSpec, PolygonSection, RectangularSection
-from engine.sections.reinforcement import bar_area, circ_perimeter_bars, rect_perimeter_bars, rect_layout_bars
 
 from app.models import ShapeType
 from app.schemas import SectionCreate
-
-# Las barras se agregan como fibras individuales; el mat_tag real (envuelto en
-# MinMax) lo asigna engine.analysis.interaction al construir el modelo.
-_BAR_MAT_TAG_PLACEHOLDER = 0
+from app.unit_converter import UnitConverter as UC
 
 
 def split_payload(payload: SectionCreate) -> tuple[dict, dict, dict]:
@@ -48,78 +38,30 @@ def split_payload(payload: SectionCreate) -> tuple[dict, dict, dict]:
     return geometry, materials, reinforcement
 
 
-def build_engine_inputs(
-    shape_type: ShapeType, geometry: dict, materials: dict, reinforcement: dict, cover: float
-) -> tuple[object, list[PointFiberSpec], ConcreteMaterialParams, ConcreteMaterialParams, SteelMaterialParams, float]:
-    """Reconstruye (shape, bars, core_params, cover_params, steel_params, depth_for_curvature)
-    a partir de los bloques geometry/materials/reinforcement, para cualquier forma soportada."""
-    fpc, fy, es = materials["fpc"], materials["fy"], materials["es"]
-    steel_params = reinforcing_steel(fy=fy, E0=es)
-    area_per_bar = bar_area(reinforcement["bar_id"])
-    cover_params = unconfined_concrete(fpc)
+def build_compiled_section(
+    shape_type: ShapeType,
+    geometry: dict,
+    materials: dict,
+    reinforcement: dict,
+    cover: float,
+) -> CompiledFiberSection:
+    """Convierte los dicts de la API legacy a CompiledFiberSection via SectionDocument.
 
-    if shape_type in (ShapeType.rectangular, ShapeType.square):
-        width, height = geometry["width"], geometry["height"]
-        shape = RectangularSection(width=width, height=height, cover=cover)
-        bars = rect_perimeter_bars(
-            shape, cover_to_bar_centroid=reinforcement["cover_to_bar_centroid"],
-            n_bars_y=reinforcement["n_bars_y"], n_bars_z=reinforcement["n_bars_z"],
-            area_per_bar=area_per_bar, mat_tag=_BAR_MAT_TAG_PLACEHOLDER,
-        )
-        ast = sum(b.area for b in bars)
-        conf = RectConfinement(
-            bc=width - 2 * cover, dc=height - 2 * cover, s=materials["hoop_spacing"],
-            hoop_bar_diameter=materials["hoop_bar_diameter"],
-            num_legs_x=materials["hoop_legs_x"], num_legs_y=materials["hoop_legs_y"],
-            leg_area=materials["hoop_leg_area"],
-            clear_bar_spacings=_estimate_rect_clear_spacings(shape, reinforcement),
-            rho_cc=ast / shape.core_area,
-        )
-        core_params = mander_confined_rect(fpc, fyh=fy, confinement=conf)
-        depth_for_curvature = height
-
-    elif shape_type == ShapeType.circular:
-        diameter = geometry["diameter"]
-        shape = CircularSection(diameter=diameter, cover=cover)
-        bars = circ_perimeter_bars(
-            shape, cover_to_bar_centroid=reinforcement["cover_to_bar_centroid"],
-            n_bars=reinforcement["n_bars"], area_per_bar=area_per_bar, mat_tag=_BAR_MAT_TAG_PLACEHOLDER,
-        )
-        ast = sum(b.area for b in bars)
-        conf = CircConfinement(
-            ds=diameter - 2 * cover, s=materials["hoop_spacing"], hoop_bar_diameter=materials["hoop_bar_diameter"],
-            bar_area=materials["hoop_leg_area"], rho_cc=ast / shape.core_area,
-            is_spiral=materials.get("is_spiral", True),
-        )
-        core_params = mander_confined_circ(fpc, fyh=fy, confinement=conf)
-        depth_for_curvature = diameter
-
-    elif shape_type == ShapeType.special:
-        vertices = [tuple(v) for v in geometry["vertices"]]
-        core_vertices = [tuple(v) for v in geometry["core_vertices"]] if geometry.get("core_vertices") else None
-        shape = PolygonSection(vertices=vertices, core_vertices=core_vertices)
-        bars = [
-            PointFiberSpec(_BAR_MAT_TAG_PLACEHOLDER, y, z, area_per_bar) for y, z in reinforcement["bars"]
-        ]
-        # v1: concreto no confinado para polígonos arbitrarios
-        core_params = cover_params
-        ys = [v[0] for v in vertices]
-        depth_for_curvature = max(ys) - min(ys)
-
-    else:
-        raise ValueError(f"shape_type no soportado: {shape_type}")
-
-    return shape, bars, core_params, cover_params, steel_params, depth_for_curvature
+    Mantiene compatibilidad total con los endpoints /api/v1/sections existentes.
+    """
+    doc = document_from_legacy(
+        shape_type=shape_type.value,
+        geometry=geometry,
+        materials=materials,
+        reinforcement=reinforcement,
+        cover=cover,
+    )
+    return compile_section(doc)
 
 
-def _estimate_rect_clear_spacings(shape: RectangularSection, reinforcement: dict) -> list[float]:
-    """Aproxima wi (separaciones libres entre barras soportadas, para el ke de Mander)
-    asumiendo barras uniformemente distribuidas en el perimetro. Simplificacion v1;
-    reemplazar con las posiciones reales de barras si se requiere mayor precision."""
-    n_y, n_z = reinforcement["n_bars_y"], reinforcement["n_bars_z"]
-    spacing_z = shape.core_width / max(n_y - 1, 1)
-    spacing_y = shape.core_height / max(n_z - 1, 1)
-    return [spacing_z] * (n_y - 1) + [spacing_y] * (n_z - 1)
+def build_compiled_from_document(doc: SectionDocument) -> CompiledFiberSection:
+    """Convierte un SectionDocument (nuevo formato) a CompiledFiberSection."""
+    return compile_section(doc)
 
 
 def build_section_summary(
@@ -132,115 +74,100 @@ def build_section_summary(
 ) -> tuple[dict, dict]:
     """Computa (material_summary, section_summary) para el reporte profesional M-phi.
 
-    material_summary: parametros del modelo Mander (confinado vs no confinado).
-    section_summary:  propiedades geometricas y de armado de la seccion.
+    Reconstruye el documento para extraer el reporte Mander y propiedades geométricas.
     """
-    fpc, fy, es = materials["fpc"], materials["fy"], materials["es"]
-    area_per_bar = bar_area(reinforcement["bar_id"])
-    eps_yield = fy / es  # deformacion de fluencia del acero longitudinal
+    compiled = build_compiled_section(shape_type, geometry, materials, reinforcement, cover)
+    fpc = materials["fpc"]
+    fy = materials["fy"]
+    es = materials.get("es", 200_000.0)
+    eps_yield = fy / es
 
-    # ── Rectangular ──────────────────────────────────────────────────────────
-    if shape_type in (ShapeType.rectangular, ShapeType.square):
-        width, height = geometry["width"], geometry["height"]
-        shape = RectangularSection(width=width, height=height, cover=cover)
-        bars_list = rect_perimeter_bars(
-            shape, cover_to_bar_centroid=reinforcement["cover_to_bar_centroid"],
-            n_bars_y=reinforcement["n_bars_y"], n_bars_z=reinforcement["n_bars_z"],
-            area_per_bar=area_per_bar, mat_tag=0,
-        )
-        ast = sum(b.area for b in bars_list)
-        conf = RectConfinement(
-            bc=width - 2 * cover, dc=height - 2 * cover,
-            s=materials["hoop_spacing"], hoop_bar_diameter=materials["hoop_bar_diameter"],
-            num_legs_x=materials["hoop_legs_x"], num_legs_y=materials["hoop_legs_y"],
-            leg_area=materials["hoop_leg_area"],
-            clear_bar_spacings=_estimate_rect_clear_spacings(shape, reinforcement),
-            rho_cc=ast / shape.core_area,
-        )
-        rpt: ConfinedConcreteReport = mander_confined_rect_report(fpc, fyh=fy, confinement=conf)
+    # Extraer reporte Mander de la primera región compilada
+    report: ConfinedConcreteReport | None = None
+    for rpt in compiled.mander_reports.values():
+        if rpt is not None:
+            report = rpt
+            break
 
-        material_summary = _build_material_summary(fpc, rpt, eps_yield)
-        section_summary = {
-            "forma": "Rectangular",
-            "b_mm": round(width, 1),
-            "h_mm": round(height, 1),
-            "recubrimiento_mm": round(cover, 1),
-            "area_bruta_mm2": round(shape.gross_area, 0),
-            "area_acero_mm2": round(ast, 1),
-            "rho_t_pct": round(ast / shape.gross_area * 100, 3),
-            "n_barras": len(bars_list),
-            "varilla": reinforcement["bar_id"],
-            "P_sobre_fcAg": round(axial_load_n / (fpc * shape.gross_area), 4) if fpc * shape.gross_area > 0 else 0.0,
-            "P_kN": round(axial_load_n / 1_000.0, 1),
-        }
-
-    # ── Circular ─────────────────────────────────────────────────────────────
-    elif shape_type == ShapeType.circular:
-        diameter = geometry["diameter"]
-        shape_circ = CircularSection(diameter=diameter, cover=cover)
-        bars_list = circ_perimeter_bars(
-            shape_circ, cover_to_bar_centroid=reinforcement["cover_to_bar_centroid"],
-            n_bars=reinforcement["n_bars"], area_per_bar=area_per_bar, mat_tag=0,
-        )
-        ast = sum(b.area for b in bars_list)
-        conf_circ = CircConfinement(
-            ds=diameter - 2 * cover, s=materials["hoop_spacing"],
-            hoop_bar_diameter=materials["hoop_bar_diameter"],
-            bar_area=materials["hoop_leg_area"], rho_cc=ast / shape_circ.core_area,
-            is_spiral=materials.get("is_spiral", True),
-        )
-        rpt = mander_confined_circ_report(fpc, fyh=fy, confinement=conf_circ)
-
-        material_summary = _build_material_summary(fpc, rpt, eps_yield)
-        tipo_estribo = "Espiral" if conf_circ.is_spiral else "Estribo circular"
-        section_summary = {
-            "forma": f"Circular ({tipo_estribo})",
-            "D_mm": round(diameter, 1),
-            "recubrimiento_mm": round(cover, 1),
-            "area_bruta_mm2": round(shape_circ.gross_area, 0),
-            "area_acero_mm2": round(ast, 1),
-            "rho_t_pct": round(ast / shape_circ.gross_area * 100, 3),
-            "n_barras": len(bars_list),
-            "varilla": reinforcement["bar_id"],
-            "P_sobre_fcAg": round(axial_load_n / (fpc * shape_circ.gross_area), 4) if fpc * shape_circ.gross_area > 0 else 0.0,
-            "P_kN": round(axial_load_n / 1_000.0, 1),
-        }
-
-    # ── Especial (poligono) ───────────────────────────────────────────────────
-    else:
+    if report is not None:
+        unconf = unconfined_concrete(fpc)
         material_summary = {
             "fpc_MPa": round(fpc, 1),
-            "fpcc_MPa": round(fpc, 1),  # no confinado en v1
-            "nota": "Seccion especial: confinamiento no calculado en v1",
+            "epsc0_unconf": round(unconf.epsc0, 4),
+            "ecu_unconf": round(unconf.epsU, 4),
+            "fpcc_MPa": round(report.params.fpc, 2),
+            "fcc_sobre_fc": round(report.fcc_over_fc, 3),
+            "ke": round(report.ke, 3),
+            "fl_MPa": round(report.fl, 3),
+            "rho_s_pct": round(report.rho_s * 100, 3),
+            "epsc0_conf": round(report.params.epsc0, 4),
+            "ecu_conf": round(report.params.epsU, 4),
+            "fyh_MPa": round(report.fyh, 1),
             "fy_MPa": round(fy, 1),
             "eps_y": round(eps_yield, 5),
         }
+    else:
+        material_summary = {
+            "fpc_MPa": round(fpc, 1),
+            "fpcc_MPa": round(fpc, 1),
+            "nota": "Confinamiento no calculado para esta geometría",
+            "fy_MPa": round(fy, 1),
+            "eps_y": round(eps_yield, 5),
+        }
+
+    # Propiedades geométricas
+    ag = compiled.gross_area
+    ast = compiled.steel_area
+    p_kn = UC.n_to_kn(axial_load_n)
+
+    if shape_type in (ShapeType.rectangular, ShapeType.square):
+        w, h = geometry["width"], geometry["height"]
         section_summary = {
-            "forma": "Especial (poligono)",
-            "P_kN": round(axial_load_n / 1_000.0, 1),
+            "forma": "Rectangular",
+            "b_mm": round(w, 1),
+            "h_mm": round(h, 1),
+            "recubrimiento_mm": round(cover, 1),
+            "area_bruta_mm2": round(ag, 0),
+            "area_acero_mm2": round(ast, 1),
+            "rho_t_pct": round(ast / ag * 100, 3) if ag > 0 else 0.0,
+            "n_barras": len([b for b in _bars_from_reinforcement(reinforcement, shape_type, geometry, cover)]),
+            "varilla": reinforcement["bar_id"],
+            "P_sobre_fcAg": round(axial_load_n / (fpc * ag), 4) if fpc * ag > 0 else 0.0,
+            "P_kN": round(p_kn, 1),
+        }
+    elif shape_type == ShapeType.circular:
+        d = geometry["diameter"]
+        section_summary = {
+            "forma": "Circular",
+            "D_mm": round(d, 1),
+            "recubrimiento_mm": round(cover, 1),
+            "area_bruta_mm2": round(ag, 0),
+            "area_acero_mm2": round(ast, 1),
+            "rho_t_pct": round(ast / ag * 100, 3) if ag > 0 else 0.0,
+            "n_barras": reinforcement.get("n_bars", 0),
+            "varilla": reinforcement["bar_id"],
+            "P_sobre_fcAg": round(axial_load_n / (fpc * ag), 4) if fpc * ag > 0 else 0.0,
+            "P_kN": round(p_kn, 1),
+        }
+    else:
+        section_summary = {
+            "forma": "Especial (polígono)",
+            "area_bruta_mm2": round(ag, 0),
+            "area_acero_mm2": round(ast, 1),
+            "P_kN": round(p_kn, 1),
         }
 
     return material_summary, section_summary
 
 
-def _build_material_summary(fpc: float, rpt: ConfinedConcreteReport, eps_yield: float) -> dict:
-    """Construye el dict de resumen de materiales a partir del reporte Mander."""
-    unconf = unconfined_concrete(fpc)
-    return {
-        # Concreto no confinado
-        "fpc_MPa": round(fpc, 1),
-        "epsc0_unconf": round(unconf.epsc0, 4),
-        "ecu_unconf": round(unconf.epsU, 4),
-        # Concreto confinado (Mander)
-        "fpcc_MPa": round(rpt.params.fpc, 2),
-        "fcc_sobre_fc": round(rpt.fcc_over_fc, 3),
-        "ke": round(rpt.ke, 3),
-        "fl_MPa": round(rpt.fl, 3),
-        "rho_s_pct": round(rpt.rho_s * 100, 3),
-        "epsc0_conf": round(rpt.params.epsc0, 4),
-        "ecu_conf": round(rpt.params.epsU, 4),
-        # Acero
-        "fyh_MPa": round(rpt.fyh, 1),
-        "fy_MPa": round(rpt.fyh, 1),  # alias para longitudinal (misma fy en v1)
-        "eps_y": round(eps_yield, 5),
-    }
+def _bars_from_reinforcement(reinforcement: dict, shape_type, geometry: dict, cover: float) -> list:
+    """Helper temporal para contar barras en el summary."""
+    bar_id = reinforcement.get("bar_id", "#8")
+    if shape_type in (ShapeType.rectangular, ShapeType.square):
+        n_y = reinforcement.get("n_bars_y", 3) or 3
+        n_z = reinforcement.get("n_bars_z", 3) or 3
+        n = 2 * n_y + 2 * (n_z - 2)
+        return list(range(n))
+    if shape_type == ShapeType.circular:
+        return list(range(reinforcement.get("n_bars", 8) or 8))
+    return reinforcement.get("bars") or []

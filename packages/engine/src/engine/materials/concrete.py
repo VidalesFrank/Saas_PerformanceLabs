@@ -30,6 +30,22 @@ class ConcreteMaterialParams:
     epsU: float   # deformacion unitaria ultima
 
 
+@dataclass(frozen=True)
+class ConfinedConcreteReport:
+    """Resultado completo del modelo de confinamiento Mander, incluyendo parametros intermedios.
+
+    Complementa ConcreteMaterialParams con los valores de ingenieria que permiten
+    verificar el confinamiento y generar el reporte profesional de la seccion.
+    """
+
+    params: ConcreteMaterialParams  # listos para Concrete01
+    ke: float           # factor de efectividad de confinamiento [-]
+    fl: float           # presion lateral efectiva de confinamiento [MPa]
+    rho_s: float        # cuantia volumetrica de acero de confinamiento [-]
+    fcc_over_fc: float  # factor de amplificacion de resistencia f'cc/f'c [-]
+    fyh: float          # resistencia a la fluencia del acero de confinamiento [MPa]
+
+
 def unconfined_concrete(
     fpc: float,
     eco: float = 0.002,
@@ -55,14 +71,18 @@ class RectConfinement:
     rho_cc: float                # cuantia de acero longitudinal respecto al area del nucleo (Asl/Ac)
 
 
-def mander_confined_rect(
+def mander_confined_rect_report(
     fpc: float,
     fyh: float,
     confinement: RectConfinement,
     eco: float = 0.002,
     esu_transverse: float = 0.10,
-) -> ConcreteMaterialParams:
-    """Concreto de nucleo confinado por estribos rectangulares (Mander et al. 1988)."""
+) -> ConfinedConcreteReport:
+    """Concreto de nucleo confinado por estribos rectangulares (Mander et al. 1988).
+
+    Retorna el reporte completo con parametros intermedios (ke, fl, rho_s, f'cc/f'c)
+    ademas de los parametros para Concrete01.
+    """
     bc, dc, s = confinement.bc, confinement.dc, confinement.s
     s_prime = max(s - confinement.hoop_bar_diameter, 0.0)
 
@@ -88,7 +108,26 @@ def mander_confined_rect(
              + 2 * confinement.num_legs_y * confinement.leg_area / (bc * s)) / 2
     ecu = 0.004 + 1.4 * rho_s * fyh * esu_transverse / fpcc
 
-    return ConcreteMaterialParams(fpc=fpcc, epsc0=epscc, fpcu=0.2 * fpcc, epsU=ecu)
+    params = ConcreteMaterialParams(fpc=fpcc, epsc0=epscc, fpcu=0.2 * fpcc, epsU=ecu)
+    return ConfinedConcreteReport(
+        params=params,
+        ke=ke,
+        fl=fl,
+        rho_s=rho_s,
+        fcc_over_fc=fpcc / fpc,
+        fyh=fyh,
+    )
+
+
+def mander_confined_rect(
+    fpc: float,
+    fyh: float,
+    confinement: RectConfinement,
+    eco: float = 0.002,
+    esu_transverse: float = 0.10,
+) -> ConcreteMaterialParams:
+    """Concreto de nucleo confinado por estribos rectangulares (Mander et al. 1988)."""
+    return mander_confined_rect_report(fpc, fyh, confinement, eco, esu_transverse).params
 
 
 @dataclass(frozen=True)
@@ -103,14 +142,17 @@ class CircConfinement:
     is_spiral: bool = True         # True: espiral continua (ke=0.95); False: estribos circulares (ke=1.0)
 
 
-def mander_confined_circ(
+def mander_confined_circ_report(
     fpc: float,
     fyh: float,
     confinement: CircConfinement,
     eco: float = 0.002,
     esu_transverse: float = 0.10,
-) -> ConcreteMaterialParams:
-    """Concreto de nucleo confinado por espiral/estribos circulares (Mander et al. 1988)."""
+) -> ConfinedConcreteReport:
+    """Concreto de nucleo confinado por espiral/estribos circulares (Mander et al. 1988).
+
+    Retorna el reporte completo con parametros intermedios.
+    """
     ds, s = confinement.ds, confinement.s
     s_prime = max(s - confinement.hoop_bar_diameter, 0.0)
 
@@ -126,7 +168,26 @@ def mander_confined_circ(
     epscc = eco * (1 + 5 * (fpcc / fpc - 1))
     ecu = 0.004 + 1.4 * rho_s * fyh * esu_transverse / fpcc
 
-    return ConcreteMaterialParams(fpc=fpcc, epsc0=epscc, fpcu=0.2 * fpcc, epsU=ecu)
+    params = ConcreteMaterialParams(fpc=fpcc, epsc0=epscc, fpcu=0.2 * fpcc, epsU=ecu)
+    return ConfinedConcreteReport(
+        params=params,
+        ke=ke,
+        fl=fl,
+        rho_s=rho_s,
+        fcc_over_fc=fpcc / fpc,
+        fyh=fyh,
+    )
+
+
+def mander_confined_circ(
+    fpc: float,
+    fyh: float,
+    confinement: CircConfinement,
+    eco: float = 0.002,
+    esu_transverse: float = 0.10,
+) -> ConcreteMaterialParams:
+    """Concreto de nucleo confinado por espiral/estribos circulares (Mander et al. 1988)."""
+    return mander_confined_circ_report(fpc, fyh, confinement, eco, esu_transverse).params
 
 
 def _mander_confined_strength(fpc: float, fl: float) -> float:

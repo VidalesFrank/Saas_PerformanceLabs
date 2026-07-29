@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, Enum, Float, ForeignKey, String, Text
+from sqlalchemy import JSON, DateTime, Enum, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -83,6 +83,33 @@ class InteractionResult(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     section: Mapped["Section"] = relationship(back_populates="results")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Módulo 2 v2 — Section Engineering (nuevo modelo de datos)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SectionV2(Base):
+    """Sección de concreto reforzado en formato SectionDocument (Módulo 2 v2).
+
+    El campo `document` almacena el JSON completo del SectionDocument del engine,
+    incluyendo regiones, barras y materiales. Es el objeto principal del editor
+    gráfico de secciones.
+    """
+    __tablename__ = "sections_v2"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    document: Mapped[dict] = mapped_column(JSON, nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

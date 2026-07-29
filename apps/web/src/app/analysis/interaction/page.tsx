@@ -639,9 +639,9 @@ export default function InteractionDiagramPage() {
 
           <Card>
             <CardHeader>
-              <h2 className="text-sm font-medium text-text">Combinaciones de carga (Pu/Mu)</h2>
+              <h2 className="text-sm font-medium text-text">Verificacion P-M — Indice de sobreesfuerzo</h2>
               <p className="mt-1 text-xs text-text-muted">
-                Una combinacion por linea: Pu (kN), Mu (kN·m). Los marcadores verdes indican OK (dentro de φ·P-M), rojos indican NG.
+                Ingresa combinaciones de carga (una por linea) para obtener el indice C/D y DCR respecto a la curva &phi;·P-M.
               </p>
             </CardHeader>
             <CardBody>
@@ -654,12 +654,12 @@ export default function InteractionDiagramPage() {
               />
               {loadCombinations.length > 0 && !result && (
                 <p className="mt-2 text-xs text-text-muted">
-                  Calcula el diagrama primero para ver los marcadores.
+                  Calcula el diagrama primero para ver el indice de sobreesfuerzo.
                 </p>
               )}
               {loadCombinations.length > 0 && result && (
                 <p className="mt-2 text-xs text-accent">
-                  {loadCombinations.length} combinacion{loadCombinations.length !== 1 ? "es" : ""} activa{loadCombinations.length !== 1 ? "s" : ""} — ver marcadores en el diagrama.
+                  {loadCombinations.length} combinacion{loadCombinations.length !== 1 ? "es" : ""} — marcadores en la grafica y tabla de resultados debajo del diagrama.
                 </p>
               )}
             </CardBody>

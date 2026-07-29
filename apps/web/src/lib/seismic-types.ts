@@ -44,3 +44,40 @@ export interface SoilTypeInfo {
   nombre: string;
   descripcion: string;
 }
+
+export interface MicrozonificacionZona {
+  id: string;
+  nombre: string;
+  descripcion: string;
+  color: string;
+  Fa_eff: number;
+  Fv_eff: number;
+  SDs: number;
+  SD1: number;
+  T0: number;
+  Ts: number;
+  TL: number;
+}
+
+export interface MicrozonificacionInfo {
+  nombre: string;
+  estudio: string;
+  Aa_base: number;
+  Av_base: number;
+  nota: string;
+  zonas: MicrozonificacionZona[];
+}
+
+export interface EspectroMicrozonificacionResult {
+  municipio_id: string;
+  zona_id: string;
+  zona_nombre: string;
+  params: {
+    SDs: number;
+    SD1: number;
+    T0: number;
+    Ts: number;
+    TL: number;
+  };
+  puntos: PuntoEspectro[];
+}

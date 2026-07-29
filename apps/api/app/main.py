@@ -9,6 +9,7 @@ from app.db import engine
 from app.models import Base, BuildingJob, BuildingJobStatus
 from app.routers import auth, catalog, sections, seismic
 from app.routers import building_projects, building_analysis
+from app.routers import section_editor
 
 
 def _create_tables() -> None:
@@ -72,6 +73,9 @@ app.include_router(auth.router)
 app.include_router(catalog.router)
 app.include_router(sections.router)
 app.include_router(seismic.router)
+
+# ── Módulo 2 v2: Editor de Secciones ─────────────────────────────────────────
+app.include_router(section_editor.router)
 
 # ── Módulo 3: Análisis No Lineal 3D de Edificios ─────────────────────────────
 app.include_router(building_projects.router)

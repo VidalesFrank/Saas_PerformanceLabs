@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { clearToken } from "@/lib/auth";
 
 export function AppHeader({ crumb }: { crumb?: string }) {
@@ -27,9 +28,12 @@ export function AppHeader({ crumb }: { crumb?: string }) {
             </>
           )}
         </div>
-        <Button variant="ghost" onClick={logout}>
-          Cerrar sesion
-        </Button>
+        <div className="flex items-center gap-3">
+          <ThemeToggle />
+          <Button variant="ghost" onClick={logout}>
+            Cerrar sesion
+          </Button>
+        </div>
       </div>
     </header>
   );

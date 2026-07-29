@@ -113,3 +113,50 @@ def compute_spectrum(
         "puntos": puntos,
         "zona_sismica": zona_sismica(Aa),
     }
+
+
+def compute_spectrum_from_params(
+    SDs: float,
+    SD1: float,
+    T0: float,
+    Ts: float,
+    TL: float = 4.0,
+    T_max: float = 4.0,
+    n_points: int = 300,
+) -> dict:
+    """Calcula el espectro elastico directamente desde parametros espectrales.
+
+    Util para espectros de microzonificacion donde Fa/Fv no corresponden
+    a las tablas estandar NSR-10 sino a valores especificos de cada zona.
+
+    Retorna un dict con:
+      - params: SDs, SD1, T0, Ts, TL
+      - puntos: lista de {T, Sa, Sd, Sv}
+    """
+    key_Ts = [0.0, T0 * 0.5, T0, (T0 + Ts) / 2, Ts, Ts * 1.5, TL, T_max]
+    key_Ts = [t for t in key_Ts if 0 <= t <= T_max]
+    T_uniform = np.linspace(0.0, T_max, n_points).tolist()
+    T_all = sorted(set([round(t, 6) for t in T_uniform + key_Ts]))
+
+    puntos = []
+    for T in T_all:
+        Sa = _sa_at_T(T, SDs, SD1, T0, Ts, TL)
+        Sd = Sa * _G_CM_S2 * T**2 / (4 * np.pi**2) if T > 0 else 0.0
+        Sv = Sa * _G_CM_S2 * T / (2 * np.pi) if T > 0 else 0.0
+        puntos.append({
+            "T": round(T, 5),
+            "Sa": round(Sa, 6),
+            "Sd": round(Sd, 4),
+            "Sv": round(Sv, 4),
+        })
+
+    return {
+        "params": {
+            "SDs": round(SDs, 4),
+            "SD1": round(SD1, 4),
+            "T0": round(T0, 4),
+            "Ts": round(Ts, 4),
+            "TL": TL,
+        },
+        "puntos": puntos,
+    }

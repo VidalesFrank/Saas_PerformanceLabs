@@ -59,7 +59,11 @@ CATALOG = [
                 "name": "Disenador de secciones de fibras",
                 "nivel": "pro", "estado": "idea", "route": None,
             },
-            {"id": "biblioteca-secciones", "name": "Biblioteca de secciones", "nivel": None, "estado": "idea", "route": None},
+            {
+                "id": "biblioteca-secciones",
+                "name": "Editor grafico de secciones (CAD)",
+                "nivel": "pro", "estado": "en_desarrollo", "route": "/sections",
+            },
             {"id": "editor-refuerzo", "name": "Editor de refuerzo", "nivel": None, "estado": "idea", "route": None},
             {"id": "confinamiento", "name": "Confinamiento", "nivel": None, "estado": "idea", "route": None},
             {
