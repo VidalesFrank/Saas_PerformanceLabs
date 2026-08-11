@@ -6,10 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db import engine
-from app.models import Base, BuildingJob, BuildingJobStatus
+from app.models import Base, BuildingJob, BuildingJobStatus, StructuralJob, StructuralJobStatus
 from app.routers import auth, catalog, sections, seismic
 from app.routers import building_projects, building_analysis
 from app.routers import section_editor
+from app.routers import structural_projects, structural_analysis
 
 
 def _create_tables() -> None:
@@ -20,27 +21,40 @@ def _cleanup_orphaned_jobs() -> None:
     """
     Al arrancar, marca como 'failed' los jobs que quedaron en estado running/pending
     sin tarea Celery activa (worker reiniciado, crash, etc.).
-    Solo afecta BuildingJob — el módulo de análisis 3D.
+    Afecta BuildingJob (Módulo 3) y StructuralJob (Módulo 1).
     """
     from sqlalchemy.orm import Session
     from app.db import SessionLocal
 
     db: Session = SessionLocal()
     try:
-        orphans = (
+        n_total = 0
+
+        orphaned_building = (
             db.query(BuildingJob)
-            .filter(
-                BuildingJob.status.in_([BuildingJobStatus.running, BuildingJobStatus.pending])
-            )
+            .filter(BuildingJob.status.in_([BuildingJobStatus.running, BuildingJobStatus.pending]))
             .all()
         )
-        for job in orphans:
+        for job in orphaned_building:
             job.status = BuildingJobStatus.failed
             job.error_message = "Worker reiniciado o caído — job interrumpido"
             job.finished_at = datetime.now(timezone.utc)
-        if orphans:
+        n_total += len(orphaned_building)
+
+        orphaned_structural = (
+            db.query(StructuralJob)
+            .filter(StructuralJob.status.in_([StructuralJobStatus.running, StructuralJobStatus.pending]))
+            .all()
+        )
+        for job in orphaned_structural:
+            job.status = StructuralJobStatus.failed
+            job.error_message = "Worker reiniciado o caído — job interrumpido"
+            job.finished_at = datetime.now(timezone.utc)
+        n_total += len(orphaned_structural)
+
+        if n_total:
             db.commit()
-            print(f"[startup] {len(orphans)} job(s) huérfano(s) marcados como failed")
+            print(f"[startup] {n_total} job(s) huérfano(s) marcados como failed")
     except Exception as e:
         print(f"[startup] cleanup_orphaned_jobs falló: {e}")
     finally:
@@ -66,6 +80,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_private_network=True,
 )
 
 # ── Módulos existentes ────────────────────────────────────────────────────────
@@ -80,6 +95,12 @@ app.include_router(section_editor.router)
 # ── Módulo 3: Análisis No Lineal 3D de Edificios ─────────────────────────────
 app.include_router(building_projects.router)
 app.include_router(building_analysis.router)
+
+# ── Módulo 1: Constructor de Modelos Estructurales ────────────────────────────
+# IMPORTANTE: structural_analysis debe registrarse ANTES de structural_projects
+# porque su prefix /api/v1/projects/analysis es más específico que /api/v1/projects
+app.include_router(structural_analysis.router)
+app.include_router(structural_projects.router)
 
 
 @app.get("/api/v1/health")

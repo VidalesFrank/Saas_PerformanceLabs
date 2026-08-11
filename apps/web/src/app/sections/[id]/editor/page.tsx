@@ -98,6 +98,79 @@ export default function SectionEditorPage() {
     setLineDialog({ y1, z1, y2, z2 });
   }
 
+  function handleExportPNG() {
+    const container = canvasContainerRef.current;
+    if (!container) return;
+    const svgEl = container.querySelector("svg");
+    if (!svgEl) return;
+
+    const rect = svgEl.getBoundingClientRect();
+    const w = Math.round(rect.width) || 800;
+    const h = Math.round(rect.height) || 600;
+
+    const cs = getComputedStyle(document.documentElement);
+    const bgColor = cs.getPropertyValue("--color-canvas-bg").trim() || "#0d1117";
+    const accentColor = cs.getPropertyValue("--color-accent").trim() || "#00b0c8";
+    const mutedColor = cs.getPropertyValue("--color-text-muted").trim() || "#6b7280";
+
+    // Deep-clone, strip event listeners & problematic attributes
+    const clone = svgEl.cloneNode(true) as SVGSVGElement;
+    clone.setAttribute("width", String(w));
+    clone.setAttribute("height", String(h));
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    // Remove cursor style — invalid in SVG-as-image context
+    clone.removeAttribute("style");
+    clone.querySelectorAll("[style]").forEach((el) => el.removeAttribute("style"));
+
+    // Serialize and resolve CSS variables
+    let svgStr = new XMLSerializer().serializeToString(clone);
+    svgStr = svgStr.replaceAll(`var(--color-text-muted)`, mutedColor);
+    svgStr = svgStr.replaceAll(`var(--color-accent)`, accentColor);
+    // Inject background fill as first child rect
+    svgStr = svgStr.replace(
+      /(<svg[^>]*>)/,
+      `$1<rect width="${w}" height="${h}" fill="${bgColor}"/>`
+    );
+
+    const dpr = window.devicePixelRatio || 1;
+    const canvas = document.createElement("canvas");
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    const ctx = canvas.getContext("2d")!;
+    ctx.scale(dpr, dpr);
+    ctx.fillStyle = bgColor;
+    ctx.fillRect(0, 0, w, h);
+
+    const img = new Image();
+    img.onload = () => {
+      ctx.drawImage(img, 0, 0, w, h);
+      canvas.toBlob((pngBlob) => {
+        if (!pngBlob) return;
+        const dlUrl = URL.createObjectURL(pngBlob);
+        const a = document.createElement("a");
+        a.href = dlUrl;
+        a.download = `${record?.name ?? "seccion"}.png`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(dlUrl), 5000);
+      }, "image/png");
+    };
+    img.onerror = () => {
+      // Fallback: download SVG directly if PNG conversion fails
+      const blob = new Blob([svgStr], { type: "image/svg+xml" });
+      const dlUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = dlUrl;
+      a.download = `${record?.name ?? "seccion"}.svg`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(dlUrl), 5000);
+    };
+    img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgStr)}`;
+  }
+
   if (loadError) {
     return (
       <div className="flex min-h-screen flex-col bg-bg">
@@ -148,6 +221,9 @@ export default function SectionEditorPage() {
           <ThemeToggle />
           <Button variant="secondary" className="text-xs" onClick={() => setShowMaterials(true)}>
             Materiales
+          </Button>
+          <Button variant="secondary" className="text-xs" onClick={handleExportPNG}>
+            Exportar PNG
           </Button>
           <Link href={`/sections/${id}/analyze`}>
             <Button variant="secondary" className="text-xs">

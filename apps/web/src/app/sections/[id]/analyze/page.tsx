@@ -7,6 +7,7 @@ import { ApiError } from "@/lib/api";
 import { sectionEditorApi } from "@/lib/editor-api";
 import type { InteractionResult, MomentCurvatureResult, PMMSurfaceResult, PMMDemand, PMMDemandResult, NSR10Result, NSR10CheckItem } from "@/lib/editor-api";
 import type { SectionRecord } from "@/lib/section-document";
+import { exportPMPDF, exportMCPDF, exportPMMPDF, exportNSR10PDF } from "@/lib/pdf-report";
 import { sectionGrossArea, sectionSteelArea } from "@/lib/section-document";
 import { useRequireAuth } from "@/lib/use-require-auth";
 import { Button } from "@/components/ui/button";
@@ -71,6 +72,7 @@ function PMTab({ sectionId, sectionName }: { sectionId: string; sectionName: str
   const [result, setResult] = useState<InteractionResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
 
   async function run() {
     setLoading(true); setError(null);
@@ -126,8 +128,12 @@ function PMTab({ sectionId, sectionName }: { sectionId: string; sectionName: str
             <InteractionChart points={toPMPoints(result.points)} />
           </div>
           <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => window.print()}>
-              Imprimir / PDF
+            <Button variant="secondary" disabled={exporting} onClick={async () => {
+              setExporting(true);
+              try { await exportPMPDF(sectionName, result, thetaDeg); }
+              finally { setExporting(false); }
+            }}>
+              {exporting ? "Generando PDF…" : "Exportar PDF"}
             </Button>
             <Button variant="secondary" onClick={() => downloadCsv(
               ["p_kn,m_knm", ...result.points.map((p) => `${p.p_kn},${p.m_knm}`)],
@@ -165,6 +171,7 @@ function MCTab({ sectionId, sectionName }: { sectionId: string; sectionName: str
   const [runs, setRuns] = useState<MCRun[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
 
   async function run() {
     setLoading(true); setError(null);
@@ -285,8 +292,12 @@ function MCTab({ sectionId, sectionName }: { sectionId: string; sectionName: str
           )}
 
           <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => window.print()}>
-              Imprimir / PDF
+            <Button variant="secondary" disabled={exporting} onClick={async () => {
+              setExporting(true);
+              try { await exportMCPDF(sectionName, runs.map((r) => ({ axialKn: r.axialKn, result: r.result }))); }
+              finally { setExporting(false); }
+            }}>
+              {exporting ? "Generando PDF…" : "Exportar PDF"}
             </Button>
             <Button variant="secondary" onClick={() => downloadCsv(
               ["phi_1_m,moment_kNm", ...latest.curve.map((p) => `${p.phi},${p.moment}`)],
@@ -365,6 +376,7 @@ function PMMTab({ sectionId, sectionName, pMaxRef }: { sectionId: string; sectio
   const [result, setResult] = useState<PMMSurfaceResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
 
   async function run() {
     setLoading(true); setError(null);
@@ -495,8 +507,12 @@ function PMMTab({ sectionId, sectionName, pMaxRef }: { sectionId: string; sectio
             </div>
           </div>
           <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => window.print()}>
-              Imprimir / PDF
+            <Button variant="secondary" disabled={exporting} onClick={async () => {
+              setExporting(true);
+              try { await exportPMMPDF(sectionName, result); }
+              finally { setExporting(false); }
+            }}>
+              {exporting ? "Generando PDF…" : "Exportar PDF"}
             </Button>
             {demands.length > 0 && result.demands_out.length > 0 && (
               <Button variant="secondary" onClick={() => downloadCsv(
@@ -543,12 +559,13 @@ const STATUS_CONFIG = {
   info:    { label: "INFO",      bg: "bg-surface-2",   border: "border-border",      text: "text-text-muted", icon: "i" },
 } as const;
 
-function NSR10Tab({ sectionId }: { sectionId: string }) {
+function NSR10Tab({ sectionId, sectionName }: { sectionId: string; sectionName: string }) {
   const [elementType, setElementType] = useState<string>("columna");
   const [ductility, setDuctility]     = useState<string>("DMO");
   const [result, setResult]           = useState<NSR10Result | null>(null);
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState<string | null>(null);
+  const [exporting, setExporting]     = useState(false);
 
   async function run() {
     setLoading(true); setError(null);
@@ -697,6 +714,15 @@ function NSR10Tab({ sectionId }: { sectionId: string }) {
               })}
             </div>
           </div>
+          <div className="flex justify-end">
+            <Button variant="secondary" disabled={exporting} onClick={async () => {
+              setExporting(true);
+              try { await exportNSR10PDF(sectionName, result); }
+              finally { setExporting(false); }
+            }}>
+              {exporting ? "Generando PDF…" : "Exportar PDF"}
+            </Button>
+          </div>
         </>
       )}
 
@@ -814,7 +840,7 @@ export default function AnalyzePage() {
         {id && activeTab === "pm"    && <PMTab    sectionId={id} sectionName={sectionName} />}
         {id && activeTab === "mc"    && <MCTab    sectionId={id} sectionName={sectionName} />}
         {id && activeTab === "pmm"   && <PMMTab   sectionId={id} sectionName={sectionName} pMaxRef={0} />}
-        {id && activeTab === "nsr10" && <NSR10Tab sectionId={id} />}
+        {id && activeTab === "nsr10" && <NSR10Tab sectionId={id} sectionName={sectionName} />}
       </div>
     </div>
   );

@@ -25,6 +25,35 @@ def _read(xl: pd.ExcelFile, sheet: str) -> pd.DataFrame | None:
     return df.drop(index=0).reset_index(drop=True)
 
 
+def _read_units_row(xl: pd.ExcelFile, sheet: str) -> dict[str, str]:
+    """Lee la fila de unidades (fila 2) de una hoja ETABS → {columna: unidad}."""
+    if sheet not in xl.sheet_names:
+        return {}
+    df = pd.read_excel(xl, sheet_name=sheet, skiprows=1, header=0, nrows=1)
+    if df.empty:
+        return {}
+    return {
+        col: str(val).strip().lower()
+        for col, val in df.iloc[0].items()
+        if pd.notna(val) and str(val).strip() not in ("", "nan")
+    }
+
+
+def _to_meters(unit: str, power: int = 1) -> float:
+    """Factor multiplicador para convertir la unidad a metros (o m^power)."""
+    u = (unit or "").lower().replace(" ", "").replace("**", "").replace("^", "")
+    base: float = 1.0
+    if u.startswith("cm"):
+        base = 0.01
+    elif u.startswith("mm"):
+        base = 0.001
+    elif u.startswith("in"):
+        base = 0.0254
+    elif u.startswith("ft"):
+        base = 0.3048
+    return base ** power
+
+
 def _write_sheet(wb: Workbook, sheet_name: str, table_key: str,
                  columns: list, units: list, df: pd.DataFrame) -> None:
     ws = wb.create_sheet(title=sheet_name)
@@ -146,16 +175,35 @@ def _t_restraints(df: pd.DataFrame) -> pd.DataFrame:
     return df[[c for c in cols if c in df.columns]]
 
 
-def _t_frame_sections(df: pd.DataFrame) -> pd.DataFrame:
+def _t_frame_sections(df: pd.DataFrame,
+                      units: dict[str, str] | None = None) -> pd.DataFrame:
     """Frame Prop - Summary → Frame Sections.
 
     E23 no tiene t3/t2. Para secciones rectangulares:
       t3 = sqrt(12 * I33 / Area)
       t2 = sqrt(12 * I22 / Area)
+
+    Si el modelo fue exportado en unidades distintas a m/m²/m⁴ (p.ej. kgf-cm
+    exporta cm²/cm⁴), se aplica el factor de conversión leído de la fila de
+    unidades del XLSX para que el modelo canónico siempre quede en metros.
     """
     df = df.copy()
     for col in ['Area', 'I33', 'I22', 'J']:
         df[col] = pd.to_numeric(df.get(col, 0), errors='coerce').fillna(0)
+
+    # Detectar factores de conversión desde la fila de unidades del XLSX
+    if units:
+        area_factor = _to_meters(units.get('Area', 'm2'), power=2)
+        i_factor    = _to_meters(units.get('I33',  'm4'), power=4)
+    else:
+        area_factor = 1.0
+        i_factor    = 1.0
+
+    if area_factor != 1.0:
+        df['Area'] *= area_factor
+    if i_factor != 1.0:
+        for col in ['I33', 'I22', 'J']:
+            df[col] *= i_factor
 
     def calc_t(i_val, area):
         if area > 1e-12:
@@ -163,15 +211,9 @@ def _t_frame_sections(df: pd.DataFrame) -> pd.DataFrame:
             return math.sqrt(max(v, 0))
         return 0.0
 
+    # t3/t2 se calculan sobre los valores ya convertidos → quedan en metros
     df['t3'] = df.apply(lambda r: calc_t(r['I33'], r['Area']), axis=1)
     df['t2'] = df.apply(lambda r: calc_t(r['I22'], r['Area']), axis=1)
-
-    # E17 exporta Area en cm² e I/J en cm⁴ — convertir desde m²/m⁴
-    df['Area'] = df['Area'] * 1e4   # m² → cm²
-    df['I33']  = df['I33']  * 1e8   # m⁴ → cm⁴
-    df['I22']  = df['I22']  * 1e8
-    if 'J' in df.columns:
-        df['J'] = df['J'] * 1e8
 
     cols = ['Name', 'Material', 'Shape', 't3', 't2', 'Area', 'I33', 'I22', 'J']
     return df[[c for c in cols if c in df.columns]]
@@ -428,7 +470,8 @@ def adapt_e23_to_e17(input_path: str, output_path: str) -> None:
     df_fc = _t_floor_conn(df_floor_conn) if df_floor_conn is not None else None
     df_m  = _t_materials(df_conc_data, df_mech_props) if df_conc_data is not None else None
     df_r  = _t_restraints(df_restraints) if df_restraints is not None else None
-    df_fs = _t_frame_sections(df_fr_prop_sum) if df_fr_prop_sum is not None else None
+    units_fr_prop = _read_units_row(xl, 'Frame Prop - Summary')
+    df_fs = _t_frame_sections(df_fr_prop_sum, units=units_fr_prop) if df_fr_prop_sum is not None else None
     df_fa = _t_frame_assigns(df_fr_sect_prop, df_fr_summary) if df_fr_sect_prop is not None else None
     df_sa = _t_shell_assigns(df_area_sect_prop) if df_area_sect_prop is not None else None
     df_sl = _t_slab_sections(df_slab_prop) if df_slab_prop is not None else None

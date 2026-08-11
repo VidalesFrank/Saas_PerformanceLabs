@@ -108,6 +108,71 @@ function regionCenter(shape: RegionShape): { y: number; z: number } {
   return { y, z };
 }
 
+// ── Cotas (dimension overlay) ─────────────────────────────────────────────────
+
+function getShapeBBox(shape: RegionShape) {
+  if (shape.kind === "rect") {
+    const { y, z, height: h, width: w } = shape;
+    return { minY: y - h / 2, maxY: y + h / 2, minZ: z - w / 2, maxZ: z + w / 2,
+      wLabel: `${Math.round(w)} mm`, hLabel: `${Math.round(h)} mm` };
+  }
+  if (shape.kind === "circ") {
+    const { y, z, radius: r } = shape;
+    const d = Math.round(2 * r);
+    return { minY: y - r, maxY: y + r, minZ: z - r, maxZ: z + r,
+      wLabel: `⌀${d} mm`, hLabel: `⌀${d} mm` };
+  }
+  if (shape.vertices.length < 2) return null;
+  const ys = shape.vertices.map(([vy]) => vy);
+  const zs = shape.vertices.map(([, vz]) => vz);
+  const [minY, maxY] = [Math.min(...ys), Math.max(...ys)];
+  const [minZ, maxZ] = [Math.min(...zs), Math.max(...zs)];
+  return { minY, maxY, minZ, maxZ,
+    wLabel: `${Math.round(maxZ - minZ)} mm`, hLabel: `${Math.round(maxY - minY)} mm` };
+}
+
+function DimLines({ shape, zoom, color }: { shape: RegionShape; zoom: number; color: string }) {
+  const bb = getShapeBBox(shape);
+  if (!bb) return null;
+  const { minY, maxY, minZ, maxZ, wLabel, hLabel } = bb;
+
+  const gap = 28 / zoom;
+  const ext = 6 / zoom;
+  const tick = 5 / zoom;
+  const lw = 1 / zoom;
+  const fs = 10; // px, counter-scaled so stays constant on screen
+
+  // Horizontal dim line (width) — placed below the shape
+  const hdY = minY - gap;
+  const hmidZ = (minZ + maxZ) / 2;
+
+  // Vertical dim line (height) — placed left of the shape
+  const vdZ = minZ - gap;
+  const vmidY = (minY + maxY) / 2;
+
+  return (
+    <g pointerEvents="none">
+      {/* Width dimension */}
+      <line x1={minZ} y1={hdY} x2={maxZ} y2={hdY} stroke={color} strokeWidth={lw} />
+      <line x1={minZ} y1={minY} x2={minZ} y2={hdY - ext} stroke={color} strokeWidth={lw * 0.6} strokeDasharray={`${3/zoom} ${2/zoom}`} />
+      <line x1={maxZ} y1={minY} x2={maxZ} y2={hdY - ext} stroke={color} strokeWidth={lw * 0.6} strokeDasharray={`${3/zoom} ${2/zoom}`} />
+      <line x1={minZ - tick} y1={hdY} x2={minZ + tick} y2={hdY} stroke={color} strokeWidth={lw * 1.8} />
+      <line x1={maxZ - tick} y1={hdY} x2={maxZ + tick} y2={hdY} stroke={color} strokeWidth={lw * 1.8} />
+      <text transform={`translate(${hmidZ},${hdY - ext}) scale(${1/zoom},${-1/zoom})`}
+        textAnchor="middle" fontSize={fs} fontFamily="monospace" fill={color}>{wLabel}</text>
+
+      {/* Height dimension */}
+      <line x1={vdZ} y1={minY} x2={vdZ} y2={maxY} stroke={color} strokeWidth={lw} />
+      <line x1={minZ} y1={minY} x2={vdZ - ext} y2={minY} stroke={color} strokeWidth={lw * 0.6} strokeDasharray={`${3/zoom} ${2/zoom}`} />
+      <line x1={minZ} y1={maxY} x2={vdZ - ext} y2={maxY} stroke={color} strokeWidth={lw * 0.6} strokeDasharray={`${3/zoom} ${2/zoom}`} />
+      <line x1={vdZ} y1={minY - tick} x2={vdZ} y2={minY + tick} stroke={color} strokeWidth={lw * 1.8} />
+      <line x1={vdZ} y1={maxY - tick} x2={vdZ} y2={maxY + tick} stroke={color} strokeWidth={lw * 1.8} />
+      <text transform={`translate(${vdZ - ext},${vmidY}) scale(${1/zoom},${-1/zoom}) rotate(-90)`}
+        textAnchor="middle" fontSize={fs} fontFamily="monospace" fill={color}>{hLabel}</text>
+    </g>
+  );
+}
+
 // ── SVG path de formas ─────────────────────────────────────────────────────────
 
 function regionPath(shape: RegionShape): string {
@@ -568,6 +633,15 @@ export function EditorCanvas({ state, dispatch, onLineComplete }: Props) {
     }
   }
 
+  // Cotas de la región seleccionada
+  let cotasEl: React.ReactNode = null;
+  if (selection?.kind === "region") {
+    const selRegion = doc.regions.find((r) => r.id === selection.id);
+    if (selRegion) {
+      cotasEl = <DimLines shape={selRegion.shape} zoom={zoom} color={C.concreteSelected} />;
+    }
+  }
+
   // Recuadro de selección múltiple
   const boxEl = boxRect ? (
     <rect
@@ -610,6 +684,7 @@ export function EditorCanvas({ state, dispatch, onLineComplete }: Props) {
           {gridLines}
           {regionEls}
           {barEls}
+          {cotasEl}
           {previewEl}
           {boxEl}
           {crosshair}

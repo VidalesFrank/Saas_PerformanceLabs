@@ -193,3 +193,90 @@ class BuildingJob(Base):
 
     project: Mapped["BuildingProject"] = relationship("BuildingProject", back_populates="jobs")
     owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Módulo 1 — Constructor de Modelos Estructurales (análisis sísmico lineal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StructuralAnalysisType(str, enum.Enum):
+    import_validate = "import_validate"  # Parseo + validación + modelo canónico JSON
+    modal           = "modal"            # Análisis modal (eigenvalue)
+    spectral        = "spectral"         # RSA modal espectral + ajuste FHE NSR-10
+
+
+class StructuralJobStatus(str, enum.Enum):
+    pending   = "pending"
+    running   = "running"
+    success   = "success"
+    failed    = "failed"
+    cancelled = "cancelled"
+
+
+class StructuralProject(Base):
+    """Proyecto de análisis sísmico lineal — Módulo 1 Constructor de Modelos.
+
+    Almacena el modelo importado de ETABS (XLSX o .e2k), los parámetros sísmicos
+    NSR-10 del proyecto y la ruta al modelo canónico JSON generado tras la validación.
+    Es el punto de entrada de toda la cadena de análisis: sísmico → diseño → no lineal.
+    """
+    __tablename__ = "structural_projects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Parámetros sísmicos NSR-10 almacenados como JSON
+    parameters_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Archivos de entrada subidos por el usuario
+    input_file_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    e2k_file_path:   Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    # Ruta al modelo canónico generado (structural_model.json) — producido por import_validate
+    canonical_model_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    # Estado resumido de la última validación: not_run / has_errors / has_warnings / ok
+    validation_status: Mapped[str] = mapped_column(String(20), default="not_run", nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
+    jobs: Mapped[list["StructuralJob"]] = relationship(
+        "StructuralJob", back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class StructuralJob(Base):
+    """Job de análisis asincrónico del Módulo 1 (Celery)."""
+    __tablename__ = "structural_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    celery_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+
+    analysis_type: Mapped[StructuralAnalysisType] = mapped_column(
+        Enum(StructuralAnalysisType), nullable=False
+    )
+    status: Mapped[StructuralJobStatus] = mapped_column(
+        Enum(StructuralJobStatus), default=StructuralJobStatus.pending, nullable=False
+    )
+
+    result_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    project_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("structural_projects.id"), nullable=False
+    )
+    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped["StructuralProject"] = relationship("StructuralProject", back_populates="jobs")
+    owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
