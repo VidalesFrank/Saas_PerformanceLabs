@@ -151,12 +151,36 @@ def _moment_curvature_max(
     return abs(max_moment)
 
 
+def _pm_p_levels(p_max: float, p_min: float, num_points: int) -> np.ndarray:
+    """Distribucion 3 zonas para diagrama P-M.
+
+    Zona 1 (40%): compresion alta — desde P_max hasta ~35% P_max.
+    Zona 2 (40%): zona balanceada — de ~35% a ~-10% P_max (captura pico de M).
+    Zona 3 (20%): traccion — hasta P_min.
+    """
+    n1 = max(2, int(num_points * 0.40))
+    n2 = max(2, int(num_points * 0.40))
+    n3 = max(1, num_points - n1 - n2)
+
+    p_bal = p_max * 0.35   # estimacion del punto balanceado
+    p_mid = p_max * (-0.10)
+
+    z1 = np.linspace(0.98 * p_max, p_bal, n1, endpoint=False)
+    z2 = np.linspace(p_bal, p_mid, n2, endpoint=False)
+    z3 = np.linspace(p_mid, 0.98 * p_min, n3)
+    return np.concatenate([z1, z2, z3])
+
+
 def compute_interaction_diagram(
     compiled: CompiledFiberSection,
-    num_points: int = 15,
+    num_points: int = 40,
     theta_deg: float = 0.0,
 ) -> list[InteractionPoint]:
-    """Calcula la envolvente P-M completa: compresion pura → flexion → tension pura."""
+    """Calcula la envolvente P-M completa: compresion pura → flexion → tension pura.
+
+    Usa distribucion 3-zonas para mayor densidad en la region balanceada donde
+    la curva tiene mayor variacion.  Default: 40 puntos intermedios.
+    """
     theta_rad = math.radians(theta_deg)
 
     ast = compiled.steel_area
@@ -168,7 +192,7 @@ def compute_interaction_diagram(
     p_exact_min = -fy * ast
     max_curvature = 6 * 0.025 / _effective_depth(compiled, theta_rad)
 
-    p_levels = np.linspace(0.98 * p_exact_max, 0.98 * p_exact_min, num_points)
+    p_levels = _pm_p_levels(p_exact_max, p_exact_min, num_points)
     diagram = [InteractionPoint(P=p_exact_max, M=0.0)]
     for p in p_levels:
         m = _moment_curvature_max(compiled, float(p), max_curvature, num_incr=120, theta_rad=theta_rad)
@@ -176,3 +200,32 @@ def compute_interaction_diagram(
             diagram.append(InteractionPoint(P=float(p), M=m))
     diagram.append(InteractionPoint(P=p_exact_min, M=0.0))
     return diagram
+
+
+def identify_key_points(diagram: list[InteractionPoint]) -> dict:
+    """Identifica puntos estructurales notables del diagrama P-M calculado.
+
+    Devuelve indices y valores de:
+    - compression_pure: P maximo (primer punto)
+    - balanced:         punto de momento maximo
+    - pure_flexure:     punto con P mas cercano a cero y M alto
+    - tension_pure:     P minimo (ultimo punto)
+    """
+    if not diagram:
+        return {}
+
+    idx_bal = max(range(len(diagram)), key=lambda i: diagram[i].M)
+    m_vals = [pt.M for pt in diagram]
+    p_vals = [pt.P for pt in diagram]
+
+    # Flexion pura: punto con |P| minimo dentro de la mitad de M_max
+    m_max = max(m_vals)
+    candidates_flex = [i for i, pt in enumerate(diagram) if pt.M > 0.3 * m_max]
+    idx_flex = min(candidates_flex, key=lambda i: abs(diagram[i].P)) if candidates_flex else idx_bal
+
+    return {
+        "compression_pure": {"idx": 0, "p_kn": round(p_vals[0] / 1000, 1), "m_knm": 0.0},
+        "balanced":         {"idx": idx_bal, "p_kn": round(p_vals[idx_bal] / 1000, 1), "m_knm": round(m_vals[idx_bal] / 1e6, 1)},
+        "pure_flexure":     {"idx": idx_flex, "p_kn": round(p_vals[idx_flex] / 1000, 1), "m_knm": round(m_vals[idx_flex] / 1e6, 1)},
+        "tension_pure":     {"idx": len(diagram) - 1, "p_kn": round(p_vals[-1] / 1000, 1), "m_knm": 0.0},
+    }

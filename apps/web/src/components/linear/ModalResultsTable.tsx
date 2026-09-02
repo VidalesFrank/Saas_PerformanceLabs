@@ -1,6 +1,7 @@
 "use client";
 
 import type { ModalResult, ModeRow } from "@/lib/structural-types";
+import { LinearModeShapeViewer } from "./LinearModeShapeViewer";
 
 interface Props {
   result: ModalResult;
@@ -48,6 +49,16 @@ export function ModalResultsTable({ result }: Props) {
         <StatCard label="∑Masa X"    value={`${cumUx.toFixed(1)}%`} sub="Participación acumulada" />
         <StatCard label="∑Masa Y"    value={`${cumUy.toFixed(1)}%`} sub="Participación acumulada" />
       </div>
+
+      {/* Formas modales — primeros 3 modos */}
+      {result.viewer && result.viewer.elements.length > 0 && (
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-wider text-text-muted border-b border-border pb-1 mb-3">
+            Formas Modales
+          </p>
+          <LinearModeShapeViewer result={result} />
+        </div>
+      )}
 
       {/* Tabla de modos */}
       <div className="overflow-x-auto rounded-lg border border-border">

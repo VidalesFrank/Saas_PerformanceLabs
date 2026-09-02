@@ -2,6 +2,8 @@
 
 import { useEffect, useRef } from "react";
 import type { SpectralResult, StoryDrift } from "@/lib/structural-types";
+import { useTheme } from "@/lib/theme";
+import { plotlyTheme } from "@/lib/plotly-theme";
 
 declare const Plotly: {
   newPlot: (el: HTMLElement, data: unknown[], layout: unknown, config?: unknown) => void;
@@ -95,9 +97,72 @@ function FHEPanel({ fhe }: { fhe: SpectralResult["fhe"] }) {
   );
 }
 
-// ── Tabla de derivas ──────────────────────────────────────────────────────────
+// ── Gráfica de perfil de derivas ──────────────────────────────────────────────
 
 const DRIFT_LIMIT = 1.0;  // NSR-10 A.6.3: 1% para estructuras convencionales
+
+function DriftChart({ drifts }: { drifts: StoryDrift[] }) {
+  const chartRef = useRef<HTMLDivElement>(null);
+  const { theme } = useTheme();
+  const isDark = theme === "dark";
+
+  useEffect(() => {
+    if (!chartRef.current || typeof Plotly === "undefined") return;
+    const el = chartRef.current;
+    const pt = plotlyTheme(isDark);
+
+    // Prepend base point (elevation 0 = sin desplazamiento)
+    const storyNames = ["Base", ...drifts.map((d) => d.story)];
+    const dx = [0, ...drifts.map((d) => d.drift_x_pct)];
+    const dy = [0, ...drifts.map((d) => d.drift_y_pct)];
+    const maxVal = Math.max(...dx, ...dy, DRIFT_LIMIT + 0.15);
+
+    Plotly.newPlot(
+      el,
+      [
+        { type: "scatter", mode: "lines+markers", name: "Δx",
+          x: dx, y: storyNames,
+          line: { color: "#38BDF8", width: 2 }, marker: { color: "#38BDF8", size: 5 },
+          hovertemplate: "%{y}<br>Δx = %{x:.3f}%<extra></extra>" },
+        { type: "scatter", mode: "lines+markers", name: "Δy",
+          x: dy, y: storyNames,
+          line: { color: "#34D399", width: 2 }, marker: { color: "#34D399", size: 5 },
+          hovertemplate: "%{y}<br>Δy = %{x:.3f}%<extra></extra>" },
+      ],
+      {
+        xaxis: { title: { text: "Deriva (%)", font: { size: 11 } }, range: [0, maxVal], ...pt.xaxis },
+        yaxis: { ...pt.yaxis, automargin: true, categoryorder: "array", categoryarray: storyNames },
+        shapes: [{
+          type: "line", x0: DRIFT_LIMIT, x1: DRIFT_LIMIT, y0: 0, y1: 1,
+          xref: "x", yref: "paper",
+          line: { color: pt.refLineColor, width: 1.5, dash: "dash" },
+        }],
+        annotations: [{
+          x: DRIFT_LIMIT, y: 0.98, xref: "x", yref: "paper",
+          text: "1% NSR-10", showarrow: false,
+          font: { color: pt.refLineColor, size: 10 },
+          xanchor: "left", yanchor: "top",
+        }],
+        paper_bgcolor: pt.paper_bgcolor, plot_bgcolor: pt.plot_bgcolor, font: pt.font,
+        margin: { t: 12, r: 16, b: 44, l: 80 },
+        legend: { ...pt.legend, orientation: "h", y: -0.22 },
+      },
+      { responsive: true, displayModeBar: false },
+    );
+    return () => { if (typeof Plotly !== "undefined") Plotly.purge(el); };
+  }, [drifts, isDark]);
+
+  return (
+    <div
+      className="rounded-lg border border-border bg-surface overflow-hidden"
+      style={{ height: Math.max(220, (drifts.length + 1) * 30 + 90) }}
+    >
+      <div ref={chartRef} style={{ width: "100%", height: "100%" }} />
+    </div>
+  );
+}
+
+// ── Tabla de derivas ──────────────────────────────────────────────────────────
 
 function DriftTable({ drifts }: { drifts: StoryDrift[] }) {
   return (
@@ -155,10 +220,13 @@ function ShearChart({
   shears_y: Record<string, number>;
 }) {
   const chartRef = useRef<HTMLDivElement>(null);
+  const { theme } = useTheme();
+  const isDark = theme === "dark";
 
   useEffect(() => {
     if (!chartRef.current || typeof Plotly === "undefined") return;
     const el = chartRef.current;
+    const pt = plotlyTheme(isDark);
 
     const vx = stories.map((s) => shears_x[s] ?? 0);
     const vy = stories.map((s) => shears_y[s] ?? 0);
@@ -166,36 +234,29 @@ function ShearChart({
     Plotly.newPlot(
       el,
       [
-        {
-          type: "bar", orientation: "h",
-          name: "Vx (kN)", x: vx, y: stories,
-          marker: { color: "#54a3ff" },
-          hovertemplate: "%{y}<br>Vx = %{x:.0f} kN<extra></extra>",
-        },
-        {
-          type: "bar", orientation: "h",
-          name: "Vy (kN)", x: vy, y: stories,
-          marker: { color: "#34d399" },
-          hovertemplate: "%{y}<br>Vy = %{x:.0f} kN<extra></extra>",
-        },
+        { type: "bar", orientation: "h", name: "Vx (kN)", x: vx, y: stories,
+          marker: { color: "#38BDF8" },
+          hovertemplate: "%{y}<br>Vx = %{x:.0f} kN<extra></extra>" },
+        { type: "bar", orientation: "h", name: "Vy (kN)", x: vy, y: stories,
+          marker: { color: "#34D399" },
+          hovertemplate: "%{y}<br>Vy = %{x:.0f} kN<extra></extra>" },
       ],
       {
         barmode: "group",
-        xaxis: { title: { text: "Cortante (kN)", font: { size: 11 } }, gridcolor: "#334155", color: "#94a3b8" },
-        yaxis: { color: "#94a3b8", automargin: true },
-        paper_bgcolor: "rgba(0,0,0,0)",
-        plot_bgcolor:  "rgba(0,0,0,0)",
+        xaxis: { title: { text: "Cortante (kN)", font: { size: 11 } }, ...pt.xaxis },
+        yaxis: { ...pt.yaxis, automargin: true },
+        paper_bgcolor: pt.paper_bgcolor, plot_bgcolor: pt.plot_bgcolor, font: pt.font,
         margin: { t: 16, r: 12, b: 40, l: 80 },
-        font: { color: "#94a3b8", size: 11 },
-        legend: { orientation: "h", y: -0.15 },
+        legend: { ...pt.legend, orientation: "h", y: -0.15 },
       },
-      { responsive: true, displayModeBar: false }
+      { responsive: true, displayModeBar: false },
     );
     return () => { if (typeof Plotly !== "undefined") Plotly.purge(el); };
-  }, [stories, shears_x, shears_y]);
+  }, [stories, shears_x, shears_y, isDark]);
 
   return (
-    <div className="rounded-lg border border-border bg-surface overflow-hidden" style={{ height: Math.max(200, stories.length * 28 + 80) }}>
+    <div className="rounded-lg border border-border bg-surface overflow-hidden"
+         style={{ height: Math.max(200, stories.length * 28 + 80) }}>
       <div ref={chartRef} style={{ width: "100%", height: "100%" }} />
     </div>
   );
@@ -254,7 +315,10 @@ export function SpectralResultsPanel({ result }: Props) {
         <SectionTitle>
           Derivas de piso{driftFail ? " — ⚠ Excede límite NSR-10 (1%)" : " — OK (≤ 1%)"}
         </SectionTitle>
-        <DriftTable drifts={story_drifts} />
+        <DriftChart drifts={story_drifts} />
+        <div className="mt-3">
+          <DriftTable drifts={story_drifts} />
+        </div>
         <p className="mt-1 text-[10px] text-text-muted">
           Derivas inelásticas Cd ≈ R · Δ_elástica (NSR-10 A.6.2). Límite: 1% para estructuras convencionales.
         </p>

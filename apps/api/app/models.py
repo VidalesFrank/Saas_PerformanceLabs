@@ -203,6 +203,8 @@ class StructuralAnalysisType(str, enum.Enum):
     import_validate = "import_validate"  # Parseo + validación + modelo canónico JSON
     modal           = "modal"            # Análisis modal (eigenvalue)
     spectral        = "spectral"         # RSA modal espectral + ajuste FHE NSR-10
+    design_columns  = "design_columns"   # Verificación PM de columnas (NSR-10 B.3.4)
+    design_beams    = "design_beams"     # Diseño flexión + cortante de vigas (NSR-10)
 
 
 class StructuralJobStatus(str, enum.Enum):

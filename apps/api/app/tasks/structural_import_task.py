@@ -66,12 +66,25 @@ def _load_raw_data(xlsx_path: str) -> tuple[dict, list[str]]:
     raw_data = {}
 
     for sheet, key in TABLE_MAP.items():
-        if sheet in sheet_names:
-            df = pd.read_excel(xl, sheet_name=sheet, skiprows=1, header=0)
-            # ETABS tiene una fila de unidades como segunda fila
-            raw_data[key] = df.drop(index=0).reset_index(drop=True)
-        else:
+        if sheet not in sheet_names:
             raw_data[key] = None
+            continue
+
+        df = pd.read_excel(xl, sheet_name=sheet, skiprows=1, header=0)
+        units_row = df.iloc[0] if len(df) > 0 else pd.Series(dtype=object)
+        df = df.drop(index=0).reset_index(drop=True)
+
+        # Normalizar Frame Sections: E17 exporta cm²/cm⁴, el adaptador E23 ya da m²/m⁴.
+        # Se lee la fila de unidades para saber qué conversión aplicar.
+        if sheet == 'Frame Sections':
+            area_unit = str(units_row.get('Area', 'm2') or 'm2').lower()
+            if 'cm' in area_unit:
+                # 1 cm² = 1e-4 m²,  1 cm⁴ = 1e-8 m⁴
+                for col, factor in [('Area', 1e4), ('I33', 1e8), ('I22', 1e8), ('J', 1e8)]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors='coerce') / factor
+
+        raw_data[key] = df
 
     return raw_data, sheet_names
 

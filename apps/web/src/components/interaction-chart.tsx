@@ -26,6 +26,25 @@ export interface LoadCombination {
   muKnm: number;
 }
 
+export interface DiagramKeyPoint {
+  p_kn: number;
+  m_knm: number;
+}
+
+export interface DiagramKeyPoints {
+  compression_pure?: DiagramKeyPoint;
+  balanced?: DiagramKeyPoint;
+  pure_flexure?: DiagramKeyPoint;
+  tension_pure?: DiagramKeyPoint;
+}
+
+const KEY_CFG = {
+  compression_pure: { label: "P₀",  color: "var(--color-danger)",    anchor: "start" as const, dx:  8, dy: -14 },
+  balanced:         { label: "Bal", color: "var(--color-warning)",   anchor: "end"   as const, dx: -8, dy:   0 },
+  pure_flexure:     { label: "M₀",  color: "var(--color-accent)",    anchor: "end"   as const, dx: -8, dy:  14 },
+  tension_pure:     { label: "T₀",  color: "var(--color-success)",   anchor: "start" as const, dx:  8, dy:  14 },
+} as const;
+
 function niceTicks(min: number, max: number, count = 5): number[] {
   if (min === max) return [min];
   const step = (max - min) / count;
@@ -125,12 +144,14 @@ export interface InteractionChartProps {
   points: InteractionPoint[];
   isSpiral?: boolean;
   loadCombinations?: LoadCombination[];
+  keyPoints?: DiagramKeyPoints;
 }
 
 export function InteractionChart({
   points,
   isSpiral = false,
   loadCombinations = [],
+  keyPoints,
 }: InteractionChartProps) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [hoverLoadIdx, setHoverLoadIdx] = useState<number | null>(null);
@@ -209,6 +230,28 @@ export function InteractionChart({
       return { ...lc, x: svgX, y: svgY, inside, cdRatio };
     });
   }, [loadCombinations, factoredPoints, xScale, yScale]);
+
+  const keyPointMarkers = useMemo(() => {
+    if (!keyPoints) return [];
+    return (Object.keys(KEY_CFG) as (keyof typeof KEY_CFG)[])
+      .filter((k) => keyPoints[k] != null)
+      .map((k) => {
+        const pt = keyPoints[k]!;
+        const cfg = KEY_CFG[k];
+        return {
+          key: k,
+          label: cfg.label,
+          color: cfg.color,
+          anchor: cfg.anchor,
+          dx: cfg.dx,
+          dy: cfg.dy,
+          x: xScale(pt.m_knm),
+          y: yScale(pt.p_kn),
+          p_kn: pt.p_kn,
+          m_knm: pt.m_knm,
+        };
+      });
+  }, [keyPoints, xScale, yScale]);
 
   const hovered = hoverIdx !== null ? chartPoints[hoverIdx] : null;
   const hoveredFact = hoverIdx !== null ? factoredPoints[hoverIdx] : null;
@@ -323,6 +366,24 @@ export function InteractionChart({
                 style={{ pointerEvents: "none" }}
               >
                 {i + 1}
+              </text>
+            </g>
+          ))}
+
+          {/* Key structural points */}
+          {keyPointMarkers.map((km) => (
+            <g key={km.key}>
+              <line x1={MARGIN.left} x2={km.x} y1={km.y} y2={km.y}
+                stroke={km.color} strokeWidth={0.75} strokeDasharray="3,2" opacity={0.4} />
+              <circle cx={km.x} cy={km.y} r={6}
+                fill={km.color} fillOpacity={0.18} stroke={km.color} strokeWidth={2} />
+              <text x={km.x + km.dx} y={km.y + km.dy}
+                textAnchor={km.anchor} fontSize={9} fill={km.color} fontWeight="700">
+                {km.label}
+              </text>
+              <text x={km.x + km.dx} y={km.y + km.dy + 11}
+                textAnchor={km.anchor} fontSize={7.5} fill={km.color} opacity={0.75}>
+                {km.m_knm.toFixed(0)}/{km.p_kn.toFixed(0)}
               </text>
             </g>
           ))}

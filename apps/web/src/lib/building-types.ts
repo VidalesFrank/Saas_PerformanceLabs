@@ -162,3 +162,43 @@ export interface DynamicParams {
   dt_analysis:    number;
   parallel_pairs: number;
 }
+
+// ── Módulo 4: Evaluación de Desempeño (Capacity Spectrum Method) ─────────────
+
+export interface AdrsCurve {
+  Sa: number[];   // aceleración espectral (g)
+  Sd: number[];   // desplazamiento espectral (m)
+  T:  number[];   // período (s) — vacío para curva de capacidad
+}
+
+export interface PerformancePoint {
+  Sa_pp:     number;   // Sa en punto de desempeño (g)
+  Sd_pp:     number;   // Sd en punto de desempeño (m)
+  drift_pp:  number;   // deriva de techo en PP (%)
+  beta_eff:  number;   // amortiguamiento efectivo (%)
+  T_eff:     number;   // período efectivo (s)
+  converged: boolean;
+}
+
+export interface PerformanceLevel {
+  code:        string;  // "IO" | "LS" | "CP" | "C"
+  nombre:      string;
+  color:       string;
+  description: string;
+}
+
+export interface PerformanceResult {
+  capacity_adrs:     AdrsCurve;
+  demand_elastic:    AdrsCurve;
+  demand_reduced:    AdrsCurve;
+  performance_point: PerformancePoint;
+  performance_level: PerformanceLevel;
+  bilinear_Sa:       number[];
+  bilinear_Sd:       number[];
+  Sy:                number;
+  dy:                number;
+  total_height_m:    number;
+  Aa:                number;
+  Av:                number;
+  soil_type:         string;
+}

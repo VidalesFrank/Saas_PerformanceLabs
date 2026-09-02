@@ -26,7 +26,7 @@ from engine.sections.document import (
 )
 from engine.sections.compiler import compile as compile_doc
 from engine.sections.nsr10_check import compute_nsr10_check
-from engine.analysis.interaction import compute_interaction_diagram
+from engine.analysis.interaction import compute_interaction_diagram, identify_key_points
 from engine.analysis.moment_curvature import compute_moment_curvature
 from engine.analysis.pmm_surface import compute_pmm_surface
 
@@ -217,17 +217,25 @@ def run_interaction(
     doc = _dict_to_doc(row.document)
     compiled = compile_doc(doc)
 
-    num_points = int(body.get("num_points", 15))
+    num_points = int(body.get("num_points", 40))
     theta_deg = float(body.get("theta_deg", 0.0))
     diagram = compute_interaction_diagram(compiled, num_points=num_points, theta_deg=theta_deg)
 
     points = [{"p_kn": UC.n_to_kn(pt.P), "m_knm": UC.nmm_to_knm(pt.M)} for pt in diagram]
+    raw_key_pts = identify_key_points(diagram)
+    key_points = {
+        k: {"p_kn": v["p_kn"], "m_knm": v["m_knm"]}
+        for k, v in raw_key_pts.items()
+    }
     return {
         "section_id": section_id,
         "points": points,
         "p_max_kn": UC.n_to_kn(diagram[0].P),
         "p_min_kn": UC.n_to_kn(diagram[-1].P),
         "m_max_knm": UC.nmm_to_knm(max(pt.M for pt in diagram)),
+        "key_points": key_points,
+        "theta_deg": theta_deg,
+        "num_points_computed": len(points),
     }
 
 

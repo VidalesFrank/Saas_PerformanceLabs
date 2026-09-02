@@ -14,6 +14,7 @@ import type {
   ModalResult,
   PushoverResult,
   DynamicResult,
+  PerformanceResult,
 } from "./building-types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -130,4 +131,23 @@ export const buildingAnalysisApi = {
 
   downloadUrl: (jobId: string) =>
     `${BASE}/analysis/jobs/${jobId}/download`,
+};
+
+// ── Módulo 4: Evaluación de Desempeño ────────────────────────────────────────
+
+export const buildingPerformanceApi = {
+  evaluate: (payload: {
+    project_id:     string;
+    direction:      "X" | "Y";
+    dtecho_pct:     number[];
+    vbasal_norm:    number[];
+    total_height_m: number;
+    T1_s:           number;
+    Aa?:            number;
+    Av?:            number;
+  }) =>
+    req<PerformanceResult>("/performance/evaluate", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };

@@ -71,7 +71,7 @@ class CanonicalModelBuilder:
         joints, stories, restraints = self._build_joints()
         materials = self._build_materials()
         sections  = self._build_sections(materials)
-        frames    = self._build_frames(sections)
+        frames    = self._build_frames(sections, joints)
         shells    = self._build_shells()
         masses    = self._build_masses(joints)
         load_patterns = self._extract_load_patterns()
@@ -230,10 +230,10 @@ class CanonicalModelBuilder:
             shape  = _safe_str(row.get("Shape", "Rectangular"))
             t3     = _to_float(row.get("t3"))      # altura / profundidad (m)
             t2     = _to_float(row.get("t2"))      # ancho (m)
-            area   = _to_float(row.get("Area"))    # m²
-            i33    = _to_float(row.get("I33"))     # m⁴
-            i22    = _to_float(row.get("I22"))     # m⁴
-            j      = _to_float(row.get("J"))       # m⁴
+            area   = _to_float(row.get("Area"))    # m² (normalizado por _load_raw_data)
+            i33    = _to_float(row.get("I33"))     # m⁴ (normalizado por _load_raw_data)
+            i22    = _to_float(row.get("I22"))     # m⁴ (normalizado por _load_raw_data)
+            j      = _to_float(row.get("J"))       # m⁴ (normalizado por _load_raw_data)
 
             # Calcular área e inercias si no vienen en el archivo
             if t3 > 0 and t2 > 0:
@@ -264,7 +264,7 @@ class CanonicalModelBuilder:
 
     # ── Elementos frame ───────────────────────────────────────────────────────
 
-    def _build_frames(self, sections: dict) -> dict[str, dict]:
+    def _build_frames(self, sections: dict, joints: dict | None = None) -> dict[str, dict]:
         frames_df = self._rd.get(_K_FRAMES)
         assign_df = self._rd.get(_K_FR_ASSIGN)
 
@@ -290,20 +290,37 @@ class CanonicalModelBuilder:
                 if lbl and sec:
                     sec_map[lbl] = sec
 
+        jcoords = joints or {}
+
         frames: dict[str, dict] = {}
         for _, row in frames_df.iterrows():
             label    = _safe_str(row.get("Element Label", ""))
             # Filtrar elementos internos ETABS (@LC-* son conectores de diafragma)
             if label.startswith("@"):
                 continue
-            obj_type = _safe_str(row.get("Object Type", ""))   # Column / Frame (beam)
-            story    = _safe_str(row.get("Story", ""))
-            ji       = _safe_str(row.get("Joint I", ""))
-            jj       = _safe_str(row.get("Joint J", ""))
+            obj_type  = _safe_str(row.get("Object Type", ""))
+            story     = _safe_str(row.get("Story", ""))
+            ji        = _safe_str(row.get("Joint I", ""))
+            jj        = _safe_str(row.get("Joint J", ""))
             obj_label = _safe_str(row.get("Object Label", label))
 
-            # Tipo de elemento
-            element_type = "column" if obj_type.lower() == "column" else "beam"
+            # Clasificación: ETABS E23 usa "Frame" para todo.
+            # Primero intentamos el campo "Object Type" (funciona con E17 nativo).
+            # Si no es concluyente, usamos geometría: columna si dz > distancia_horizontal.
+            if obj_type.lower() == "column":
+                element_type = "column"
+            elif obj_type.lower() in ("beam", "brace"):
+                element_type = "beam"
+            else:
+                # Fallback geométrico con coordenadas de nodos
+                ji_data = jcoords.get(ji, {})
+                jj_data = jcoords.get(jj, {})
+                dz  = abs(jj_data.get("z", 0.0) - ji_data.get("z", 0.0))
+                dxy = math.sqrt(
+                    (jj_data.get("x", 0.0) - ji_data.get("x", 0.0)) ** 2 +
+                    (jj_data.get("y", 0.0) - ji_data.get("y", 0.0)) ** 2
+                )
+                element_type = "column" if dz > dxy else "beam"
 
             # Sección (busca por label del elemento primero, luego por object label)
             section = sec_map.get(label) or sec_map.get(obj_label) or ""

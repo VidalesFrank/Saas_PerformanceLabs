@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/input";
 import { ApiError } from "@/lib/api";
-import { buildingAnalysisApi, buildingProjectsApi } from "@/lib/building-api";
+import { buildingAnalysisApi, buildingPerformanceApi, buildingProjectsApi } from "@/lib/building-api";
 import type {
   AnalysisType,
   BuildingJob,
@@ -17,6 +17,7 @@ import type {
   DynamicParams,
   DynamicResult,
   ModalResult,
+  PerformanceResult,
   PushoverParams,
   PushoverResult,
 } from "@/lib/building-types";
@@ -25,6 +26,7 @@ import { ModelViewer3D } from "@/components/building/ModelViewer3D";
 import { ModalResultsTable } from "@/components/building/ModalResultsTable";
 import { PushoverChart } from "@/components/building/PushoverChart";
 import { DynamicResultsChart } from "@/components/building/DynamicResultsChart";
+import { PerformanceChart } from "@/components/building/PerformanceChart";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -319,10 +321,11 @@ export default function BuildingProjectDetailPage() {
   const [error,   setError]               = useState<string | null>(null);
 
   // Results
-  const [archetypeResult, setArchetypeResult] = useState<Record<string, unknown> | null>(null);
-  const [modalResult,     setModalResult]     = useState<ModalResult | null>(null);
-  const [pushoverResult,  setPushoverResult]  = useState<PushoverResult | null>(null);
-  const [dynamicResult,   setDynamicResult]   = useState<DynamicResult | null>(null);
+  const [archetypeResult,    setArchetypeResult]    = useState<Record<string, unknown> | null>(null);
+  const [modalResult,        setModalResult]        = useState<ModalResult | null>(null);
+  const [pushoverResult,     setPushoverResult]     = useState<PushoverResult | null>(null);
+  const [dynamicResult,      setDynamicResult]      = useState<DynamicResult | null>(null);
+  const [performanceResult,  setPerformanceResult]  = useState<PerformanceResult | null>(null);
 
   // UI
   const [showParams,   setShowParams]   = useState(false);
@@ -336,6 +339,11 @@ export default function BuildingProjectDetailPage() {
   const [dynamicParams,  setDynamicParams]  = useState<DynamicParams>(defaultDynamicParams);
   const [showPushParams,  setShowPushParams]  = useState(false);
   const [showDynParams,   setShowDynParams]   = useState(false);
+
+  // Performance evaluation state
+  const [perfDir,       setPerfDir]       = useState<"X" | "Y">("X");
+  const [evaluating,    setEvaluating]    = useState(false);
+  const [perfError,     setPerfError]     = useState<string | null>(null);
 
   // Polling
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -481,10 +489,41 @@ export default function BuildingProjectDetailPage() {
     try {
       const job = await buildingAnalysisApi.launch(id, type, params);
       setJobs((prev) => [job, ...prev]);
+      // Primer poll rápido a 1.5 s para capturar jobs que terminan en segundos
+      setTimeout(() => { refreshJobs().catch(() => {}); }, 1500);
     } catch (e) {
       setJobError(e instanceof ApiError ? e.message : "Error al lanzar análisis");
     } finally {
       setLaunching(null);
+    }
+  }
+
+  async function handleEvaluatePerformance() {
+    if (!id || !pushoverResult || !modalResult) return;
+    const dirData = pushoverResult[perfDir];
+    if (!dirData) return;
+
+    setPerfError(null);
+    setEvaluating(true);
+    try {
+      const totalH = pushoverResult.story_heights.length > 0
+        ? pushoverResult.story_heights[pushoverResult.story_heights.length - 1]
+        : 10.0;
+      const T1 = modalResult.modes_table[0]?.T ?? 1.0;
+
+      const result = await buildingPerformanceApi.evaluate({
+        project_id:     id,
+        direction:      perfDir,
+        dtecho_pct:     dirData.dtecho,
+        vbasal_norm:    dirData.vbasal_norm,
+        total_height_m: totalH,
+        T1_s:           T1,
+      });
+      setPerformanceResult(result);
+    } catch (e) {
+      setPerfError(e instanceof Error ? e.message : "Error al evaluar desempeño");
+    } finally {
+      setEvaluating(false);
     }
   }
 
@@ -509,10 +548,12 @@ export default function BuildingProjectDetailPage() {
   const archetypeOk   = archetypeJob?.status === "success";
   const modalOk       = modalJob?.status === "success";
 
-  const canRunArchetype = hasModel && hasParams && !hasRunning();
-  const canRunModal     = archetypeOk && !hasRunning();
-  const canRunPushover  = archetypeOk && !hasRunning();
-  const canRunDynamic   = modalOk && !hasRunning();
+  const canRunArchetype    = hasModel && hasParams && !hasRunning();
+  const canRunModal        = archetypeOk && !hasRunning();
+  const canRunPushover     = archetypeOk && !hasRunning();
+  const canRunDynamic      = modalOk && !hasRunning();
+  const pushoverOk         = latestJob("pushover")?.status === "success" && !!pushoverResult?.[perfDir];
+  const canRunPerformance  = pushoverOk && modalOk && !!modalResult;
 
   // ── Render guards ────────────────────────────────────────────────────────────
 
@@ -983,6 +1024,54 @@ export default function BuildingProjectDetailPage() {
                       : "Ejecuta el análisis dinámico para obtener la envolvente de derivas y la curva IDA."}
                   </p>
                 )
+              )}
+            </CardBody>
+          </Card>
+
+          {/* ── Paso 5: Evaluación de Desempeño (CSM) ──────────────── */}
+          <Card>
+            <CardHeader>
+              <StepHeader num={5} title="Evaluación de Desempeño Sísmico (ATC-40 / NSR-10)">
+                {/* Direction toggle */}
+                <div className="flex overflow-hidden rounded-md border border-border text-xs">
+                  {(["X", "Y"] as const).map((d) => (
+                    <button
+                      key={d}
+                      type="button"
+                      onClick={() => { setPerfDir(d); setPerformanceResult(null); }}
+                      className={`px-3 py-1.5 font-medium transition-colors ${perfDir === d ? "bg-accent text-white" : "text-text-muted hover:text-text"}`}
+                    >
+                      Dir {d}
+                    </button>
+                  ))}
+                </div>
+                <Button
+                  className="text-xs py-1 px-3 h-auto"
+                  disabled={!canRunPerformance || evaluating}
+                  onClick={handleEvaluatePerformance}
+                >
+                  {evaluating ? "Evaluando..." : performanceResult ? "Re-evaluar" : "Evaluar"}
+                </Button>
+              </StepHeader>
+            </CardHeader>
+
+            <CardBody className="flex flex-col gap-4">
+              {perfError && (
+                <div className="rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+                  {perfError}
+                </div>
+              )}
+
+              {performanceResult ? (
+                <PerformanceChart data={performanceResult} direction={perfDir} />
+              ) : (
+                <p className="text-sm text-text-muted">
+                  {!pushoverOk
+                    ? `Completa el análisis pushover (Paso 3) para la dirección ${perfDir} para habilitar la evaluación de desempeño.`
+                    : !modalOk
+                    ? "Completa el análisis modal (Paso 2) para obtener el período fundamental."
+                    : "Selecciona la dirección y ejecuta la evaluación para obtener el punto de desempeño mediante el Método del Espectro de Capacidad (CSM)."}
+                </p>
               )}
             </CardBody>
           </Card>

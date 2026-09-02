@@ -17,10 +17,11 @@ _CM_TAG_OFFSET = 10_000_000
 
 
 def _joint_tag(label: str) -> int:
-    """Convierte el label de junta (string) a entero para OpenSees."""
+    """Convierte el label de junta a entero para OpenSees.
+    Maneja tanto '313' como '313.0' (pandas lee enteros Excel como float)."""
     try:
-        return int(label)
-    except ValueError:
+        return int(float(label))
+    except (TypeError, ValueError):
         return abs(hash(label)) % (_CM_TAG_OFFSET - 1000) + 1000
 
 

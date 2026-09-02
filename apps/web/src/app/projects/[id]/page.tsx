@@ -9,12 +9,20 @@ import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { ValidationReport } from "@/components/linear/ValidationReport";
 import { LoadPatternSelector } from "@/components/linear/LoadPatternSelector";
 import { LinearModelViewer3D } from "@/components/linear/LinearModelViewer3D";
+import ModelEditorPanel from "@/components/linear/ModelEditorPanel";
 import { SeismicParamsForm } from "@/components/linear/SeismicParamsForm";
 import { SpectrumPreview } from "@/components/linear/SpectrumPreview";
 import { ModalResultsTable } from "@/components/linear/ModalResultsTable";
 import { SpectralResultsPanel } from "@/components/linear/SpectralResultsPanel";
+import { CombinationSelector } from "@/components/linear/CombinationSelector";
+import FrameNavigator from "@/components/linear/FrameNavigator";
+import ColumnDetailPanel from "@/components/linear/ColumnDetailPanel";
+import BeamDetailPanel from "@/components/linear/BeamDetailPanel";
+import WallsPanel from "@/components/linear/WallsPanel";
+import ModelMaterialsPanel from "@/components/linear/ModelMaterialsPanel";
+import ModelSectionsPanel from "@/components/linear/ModelSectionsPanel";
 import { ApiError } from "@/lib/api";
-import { structuralProjectsApi, structuralAnalysisApi } from "@/lib/structural-api";
+import { structuralProjectsApi, structuralAnalysisApi, structuralDesignApi, structuralEditorApi } from "@/lib/structural-api";
 import type {
   StructuralProject,
   StructuralJob,
@@ -26,26 +34,81 @@ import type {
   ModalResult,
   SpectralResult,
   ModelGeometry,
+  ColumnDesignResult,
+  BeamDesignResult,
+  FrameListResult,
+  ColumnDesignDetail,
+  BeamDesignDetail,
+  FullModelData,
 } from "@/lib/structural-types";
 import { useRequireAuth } from "@/lib/use-require-auth";
 
-// ── Tipos de tab ──────────────────────────────────────────────────────────────
+// ── Tipos de sección (sidebar) ────────────────────────────────────────────────
 
-type TabId = "model" | "seismic" | "design" | "nonlinear";
+type SectionId =
+  | "archivos"
+  | "vista-3d"
+  | "materiales"
+  | "secciones"
+  | "muros"
+  | "sismico"
+  | "diseno"
+  | "no-lineal";
 
-interface Tab {
-  id: TabId;
+interface NavItem {
+  id: SectionId;
   label: string;
   locked?: boolean;
   lockReason?: string;
 }
 
-const TABS: Tab[] = [
-  { id: "model",     label: "Modelo" },
-  { id: "seismic",   label: "Análisis Sísmico" },
-  { id: "design",    label: "Diseño", locked: true, lockReason: "Próximamente" },
-  { id: "nonlinear", label: "Modelo NL", locked: true, lockReason: "Próximamente" },
-];
+interface NavGroup {
+  groupLabel: string;
+  items: NavItem[];
+}
+
+function buildNav(hasSpectral: boolean, isValidated: boolean): NavGroup[] {
+  return [
+    {
+      groupLabel: "Modelo",
+      items: [
+        { id: "archivos",  label: "Archivos y Validación" },
+        { id: "vista-3d",  label: "Vista 3D / Editor",   locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+      ],
+    },
+    {
+      groupLabel: "Definir",
+      items: [
+        { id: "materiales", label: "Materiales", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "secciones",  label: "Secciones",  locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+      ],
+    },
+    {
+      groupLabel: "Asignar",
+      items: [
+        { id: "muros", label: "Muros", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+      ],
+    },
+    {
+      groupLabel: "Análisis",
+      items: [
+        { id: "sismico", label: "Sísmico + Modal + Espectral", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+      ],
+    },
+    {
+      groupLabel: "Diseño",
+      items: [
+        { id: "diseno", label: "Columnas + Vigas", locked: !hasSpectral, lockReason: !hasSpectral ? "Requiere análisis espectral" : undefined },
+      ],
+    },
+    {
+      groupLabel: "No Lineal",
+      items: [
+        { id: "no-lineal", label: "Exportar a Módulo 3", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+      ],
+    },
+  ];
+}
 
 // ── Helpers visuales ──────────────────────────────────────────────────────────
 
@@ -62,6 +125,14 @@ const JOB_STATUS_LABEL: Record<StructuralJobStatus, string> = {
   success:   "Completado",
   failed:    "Error",
   cancelled: "Cancelado",
+};
+
+const JOB_TYPE_LABEL: Record<string, string> = {
+  import_validate: "Validando",
+  modal:           "Modal",
+  spectral:        "Espectral",
+  design_columns:  "Diseño columnas",
+  design_beams:    "Diseño vigas",
 };
 
 function JobStatusBadge({ status }: { status: StructuralJobStatus }) {
@@ -90,11 +161,11 @@ export default function StructuralProjectPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
 
-  const [project, setProject]     = useState<StructuralProject | null>(null);
-  const [jobs, setJobs]           = useState<StructuralJob[]>([]);
-  const [activeTab, setActiveTab] = useState<TabId>("model");
-  const [loading, setLoading]     = useState(true);
-  const [error, setError]         = useState<string | null>(null);
+  const [project, setProject]           = useState<StructuralProject | null>(null);
+  const [jobs, setJobs]                 = useState<StructuralJob[]>([]);
+  const [activeSection, setActiveSection] = useState<SectionId>("archivos");
+  const [loading, setLoading]           = useState(true);
+  const [error, setError]               = useState<string | null>(null);
 
   // Estado de subida de archivo
   const [uploading, setUploading]       = useState(false);
@@ -105,25 +176,55 @@ export default function StructuralProjectPage() {
   const e2kFileRef   = useRef<HTMLInputElement>(null);
 
   // Geometría del modelo 3D
-  const [modelGeometry, setModelGeometry]       = useState<ModelGeometry | null>(null);
-  const [loadingGeometry, setLoadingGeometry]   = useState(false);
+  const [modelGeometry, setModelGeometry]     = useState<ModelGeometry | null>(null);
+  const [loadingGeometry, setLoadingGeometry] = useState(false);
 
   // Estado de lanzamiento de job
   const [launching, setLaunching] = useState<string | null>(null);
 
   // Resultado de validación cargado
-  const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
-  const [loadingValidation, setLoadingValidation] = useState(false);
+  const [validationResult, setValidationResult]     = useState<ValidationResult | null>(null);
+  const [loadingValidation, setLoadingValidation]   = useState(false);
 
   // Espectro NSR-10 para previsualización
   const [spectrumData, setSpectrumData]       = useState<SpectrumPreviewResult | null>(null);
   const [spectrumLoading, setSpectrumLoading] = useState(false);
 
   // Resultado del análisis modal
-  const [modalResult, setModalResult]         = useState<ModalResult | null>(null);
+  const [modalResult, setModalResult]       = useState<ModalResult | null>(null);
 
   // Resultado del análisis espectral
-  const [spectralResult, setSpectralResult]   = useState<SpectralResult | null>(null);
+  const [spectralResult, setSpectralResult] = useState<SpectralResult | null>(null);
+
+  // Resultado del diseño de columnas
+  const [columnDesignResult, setColumnDesignResult] = useState<ColumnDesignResult | null>(null);
+
+  // Resultado del diseño de vigas
+  const [beamDesignResult, setBeamDesignResult] = useState<BeamDesignResult | null>(null);
+
+  // Frame navigator + panel de detalle
+  const [frameListData,      setFrameListData]     = useState<FrameListResult | null>(null);
+  const [selectedFrameId,    setSelectedFrameId]   = useState<string | null>(null);
+  const [selectedFrameType,  setSelectedFrameType] = useState<"column" | "beam" | null>(null);
+  const [frameDetailData,    setFrameDetailData]   = useState<ColumnDesignDetail | BeamDesignDetail | null>(null);
+  const [loadingFrameDetail, setLoadingFrameDetail] = useState(false);
+
+  // Modelo completo para el panel de Muros (carga lazy al entrar al tab)
+  const [fullModelData, setFullModelData] = useState<FullModelData | null>(null);
+
+  // Carga lazy de fullModelData: Muros, Materiales y Secciones lo necesitan
+  useEffect(() => {
+    const needsModel = activeSection === "muros" || activeSection === "materiales" || activeSection === "secciones";
+    if (needsModel && !fullModelData && project?.canonical_model_path) {
+      structuralEditorApi.modelData(project.id).then(setFullModelData).catch(() => {});
+    }
+  }, [activeSection, fullModelData, project]);
+
+  function handleModelDataChange() {
+    if (project) {
+      structuralEditorApi.modelData(project.id).then(setFullModelData).catch(() => {});
+    }
+  }
 
   // Polling ref
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -189,14 +290,60 @@ export default function StructuralProjectPage() {
     } catch { /* silencioso */ }
   }, []);
 
+  // Cargar resultado de diseño de columnas cuando hay un job exitoso
+  const loadColumnDesignResult = useCallback(async (jobList: StructuralJob[]) => {
+    const designJob = jobList.find((j) => j.analysis_type === "design_columns" && j.status === "success");
+    if (!designJob) return;
+    try {
+      const result = await structuralAnalysisApi.result<ColumnDesignResult>(designJob.id);
+      setColumnDesignResult(result);
+    } catch { /* silencioso */ }
+  }, []);
+
+  // Cargar resultado de diseño de vigas cuando hay un job exitoso
+  const loadBeamDesignResult = useCallback(async (jobList: StructuralJob[]) => {
+    const beamJob = jobList.find((j) => j.analysis_type === "design_beams" && j.status === "success");
+    if (!beamJob) return;
+    try {
+      const result = await structuralAnalysisApi.result<BeamDesignResult>(beamJob.id);
+      setBeamDesignResult(result);
+    } catch { /* silencioso */ }
+  }, []);
+
+  // Cargar lista de frames para el navigator
+  const loadFrameList = useCallback(async () => {
+    try {
+      const list = await structuralDesignApi.listFrames(params.id);
+      setFrameListData(list);
+    } catch { /* silencioso */ }
+  }, [params.id]);
+
+  // Cargar detalle de un frame concreto
+  const loadFrameDetail = useCallback(async (frameId: string) => {
+    setLoadingFrameDetail(true);
+    setFrameDetailData(null);
+    try {
+      const detail = await structuralDesignApi.getFrame(params.id, frameId);
+      setFrameDetailData(detail);
+    } catch { /* silencioso */ } finally {
+      setLoadingFrameDetail(false);
+    }
+  }, [params.id]);
+
   // Polling mientras haya jobs activos
   useEffect(() => {
     const hasActive = jobs.some((j) => j.status === "pending" || j.status === "running");
+    const hasAnyDesign = jobs.some(
+      (j) => (j.analysis_type === "design_columns" || j.analysis_type === "design_beams") && j.status === "success"
+    );
     if (!hasActive) {
       if (pollRef.current) clearInterval(pollRef.current);
-      if (!validationResult)  loadValidationResult(jobs);
-      if (!modalResult)       loadModalResult(jobs);
-      if (!spectralResult)    loadSpectralResult(jobs);
+      if (!validationResult)    loadValidationResult(jobs);
+      if (!modalResult)         loadModalResult(jobs);
+      if (!spectralResult)      loadSpectralResult(jobs);
+      if (!columnDesignResult)  loadColumnDesignResult(jobs);
+      if (!beamDesignResult)    loadBeamDesignResult(jobs);
+      if (!frameListData && hasAnyDesign) loadFrameList();
       return;
     }
     pollRef.current = setInterval(async () => {
@@ -207,17 +354,25 @@ export default function StructuralProjectPage() {
         ]);
         setProject(proj);
         setJobs(jobList);
-        if (!validationResult)  loadValidationResult(jobList);
-        if (!modalResult)       loadModalResult(jobList);
-        if (!spectralResult)    loadSpectralResult(jobList);
+        if (!validationResult)    loadValidationResult(jobList);
+        if (!modalResult)         loadModalResult(jobList);
+        if (!spectralResult)      loadSpectralResult(jobList);
+        if (!columnDesignResult)  loadColumnDesignResult(jobList);
+        if (!beamDesignResult)    loadBeamDesignResult(jobList);
         if (!modelGeometry && proj.canonical_model_path) loadModelGeometry(proj);
+        // Recargar frame list cuando un job de diseño acaba de completarse
+        const nowHasDesign = jobList.some(
+          (j) => (j.analysis_type === "design_columns" || j.analysis_type === "design_beams") && j.status === "success"
+        );
+        if (nowHasDesign && !frameListData) loadFrameList();
       } catch {
         // silencioso en polling
       }
     }, 3000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
-  }, [jobs, params.id, validationResult, modalResult, spectralResult, modelGeometry,
-      loadValidationResult, loadModalResult, loadSpectralResult, loadModelGeometry]);
+  }, [jobs, params.id, validationResult, modalResult, spectralResult, columnDesignResult,
+      beamDesignResult, frameListData, modelGeometry, loadValidationResult, loadModalResult,
+      loadSpectralResult, loadColumnDesignResult, loadBeamDesignResult, loadFrameList, loadModelGeometry]);
 
   // ── Acciones ───────────────────────────────────────────────────────────────
 
@@ -271,17 +426,51 @@ export default function StructuralProjectPage() {
     setProject(updated);
   }
 
-  async function handleLaunch(analysisType: "import_validate" | "modal" | "spectral") {
+  async function handleLaunch(analysisType: "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams") {
     if (!project) return;
     setLaunching(analysisType);
+    if (analysisType === "design_columns" || analysisType === "design_beams") {
+      setFrameListData(null);
+      setSelectedFrameId(null);
+      setSelectedFrameType(null);
+      setFrameDetailData(null);
+    }
     try {
       const job = await structuralAnalysisApi.launch(project.id, analysisType);
       setJobs((prev) => [job, ...prev]);
+      // Primer poll rápido a 1.5 s para capturar jobs que terminan en segundos
+      setTimeout(async () => {
+        try {
+          const [proj, jobList] = await Promise.all([
+            structuralProjectsApi.get(params.id),
+            structuralProjectsApi.jobs(params.id),
+          ]);
+          setProject(proj);
+          setJobs(jobList);
+          if (!validationResult)   loadValidationResult(jobList);
+          if (!modalResult)        loadModalResult(jobList);
+          if (!spectralResult)     loadSpectralResult(jobList);
+          if (!columnDesignResult) loadColumnDesignResult(jobList);
+          if (!beamDesignResult)   loadBeamDesignResult(jobList);
+          if (!modelGeometry && proj.canonical_model_path) loadModelGeometry(proj);
+        } catch { /* silencioso */ }
+      }, 1500);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Error al lanzar el análisis");
     } finally {
       setLaunching(null);
     }
+  }
+
+  function handleFrameSelect(frameId: string, elementType: "column" | "beam") {
+    setSelectedFrameId(frameId);
+    setSelectedFrameType(elementType);
+    loadFrameDetail(frameId);
+  }
+
+  async function handleReinforcementSaved() {
+    await loadFrameList();
+    if (selectedFrameId) loadFrameDetail(selectedFrameId);
   }
 
   async function handleSpectrumPreview({ Aa, Av, soil_type }: { Aa: number; Av: number; soil_type: string }) {
@@ -297,8 +486,8 @@ export default function StructuralProjectPage() {
     }
   }
 
-  function handleParamsSaved(params: SeismicParameters) {
-    setProject((prev) => prev ? { ...prev, parameters_json: params } : prev);
+  function handleParamsSaved(p: SeismicParameters) {
+    setProject((prev) => prev ? { ...prev, parameters_json: p } : prev);
   }
 
   async function handleCancel(jobId: string) {
@@ -313,8 +502,11 @@ export default function StructuralProjectPage() {
 
   const hasFile        = !!(project?.input_file_path || project?.e2k_file_path);
   const isValidated    = project?.validation_status === "ok" || project?.validation_status === "has_warnings";
-  const hasModal       = jobs.some((j) => j.analysis_type === "modal" && j.status === "success");
+  const isEditorMode   = activeSection === "vista-3d" && isValidated && !!modelGeometry;
+  const hasModal       = jobs.some((j) => j.analysis_type === "modal"   && j.status === "success");
   const hasSpectral    = jobs.some((j) => j.analysis_type === "spectral" && j.status === "success");
+  const hasDesign      = jobs.some((j) => j.analysis_type === "design_columns" && j.status === "success");
+  const hasBeamDesign  = jobs.some((j) => j.analysis_type === "design_beams"   && j.status === "success");
   const activeJobTypes = new Set(
     jobs.filter((j) => j.status === "pending" || j.status === "running").map((j) => j.analysis_type)
   );
@@ -324,537 +516,1060 @@ export default function StructuralProjectPage() {
 
   if (!ready) return null;
 
-  if (loading) {
+  // ── Sidebar component ──────────────────────────────────────────────────────
+
+  function Sidebar({ projectName, validationStatus }: { projectName?: string; validationStatus?: ValidationStatus }) {
+    const vInfo = validationStatus ? VALIDATION_INFO[validationStatus] : null;
+    const navGroups = buildNav(hasSpectral, isValidated);
+    const activeJobs = jobs.filter((j) => j.status === "pending" || j.status === "running");
+
     return (
-      <div className="flex flex-1 flex-col">
-        <AppHeader crumb="Constructor de Modelos" />
-        <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-10">
-          <p className="text-sm text-text-muted">Cargando proyecto...</p>
-        </main>
-      </div>
-    );
-  }
-
-  if (error || !project) {
-    return (
-      <div className="flex flex-1 flex-col">
-        <AppHeader crumb="Constructor de Modelos" />
-        <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-10">
-          <p className="text-sm text-danger">{error ?? "Proyecto no encontrado"}</p>
-          <Button className="mt-4" variant="ghost" onClick={() => router.push("/projects")}>
-            ← Volver a proyectos
-          </Button>
-        </main>
-      </div>
-    );
-  }
-
-  const validationInfo = VALIDATION_INFO[project.validation_status];
-
-  return (
-    <div className="flex flex-1 flex-col">
-      <AppHeader crumb="Constructor de Modelos" />
-      <main className="mx-auto w-full max-w-6xl flex-1 px-6 py-8">
-
-        {/* Breadcrumb + título */}
-        <div className="mb-6">
-          <div className="flex items-center gap-2 text-xs text-text-muted mb-2">
-            <Link href="/projects" className="hover:text-accent transition-colors">Proyectos</Link>
-            <span>/</span>
-            <span className="text-text">{project.name}</span>
-          </div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl font-semibold text-text">{project.name}</h1>
-            <span
-              className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold"
-              style={{ background: `${validationInfo.color}22`, color: validationInfo.color }}
-            >
-              {validationInfo.label}
-            </span>
-          </div>
-          {project.description && (
-            <p className="mt-1 text-sm text-text-muted">{project.description}</p>
+      <aside className="w-56 flex-shrink-0 border-r border-[var(--border)] bg-[var(--surface)] flex flex-col overflow-hidden">
+        {/* Project name + validation status */}
+        <div className="px-3 pt-4 pb-3 border-b border-[var(--border)] flex-shrink-0">
+          <p className="text-xs font-semibold text-[var(--text)] truncate leading-tight">
+            {projectName ?? "Proyecto"}
+          </p>
+          {vInfo && (
+            <div className="flex items-center gap-1.5 mt-1">
+              <div
+                className="h-1.5 w-1.5 rounded-full flex-shrink-0"
+                style={{ background: vInfo.color }}
+              />
+              <span className="text-[10px]" style={{ color: vInfo.color }}>{vInfo.label}</span>
+            </div>
           )}
         </div>
 
-        {/* Tab bar */}
-        <div className="flex border-b border-border mb-8 gap-0">
-          {TABS.map((tab) => {
-            const isActive = activeTab === tab.id;
-            const isLocked = tab.locked;
-            return (
-              <button
-                key={tab.id}
-                onClick={() => !isLocked && setActiveTab(tab.id)}
-                className={[
-                  "relative px-5 py-3 text-sm font-medium transition-colors",
-                  isLocked
-                    ? "text-text-muted cursor-not-allowed opacity-50"
-                    : isActive
-                    ? "text-accent border-b-2 border-accent -mb-px"
-                    : "text-text-muted hover:text-text",
-                ].join(" ")}
-                title={isLocked ? tab.lockReason : undefined}
-              >
-                {tab.label}
-                {isLocked && (
-                  <span className="ml-2 text-[9px] font-normal opacity-70">
-                    {tab.lockReason}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
-
-        {/* ── Tab: Modelo ───────────────────────────────────────────────────── */}
-        {activeTab === "model" && (
-          <div className="flex flex-col gap-6">
-
-            {/* Sección: Cargar modelo */}
-            <Card>
-              <CardHeader>
-                <h2 className="text-sm font-semibold text-text">Archivo de modelo</h2>
-                <p className="text-xs text-text-muted mt-0.5">
-                  Sube el exportado de ETABS en formato XLSX o .e2k
-                </p>
-              </CardHeader>
-              <CardBody className="flex flex-col gap-4">
-
-                {/* inputs ocultos */}
-                <input ref={modelFileRef} type="file" accept=".xlsx" className="hidden"
-                  onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUpload(f, "model"); e.target.value = ""; }} />
-                <input ref={e2kFileRef}   type="file" accept=".e2k"  className="hidden"
-                  onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUpload(f, "e2k");   e.target.value = ""; }} />
-
-                <div className="grid grid-cols-2 gap-4">
-                  {/* Zona XLSX */}
-                  <div
-                    onClick={() => !uploading && modelFileRef.current?.click()}
-                    onDragOver={(e) => { e.preventDefault(); setDragOverXlsx(true); }}
-                    onDragLeave={() => setDragOverXlsx(false)}
-                    onDrop={(e) => handleDrop(e, "model")}
+        {/* Nav groups */}
+        <nav className="flex-1 overflow-y-auto py-1">
+          {navGroups.map((group) => (
+            <div key={group.groupLabel}>
+              <p className="text-[10px] font-semibold uppercase tracking-widest text-[var(--text-muted)] px-3 pt-4 pb-1">
+                {group.groupLabel}
+              </p>
+              {group.items.map((item) => {
+                const isActive = activeSection === item.id;
+                const isLocked = item.locked;
+                return (
+                  <button
+                    key={item.id}
+                    onClick={() => !isLocked && setActiveSection(item.id)}
+                    title={isLocked ? item.lockReason : undefined}
                     className={[
-                      "relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 cursor-pointer transition-colors min-h-[140px]",
-                      dragOverXlsx
-                        ? "border-accent bg-accent/5"
-                        : project.input_file_path
-                        ? "border-[var(--color-success)]/50 bg-[var(--color-success)]/5 hover:border-[var(--color-success)]"
-                        : "border-border bg-surface-2 hover:border-accent hover:bg-accent/5",
+                      "w-full text-left text-xs px-3 py-1.5 rounded-lg mx-0 transition-colors flex items-center gap-1.5",
+                      isLocked
+                        ? "opacity-40 cursor-not-allowed text-[var(--text-muted)]"
+                        : isActive
+                        ? "bg-[color-mix(in_srgb,var(--accent)_15%,transparent)] text-[var(--accent)] font-medium border-l-2 border-[var(--accent)] pl-[10px]"
+                        : "text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
                     ].join(" ")}
                   >
-                    <span className="text-2xl mb-2 select-none">
-                      {project.input_file_path ? "✅" : "📊"}
-                    </span>
-                    <p className="text-sm font-medium text-text text-center">
-                      {project.input_file_path ? "Modelo XLSX cargado" : "Modelo ETABS (.xlsx)"}
-                    </p>
-                    <p className="text-[11px] text-text-muted text-center mt-1">
-                      {project.input_file_path
-                        ? "Clic o arrastra para reemplazar"
-                        : "Arrastra aquí o haz clic para seleccionar"}
-                    </p>
-                    <p className="text-[10px] text-text-muted mt-1 opacity-70">
-                      File → Export → Excel Spreadsheet
-                    </p>
-                    {dragOverXlsx && (
-                      <div className="absolute inset-0 rounded-xl bg-accent/10 flex items-center justify-center">
-                        <p className="text-accent font-semibold text-sm">Suelta para subir</p>
-                      </div>
-                    )}
-                  </div>
+                    {item.label}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </nav>
 
-                  {/* Zona E2K */}
-                  <div
-                    onClick={() => !uploading && e2kFileRef.current?.click()}
-                    onDragOver={(e) => { e.preventDefault(); setDragOverE2k(true); }}
-                    onDragLeave={() => setDragOverE2k(false)}
-                    onDrop={(e) => handleDrop(e, "e2k")}
-                    className={[
-                      "relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 cursor-pointer transition-colors min-h-[140px]",
-                      dragOverE2k
-                        ? "border-accent bg-accent/5"
-                        : project.e2k_file_path
-                        ? "border-[var(--color-success)]/50 bg-[var(--color-success)]/5 hover:border-[var(--color-success)]"
-                        : "border-border bg-surface-2 hover:border-accent hover:bg-accent/5",
-                    ].join(" ")}
-                  >
-                    <span className="text-2xl mb-2 select-none">
-                      {project.e2k_file_path ? "✅" : "📄"}
-                    </span>
-                    <p className="text-sm font-medium text-text text-center">
-                      {project.e2k_file_path ? "Archivo .e2k cargado" : "ETABS Text (.e2k)"}
-                    </p>
-                    <p className="text-[11px] text-text-muted text-center mt-1">
-                      {project.e2k_file_path
-                        ? "Clic o arrastra para reemplazar"
-                        : "Arrastra aquí o haz clic para seleccionar"}
-                    </p>
-                    <p className="text-[10px] text-text-muted mt-1 opacity-70">
-                      File → Export → ETABS Text File
-                    </p>
-                    {dragOverE2k && (
-                      <div className="absolute inset-0 rounded-xl bg-accent/10 flex items-center justify-center">
-                        <p className="text-accent font-semibold text-sm">Suelta para subir</p>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {uploadError && (
-                  <p className="text-sm text-danger">{uploadError}</p>
-                )}
-                {uploading && (
-                  <p className="text-sm text-text-muted animate-pulse">Subiendo archivo...</p>
-                )}
-              </CardBody>
-            </Card>
-
-            {/* Sección: Validar modelo */}
-            <Card>
-              <CardHeader>
-                <h2 className="text-sm font-semibold text-text">Validación del modelo</h2>
-                <p className="text-xs text-text-muted mt-0.5">
-                  Verifica la integridad del modelo antes de ejecutar análisis
-                </p>
-              </CardHeader>
-              <CardBody className="flex flex-col gap-4">
-
-                {!hasFile ? (
-                  <div className="rounded-lg border border-border bg-surface-2 p-6 text-center">
-                    <p className="text-sm text-text-muted">
-                      Sube un archivo de modelo para poder validar
-                    </p>
-                  </div>
-                ) : (
-                  <>
-                    {/* Estado de validación */}
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div
-                          className="h-2 w-2 rounded-full"
-                          style={{ background: validationInfo.color }}
-                        />
-                        <span className="text-sm text-text">{validationInfo.label}</span>
-                      </div>
-                      <Button
-                        onClick={() => handleLaunch("import_validate")}
-                        disabled={activeJobTypes.has("import_validate") || !!launching}
-                      >
-                        {activeJobTypes.has("import_validate")
-                          ? "Validando..."
-                          : project.validation_status === "not_run"
-                          ? "Validar modelo"
-                          : "Revalidar"}
-                      </Button>
-                    </div>
-
-                    {/* Resultado de la última validación */}
-                    {(() => {
-                      const lastValidation = lastJobByType("import_validate");
-                      if (!lastValidation) return null;
-
-                      if (lastValidation.status === "failed") {
-                        return (
-                          <div className="rounded-lg border border-danger bg-surface-2 p-4">
-                            <p className="text-xs font-semibold text-danger mb-1">Error en la tarea</p>
-                            <pre className="text-[11px] text-text-muted whitespace-pre-wrap line-clamp-6">
-                              {lastValidation.error_message}
-                            </pre>
-                          </div>
-                        );
-                      }
-
-                      if (lastValidation.status === "running" || lastValidation.status === "pending") {
-                        return (
-                          <div className="rounded-lg border border-border bg-surface-2 p-4 text-center">
-                            <p className="text-sm text-text-muted">Validando el modelo...</p>
-                          </div>
-                        );
-                      }
-
-                      if (lastValidation.status === "success") {
-                        if (loadingValidation) {
-                          return (
-                            <div className="rounded-lg border border-border bg-surface-2 p-4 text-center">
-                              <p className="text-sm text-text-muted">Cargando resultados...</p>
-                            </div>
-                          );
-                        }
-                        if (validationResult) {
-                          return <ValidationReport report={validationResult} />;
-                        }
-                      }
-
-                      return null;
-                    })()}
-                  </>
-                )}
-              </CardBody>
-            </Card>
-
-            {/* Sección: Patrones de carga — usa los del modelo canónico */}
-            {isValidated && modelGeometry && modelGeometry.load_patterns.length > 0 && (
-              <Card>
-                <CardHeader>
-                  <h2 className="text-sm font-semibold text-text">Patrones de carga</h2>
-                  <p className="text-xs text-text-muted mt-0.5">
-                    Indica cuál patrón corresponde a carga muerta y cuál a carga viva
-                  </p>
-                </CardHeader>
-                <CardBody>
-                  <LoadPatternSelector
-                    patterns={modelGeometry.load_patterns}
-                    cmLoad={project.parameters_json?.cm_load ?? "DEAD"}
-                    cvLoad={project.parameters_json?.cv_load ?? "LIVE"}
-                    onSave={handleSaveLoadPatterns}
-                  />
-                </CardBody>
-              </Card>
-            )}
-
-            {/* Sección: Vista previa del modelo 3D */}
-            {isValidated && (
-              <Card>
-                <CardHeader>
-                  <h2 className="text-sm font-semibold text-text">Modelo estructural 3D</h2>
-                  <p className="text-xs text-text-muted mt-0.5">
-                    Vista del modelo importado — columnas, vigas y apoyos
-                  </p>
-                </CardHeader>
-                <CardBody>
-                  {loadingGeometry ? (
-                    <div className="flex items-center justify-center h-48">
-                      <p className="text-sm text-text-muted animate-pulse">Cargando modelo 3D...</p>
-                    </div>
-                  ) : modelGeometry ? (
-                    <LinearModelViewer3D geometry={modelGeometry} />
-                  ) : (
-                    <div className="rounded-lg border border-border bg-surface-2 flex items-center justify-center h-48">
-                      <p className="text-sm text-text-muted">
-                        Modelo 3D no disponible
-                      </p>
-                    </div>
-                  )}
-                </CardBody>
-              </Card>
-            )}
+        {/* Active jobs indicator */}
+        {activeJobs.length > 0 && (
+          <div className="border-t border-[var(--border)] py-2 flex-shrink-0">
+            {activeJobs.map((j) => (
+              <div key={j.id} className="text-[10px] px-3 py-1 text-[var(--accent)] animate-pulse flex items-center gap-1">
+                <span>↻</span>
+                <span>{JOB_TYPE_LABEL[j.analysis_type] ?? j.analysis_type}</span>
+              </div>
+            ))}
           </div>
         )}
+      </aside>
+    );
+  }
 
-        {/* ── Tab: Análisis Sísmico ─────────────────────────────────────────── */}
-        {activeTab === "seismic" && (
-          <div className="flex flex-col gap-6">
+  // ── Loading state ──────────────────────────────────────────────────────────
 
-            {!isValidated ? (
+  if (loading) {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
+        <AppHeader crumb="Constructor de Modelos" />
+        <div className="flex flex-1 min-h-0 overflow-hidden">
+          <aside className="w-56 flex-shrink-0 border-r border-[var(--border)] bg-[var(--surface)]">
+            <div className="px-3 pt-4 pb-3">
+              <p className="text-xs text-[var(--text-muted)]">Cargando...</p>
+            </div>
+          </aside>
+          <main className="flex-1 overflow-y-auto">
+            <div className="mx-auto max-w-5xl px-6 py-10">
+              <p className="text-sm text-[var(--text-muted)]">Cargando proyecto...</p>
+            </div>
+          </main>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Error state ────────────────────────────────────────────────────────────
+
+  if (error || !project) {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
+        <AppHeader crumb="Constructor de Modelos" />
+        <div className="flex flex-1 min-h-0 overflow-hidden">
+          <aside className="w-56 flex-shrink-0 border-r border-[var(--border)] bg-[var(--surface)]">
+            <div className="px-3 pt-4 pb-3">
+              <p className="text-xs text-[var(--text-muted)]">Error</p>
+            </div>
+          </aside>
+          <main className="flex-1 overflow-y-auto">
+            <div className="mx-auto max-w-5xl px-6 py-10">
+              <p className="text-sm text-[var(--danger)]">{error ?? "Proyecto no encontrado"}</p>
+              <Button className="mt-4" variant="ghost" onClick={() => router.push("/projects")}>
+                ← Volver a proyectos
+              </Button>
+            </div>
+          </main>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Main render ────────────────────────────────────────────────────────────
+
+  return (
+    <div className="flex flex-1 flex-col min-h-0 overflow-hidden">
+      <AppHeader crumb="Constructor de Modelos" />
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+
+        {/* LEFT SIDEBAR */}
+        <Sidebar projectName={project.name} validationStatus={project.validation_status} />
+
+        {/* MAIN CONTENT */}
+        <main className={
+          activeSection === "vista-3d" && isEditorMode
+            ? "flex-1 min-h-0 overflow-hidden flex flex-col"
+            : "flex-1 overflow-y-auto"
+        }>
+
+          {/* ── Vista 3D / Editor ───────────────────────────────────────────── */}
+          {activeSection === "vista-3d" && isEditorMode && (
+            <ModelEditorPanel
+              projectId={project.id}
+              geometry={modelGeometry!}
+              onLaunchAnalysis={(type) => {
+                setActiveSection("sismico");
+                handleLaunch(type as "modal" | "spectral");
+              }}
+              analysisRunning={activeJobTypes.has("modal") || activeJobTypes.has("spectral")}
+            />
+          )}
+
+          {activeSection === "vista-3d" && !isEditorMode && (
+            <div className="mx-auto max-w-5xl px-6 py-8 flex flex-col gap-6">
+              <div className="mb-4">
+                <div className="flex items-center gap-2 text-xs text-[var(--text-muted)] mb-2">
+                  <Link href="/projects" className="hover:text-[var(--accent)] transition-colors">Proyectos</Link>
+                  <span>/</span>
+                  <span className="text-[var(--text)]">{project.name}</span>
+                </div>
+                <h1 className="text-xl font-semibold text-[var(--text)]">Vista 3D / Editor</h1>
+              </div>
               <Card>
                 <CardBody className="py-12 text-center">
-                  <p className="text-text-muted text-sm">
-                    Valida el modelo en la pestaña <strong>Modelo</strong> antes de configurar el análisis sísmico.
+                  <p className="text-[var(--text-muted)] text-sm">
+                    {!isValidated
+                      ? "El modelo debe estar validado para acceder al editor 3D."
+                      : "El modelo 3D no está disponible aún."}
                   </p>
-                  <Button className="mt-4" variant="secondary" onClick={() => setActiveTab("model")}>
-                    Ir a Modelo
+                  <Button className="mt-4" variant="secondary" onClick={() => setActiveSection("archivos")}>
+                    Ir a Archivos y Validación
                   </Button>
                 </CardBody>
               </Card>
-            ) : (
-              <>
-                {/* Parámetros sísmicos — placeholder para F3 */}
-                {/* Parámetros sísmicos NSR-10 */}
+            </div>
+          )}
+
+          {/* ── Archivos y Validación ────────────────────────────────────────── */}
+          {activeSection === "archivos" && (
+            <div className="mx-auto max-w-5xl px-6 py-8 flex flex-col gap-6">
+
+              {/* Breadcrumb + título */}
+              <div className="mb-2">
+                <div className="flex items-center gap-2 text-xs text-[var(--text-muted)] mb-2">
+                  <Link href="/projects" className="hover:text-[var(--accent)] transition-colors">Proyectos</Link>
+                  <span>/</span>
+                  <span className="text-[var(--text)]">{project.name}</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <h1 className="text-xl font-semibold text-[var(--text)]">{project.name}</h1>
+                  <span
+                    className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold"
+                    style={{ background: `${VALIDATION_INFO[project.validation_status].color}22`, color: VALIDATION_INFO[project.validation_status].color }}
+                  >
+                    {VALIDATION_INFO[project.validation_status].label}
+                  </span>
+                </div>
+                {project.description && (
+                  <p className="mt-1 text-sm text-[var(--text-muted)]">{project.description}</p>
+                )}
+              </div>
+
+              {/* Sección: Cargar modelo */}
+              <Card>
+                <CardHeader>
+                  <h2 className="text-sm font-semibold text-[var(--text)]">Archivo de modelo</h2>
+                  <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                    Sube el exportado de ETABS en formato XLSX o .e2k
+                  </p>
+                </CardHeader>
+                <CardBody className="flex flex-col gap-4">
+
+                  {/* inputs ocultos */}
+                  <input ref={modelFileRef} type="file" accept=".xlsx" className="hidden"
+                    onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUpload(f, "model"); e.target.value = ""; }} />
+                  <input ref={e2kFileRef}   type="file" accept=".e2k"  className="hidden"
+                    onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUpload(f, "e2k");   e.target.value = ""; }} />
+
+                  <div className="grid grid-cols-2 gap-4">
+                    {/* Zona XLSX */}
+                    <div
+                      onClick={() => !uploading && modelFileRef.current?.click()}
+                      onDragOver={(e) => { e.preventDefault(); setDragOverXlsx(true); }}
+                      onDragLeave={() => setDragOverXlsx(false)}
+                      onDrop={(e) => handleDrop(e, "model")}
+                      className={[
+                        "relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 cursor-pointer transition-colors min-h-[140px]",
+                        dragOverXlsx
+                          ? "border-[var(--accent)] bg-[color-mix(in_srgb,var(--accent)_5%,transparent)]"
+                          : project.input_file_path
+                          ? "border-[var(--color-success)]/50 bg-[var(--color-success)]/5 hover:border-[var(--color-success)]"
+                          : "border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] hover:bg-[color-mix(in_srgb,var(--accent)_5%,transparent)]",
+                      ].join(" ")}
+                    >
+                      <span className="text-2xl mb-2 select-none">
+                        {project.input_file_path ? "✅" : "📊"}
+                      </span>
+                      <p className="text-sm font-medium text-[var(--text)] text-center">
+                        {project.input_file_path ? "Modelo XLSX cargado" : "Modelo ETABS (.xlsx)"}
+                      </p>
+                      <p className="text-[11px] text-[var(--text-muted)] text-center mt-1">
+                        {project.input_file_path
+                          ? "Clic o arrastra para reemplazar"
+                          : "Arrastra aquí o haz clic para seleccionar"}
+                      </p>
+                      <p className="text-[10px] text-[var(--text-muted)] mt-1 opacity-70">
+                        File → Export → Excel Spreadsheet
+                      </p>
+                      {dragOverXlsx && (
+                        <div className="absolute inset-0 rounded-xl bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] flex items-center justify-center">
+                          <p className="text-[var(--accent)] font-semibold text-sm">Suelta para subir</p>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Zona E2K */}
+                    <div
+                      onClick={() => !uploading && e2kFileRef.current?.click()}
+                      onDragOver={(e) => { e.preventDefault(); setDragOverE2k(true); }}
+                      onDragLeave={() => setDragOverE2k(false)}
+                      onDrop={(e) => handleDrop(e, "e2k")}
+                      className={[
+                        "relative flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 cursor-pointer transition-colors min-h-[140px]",
+                        dragOverE2k
+                          ? "border-[var(--accent)] bg-[color-mix(in_srgb,var(--accent)_5%,transparent)]"
+                          : project.e2k_file_path
+                          ? "border-[var(--color-success)]/50 bg-[var(--color-success)]/5 hover:border-[var(--color-success)]"
+                          : "border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] hover:bg-[color-mix(in_srgb,var(--accent)_5%,transparent)]",
+                      ].join(" ")}
+                    >
+                      <span className="text-2xl mb-2 select-none">
+                        {project.e2k_file_path ? "✅" : "📄"}
+                      </span>
+                      <p className="text-sm font-medium text-[var(--text)] text-center">
+                        {project.e2k_file_path ? "Archivo .e2k cargado" : "ETABS Text (.e2k)"}
+                      </p>
+                      <p className="text-[11px] text-[var(--text-muted)] text-center mt-1">
+                        {project.e2k_file_path
+                          ? "Clic o arrastra para reemplazar"
+                          : "Arrastra aquí o haz clic para seleccionar"}
+                      </p>
+                      <p className="text-[10px] text-[var(--text-muted)] mt-1 opacity-70">
+                        File → Export → ETABS Text File
+                      </p>
+                      {dragOverE2k && (
+                        <div className="absolute inset-0 rounded-xl bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] flex items-center justify-center">
+                          <p className="text-[var(--accent)] font-semibold text-sm">Suelta para subir</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {uploadError && (
+                    <p className="text-sm text-[var(--danger)]">{uploadError}</p>
+                  )}
+                  {uploading && (
+                    <p className="text-sm text-[var(--text-muted)] animate-pulse">Subiendo archivo...</p>
+                  )}
+                </CardBody>
+              </Card>
+
+              {/* Sección: Validar modelo */}
+              <Card>
+                <CardHeader>
+                  <h2 className="text-sm font-semibold text-[var(--text)]">Validación del modelo</h2>
+                  <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                    Verifica la integridad del modelo antes de ejecutar análisis
+                  </p>
+                </CardHeader>
+                <CardBody className="flex flex-col gap-4">
+
+                  {!hasFile ? (
+                    <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] p-6 text-center">
+                      <p className="text-sm text-[var(--text-muted)]">
+                        Sube un archivo de modelo para poder validar
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      {/* Estado de validación */}
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div
+                            className="h-2 w-2 rounded-full"
+                            style={{ background: VALIDATION_INFO[project.validation_status].color }}
+                          />
+                          <span className="text-sm text-[var(--text)]">{VALIDATION_INFO[project.validation_status].label}</span>
+                        </div>
+                        <Button
+                          onClick={() => handleLaunch("import_validate")}
+                          disabled={activeJobTypes.has("import_validate") || !!launching}
+                        >
+                          {activeJobTypes.has("import_validate")
+                            ? "Validando..."
+                            : project.validation_status === "not_run"
+                            ? "Validar modelo"
+                            : "Revalidar"}
+                        </Button>
+                      </div>
+
+                      {/* Resultado de la última validación */}
+                      {(() => {
+                        const lastValidation = lastJobByType("import_validate");
+                        if (!lastValidation) return null;
+
+                        if (lastValidation.status === "failed") {
+                          return (
+                            <div className="rounded-lg border border-[var(--danger)] bg-[var(--surface-2)] p-4">
+                              <p className="text-xs font-semibold text-[var(--danger)] mb-1">Error en la tarea</p>
+                              <pre className="text-[11px] text-[var(--text-muted)] whitespace-pre-wrap line-clamp-6">
+                                {lastValidation.error_message}
+                              </pre>
+                            </div>
+                          );
+                        }
+
+                        if (lastValidation.status === "running" || lastValidation.status === "pending") {
+                          return (
+                            <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] p-4 text-center">
+                              <p className="text-sm text-[var(--text-muted)]">Validando el modelo...</p>
+                            </div>
+                          );
+                        }
+
+                        if (lastValidation.status === "success") {
+                          if (loadingValidation) {
+                            return (
+                              <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] p-4 text-center">
+                                <p className="text-sm text-[var(--text-muted)]">Cargando resultados...</p>
+                              </div>
+                            );
+                          }
+                          if (validationResult) {
+                            return <ValidationReport report={validationResult} />;
+                          }
+                        }
+
+                        return null;
+                      })()}
+                    </>
+                  )}
+                </CardBody>
+              </Card>
+
+              {/* Sección: Patrones de carga */}
+              {isValidated && modelGeometry && modelGeometry.load_patterns.length > 0 && (
                 <Card>
                   <CardHeader>
-                    <h2 className="text-sm font-semibold text-text">Parámetros sísmicos NSR-10</h2>
-                    <p className="text-xs text-text-muted mt-0.5">
-                      Municipio, suelo, sistema estructural y parámetros de análisis
+                    <h2 className="text-sm font-semibold text-[var(--text)]">Patrones de carga</h2>
+                    <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                      Indica cuál patrón corresponde a carga muerta y cuál a carga viva
                     </p>
                   </CardHeader>
                   <CardBody>
-                    <SeismicParamsForm
-                      projectId={project.id}
-                      initial={project.parameters_json ?? undefined}
-                      onSaved={handleParamsSaved}
-                      onPreview={handleSpectrumPreview}
+                    <LoadPatternSelector
+                      patterns={modelGeometry.load_patterns}
+                      cmLoad={project.parameters_json?.cm_load ?? "DEAD"}
+                      cvLoad={project.parameters_json?.cv_load ?? "LIVE"}
+                      onSave={handleSaveLoadPatterns}
                     />
                   </CardBody>
                 </Card>
+              )}
 
-                {/* Espectro de diseño */}
-                {(spectrumData || spectrumLoading) && (
+              {/* Sección: Vista previa del modelo 3D */}
+              {isValidated && (
+                <Card>
+                  <CardHeader>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h2 className="text-sm font-semibold text-[var(--text)]">Modelo estructural 3D</h2>
+                        <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                          Vista del modelo importado — columnas, vigas y apoyos
+                        </p>
+                      </div>
+                      {modelGeometry && (
+                        <Button variant="secondary" onClick={() => setActiveSection("vista-3d")}>
+                          Abrir editor 3D →
+                        </Button>
+                      )}
+                    </div>
+                  </CardHeader>
+                  <CardBody>
+                    {loadingGeometry ? (
+                      <div className="flex items-center justify-center h-48">
+                        <p className="text-sm text-[var(--text-muted)] animate-pulse">Cargando modelo 3D...</p>
+                      </div>
+                    ) : modelGeometry ? (
+                      <LinearModelViewer3D geometry={modelGeometry} />
+                    ) : (
+                      <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] flex items-center justify-center h-48">
+                        <p className="text-sm text-[var(--text-muted)]">
+                          Modelo 3D no disponible
+                        </p>
+                      </div>
+                    )}
+                  </CardBody>
+                </Card>
+              )}
+
+              {/* Historial de jobs */}
+              {jobs.length > 0 && (
+                <div className="mt-4">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)] mb-3">
+                    Historial de análisis
+                  </h3>
+                  <div className="flex flex-col gap-2">
+                    {jobs.slice(0, 8).map((j) => (
+                      <div
+                        key={j.id}
+                        className="flex items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-xs"
+                      >
+                        <div className="flex items-center gap-3">
+                          <JobStatusBadge status={j.status} />
+                          <span className="text-[var(--text)] capitalize">
+                            {{
+                              import_validate: "Importar y Validar",
+                              modal:           "Análisis Modal",
+                              spectral:        "Análisis Espectral",
+                              design_columns:  "Verificación P-M Columnas",
+                              design_beams:    "Diseño de Vigas",
+                            }[j.analysis_type]}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <span className="text-[var(--text-muted)]">
+                            {new Date(j.created_at).toLocaleString("es-CO", { dateStyle: "short", timeStyle: "short" })}
+                          </span>
+                          {(j.status === "pending" || j.status === "running") && (
+                            <Button
+                              variant="ghost"
+                              onClick={() => handleCancel(j.id)}
+                              className="text-xs py-0.5 px-2 h-auto"
+                            >
+                              Cancelar
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Sísmico + Modal + Espectral ──────────────────────────────────── */}
+          {activeSection === "sismico" && (
+            <div className="mx-auto max-w-5xl px-6 py-8 flex flex-col gap-6">
+
+              {!isValidated ? (
+                <Card>
+                  <CardBody className="py-12 text-center">
+                    <p className="text-[var(--text-muted)] text-sm">
+                      Valida el modelo en <strong>Archivos y Validación</strong> antes de configurar el análisis sísmico.
+                    </p>
+                    <Button className="mt-4" variant="secondary" onClick={() => setActiveSection("archivos")}>
+                      Ir a Archivos y Validación
+                    </Button>
+                  </CardBody>
+                </Card>
+              ) : (
+                <>
+                  {/* Parámetros sísmicos NSR-10 */}
                   <Card>
                     <CardHeader>
-                      <h2 className="text-sm font-semibold text-text">Espectro de diseño NSR-10</h2>
-                      <p className="text-xs text-text-muted mt-0.5">
-                        Sa(T) — espectro elástico reducido por factor R
+                      <h2 className="text-sm font-semibold text-[var(--text)]">Parámetros sísmicos NSR-10</h2>
+                      <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                        Municipio, suelo, sistema estructural y parámetros de análisis
                       </p>
                     </CardHeader>
                     <CardBody>
-                      {spectrumLoading ? (
-                        <SpectrumPreview data={null as unknown as SpectrumPreviewResult} loading />
-                      ) : spectrumData ? (
-                        <SpectrumPreview data={spectrumData} />
+                      <SeismicParamsForm
+                        projectId={project.id}
+                        initial={project.parameters_json ?? undefined}
+                        onSaved={handleParamsSaved}
+                        onPreview={handleSpectrumPreview}
+                      />
+                    </CardBody>
+                  </Card>
+
+                  {/* Espectro de diseño */}
+                  {(spectrumData || spectrumLoading) && (
+                    <Card>
+                      <CardHeader>
+                        <h2 className="text-sm font-semibold text-[var(--text)]">Espectro de diseño NSR-10</h2>
+                        <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                          Sa(T) — espectro elástico reducido por factor R
+                        </p>
+                      </CardHeader>
+                      <CardBody>
+                        {spectrumLoading ? (
+                          <SpectrumPreview data={null as unknown as SpectrumPreviewResult} loading />
+                        ) : spectrumData ? (
+                          <SpectrumPreview data={spectrumData} />
+                        ) : null}
+                      </CardBody>
+                    </Card>
+                  )}
+
+                  {/* Análisis modal */}
+                  <Card>
+                    <CardHeader>
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h2 className="text-sm font-semibold text-[var(--text)]">Análisis Modal</h2>
+                          <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                            Períodos, modos de vibración y participación de masas
+                          </p>
+                        </div>
+                        <Button
+                          onClick={() => handleLaunch("modal")}
+                          disabled={!isValidated || activeJobTypes.has("modal") || !!launching}
+                        >
+                          {activeJobTypes.has("modal") ? "Calculando..." : hasModal ? "Recalcular" : "Ejecutar modal"}
+                        </Button>
+                      </div>
+                    </CardHeader>
+                    <CardBody>
+                      {lastJobByType("modal")?.status === "failed" && (
+                        <div className="mb-4 rounded-lg border border-[var(--color-danger)] bg-[var(--surface-2)] p-3">
+                          <p className="text-xs font-semibold text-[var(--color-danger)] mb-1">Error en el análisis modal</p>
+                          <pre className="text-[11px] text-[var(--text-muted)] whitespace-pre-wrap line-clamp-6">
+                            {lastJobByType("modal")?.error_message}
+                          </pre>
+                        </div>
+                      )}
+                      {(lastJobByType("modal")?.status === "pending" || lastJobByType("modal")?.status === "running") && (
+                        <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] p-6 text-center mb-4">
+                          <p className="text-sm text-[var(--text-muted)] animate-pulse">Calculando modos de vibración…</p>
+                        </div>
+                      )}
+                      {hasModal && modalResult ? (
+                        <ModalResultsTable result={modalResult} />
+                      ) : !hasModal && lastJobByType("modal")?.status !== "failed" &&
+                          lastJobByType("modal")?.status !== "running" &&
+                          lastJobByType("modal")?.status !== "pending" ? (
+                        <div className="rounded-lg border border-dashed border-[var(--border)] p-6 text-center">
+                          <p className="text-sm text-[var(--text-muted)]">
+                            Configura los parámetros sísmicos y ejecuta el análisis modal
+                          </p>
+                        </div>
                       ) : null}
                     </CardBody>
                   </Card>
-                )}
 
-                {/* Análisis modal */}
+                  {/* Análisis espectral + FHE */}
+                  <Card>
+                    <CardHeader>
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h2 className="text-sm font-semibold text-[var(--text)]">Análisis Espectral RSA + Ajuste FHE</h2>
+                          <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                            Cortante basal, derivas y verificación NSR-10
+                          </p>
+                        </div>
+                        <Button
+                          onClick={() => handleLaunch("spectral")}
+                          disabled={!hasModal || !project.parameters_json || activeJobTypes.has("spectral") || !!launching}
+                          title={!hasModal ? "Ejecuta el análisis modal primero" : !project.parameters_json ? "Configura los parámetros sísmicos primero" : undefined}
+                        >
+                          {activeJobTypes.has("spectral") ? "Calculando..." : hasSpectral ? "Recalcular" : "Ejecutar espectral"}
+                        </Button>
+                      </div>
+                    </CardHeader>
+                    <CardBody>
+                      {lastJobByType("spectral")?.status === "failed" && (
+                        <div className="mb-4 rounded-lg border border-[var(--color-danger)] bg-[var(--surface-2)] p-3">
+                          <p className="text-xs font-semibold text-[var(--color-danger)] mb-1">Error en el análisis espectral</p>
+                          <pre className="text-[11px] text-[var(--text-muted)] whitespace-pre-wrap line-clamp-6">
+                            {lastJobByType("spectral")?.error_message}
+                          </pre>
+                        </div>
+                      )}
+                      {(lastJobByType("spectral")?.status === "pending" || lastJobByType("spectral")?.status === "running") && (
+                        <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] p-6 text-center mb-4">
+                          <p className="text-sm text-[var(--text-muted)] animate-pulse">Calculando análisis espectral RSA…</p>
+                        </div>
+                      )}
+                      {hasSpectral && spectralResult ? (
+                        <SpectralResultsPanel result={spectralResult} />
+                      ) : !hasSpectral && lastJobByType("spectral")?.status !== "failed" &&
+                          lastJobByType("spectral")?.status !== "running" &&
+                          lastJobByType("spectral")?.status !== "pending" ? (
+                        <div className="rounded-lg border border-dashed border-[var(--border)] p-6 text-center">
+                          <p className="text-sm text-[var(--text-muted)]">
+                            {!hasModal
+                              ? "Ejecuta el análisis modal primero"
+                              : !project.parameters_json
+                              ? "Configura los parámetros sísmicos y guárdalos"
+                              : "Ejecuta el análisis espectral RSA"}
+                          </p>
+                        </div>
+                      ) : null}
+                    </CardBody>
+                  </Card>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* ── Diseño ───────────────────────────────────────────────────────── */}
+          {activeSection === "diseno" && hasSpectral && (
+            <div className="mx-auto max-w-5xl px-6 py-8 flex flex-col gap-6">
+
+              {/* Combinaciones NSR-10 */}
+              <Card>
+                <CardHeader>
+                  <h2 className="text-sm font-semibold text-[var(--text)]">
+                    Combinaciones de diseño — NSR-10 Título B
+                  </h2>
+                  <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                    Selecciona las combinaciones LRFD a incluir en la envolvente de diseño.
+                    Las fuerzas sísmicas E provienen del RSA y ya incorporan el factor R.
+                  </p>
+                </CardHeader>
+                <CardBody>
+                  <CombinationSelector
+                    projectId={project.id}
+                    cmLoad={project.parameters_json?.cm_load ?? "DEAD"}
+                    cvLoad={project.parameters_json?.cv_load ?? "LIVE"}
+                  />
+                </CardBody>
+              </Card>
+
+              {/* Botones de lanzamiento — fila compacta */}
+              <div className="grid grid-cols-2 gap-4">
+                {/* Verificación P-M de columnas */}
                 <Card>
                   <CardHeader>
                     <div className="flex items-center justify-between">
                       <div>
-                        <h2 className="text-sm font-semibold text-text">Análisis Modal</h2>
-                        <p className="text-xs text-text-muted mt-0.5">
-                          Períodos, modos de vibración y participación de masas
-                        </p>
+                        <h2 className="text-sm font-semibold text-[var(--text)]">Verificación P-M columnas</h2>
+                        <p className="text-xs text-[var(--text-muted)] mt-0.5">Envolvente NSR-10 · Método del pórtico</p>
                       </div>
                       <Button
-                        onClick={() => handleLaunch("modal")}
-                        disabled={!isValidated || activeJobTypes.has("modal") || !!launching}
+                        onClick={() => handleLaunch("design_columns")}
+                        disabled={activeJobTypes.has("design_columns") || !!launching}
                       >
-                        {activeJobTypes.has("modal") ? "Calculando..." : hasModal ? "Recalcular" : "Ejecutar modal"}
+                        {activeJobTypes.has("design_columns") ? "Calculando..." : hasDesign ? "Recalcular" : "Verificar"}
                       </Button>
                     </div>
                   </CardHeader>
-                  <CardBody>
-                    {lastJobByType("modal")?.status === "failed" && (
-                      <div className="mb-4 rounded-lg border border-[var(--color-danger)] bg-surface-2 p-3">
-                        <p className="text-xs font-semibold text-[var(--color-danger)] mb-1">Error en el análisis modal</p>
-                        <pre className="text-[11px] text-text-muted whitespace-pre-wrap line-clamp-6">
-                          {lastJobByType("modal")?.error_message}
+                  {lastJobByType("design_columns")?.status === "failed" && (
+                    <CardBody>
+                      <div className="rounded-lg border border-[var(--color-danger)] bg-[var(--surface-2)] p-3">
+                        <p className="text-xs font-semibold text-[var(--color-danger)] mb-1">Error en la verificación</p>
+                        <pre className="text-[11px] text-[var(--text-muted)] whitespace-pre-wrap line-clamp-4">
+                          {lastJobByType("design_columns")?.error_message}
                         </pre>
                       </div>
-                    )}
-                    {(lastJobByType("modal")?.status === "pending" || lastJobByType("modal")?.status === "running") && (
-                      <div className="rounded-lg border border-border bg-surface-2 p-6 text-center mb-4">
-                        <p className="text-sm text-text-muted animate-pulse">Calculando modos de vibración…</p>
-                      </div>
-                    )}
-                    {hasModal && modalResult ? (
-                      <ModalResultsTable result={modalResult} />
-                    ) : !hasModal && lastJobByType("modal")?.status !== "failed" &&
-                        lastJobByType("modal")?.status !== "running" &&
-                        lastJobByType("modal")?.status !== "pending" ? (
-                      <div className="rounded-lg border border-dashed border-border p-6 text-center">
-                        <p className="text-sm text-text-muted">
-                          Configura los parámetros sísmicos y ejecuta el análisis modal
-                        </p>
-                      </div>
-                    ) : null}
-                  </CardBody>
+                    </CardBody>
+                  )}
+                  {(lastJobByType("design_columns")?.status === "pending" ||
+                    lastJobByType("design_columns")?.status === "running") && (
+                    <CardBody>
+                      <p className="text-sm text-[var(--text-muted)] animate-pulse py-1">Calculando envolvente de diseño…</p>
+                    </CardBody>
+                  )}
                 </Card>
 
-                {/* Análisis espectral + FHE */}
+                {/* Diseño de vigas */}
                 <Card>
                   <CardHeader>
                     <div className="flex items-center justify-between">
                       <div>
-                        <h2 className="text-sm font-semibold text-text">Análisis Espectral RSA + Ajuste FHE</h2>
-                        <p className="text-xs text-text-muted mt-0.5">
-                          Cortante basal, derivas y verificación NSR-10
-                        </p>
+                        <h2 className="text-sm font-semibold text-[var(--text)]">Diseño vigas — Flexión + Cortante</h2>
+                        <p className="text-xs text-[var(--text-muted)] mt-0.5">ACI 318 / NSR-10 C · As mínimo NSR-10 C.9.6.1</p>
                       </div>
                       <Button
-                        onClick={() => handleLaunch("spectral")}
-                        disabled={!hasModal || !project.parameters_json || activeJobTypes.has("spectral") || !!launching}
-                        title={!hasModal ? "Ejecuta el análisis modal primero" : !project.parameters_json ? "Configura los parámetros sísmicos primero" : undefined}
+                        onClick={() => handleLaunch("design_beams")}
+                        disabled={activeJobTypes.has("design_beams") || !!launching}
                       >
-                        {activeJobTypes.has("spectral") ? "Calculando..." : hasSpectral ? "Recalcular" : "Ejecutar espectral"}
+                        {activeJobTypes.has("design_beams") ? "Calculando..." : hasBeamDesign ? "Recalcular" : "Diseñar vigas"}
                       </Button>
                     </div>
                   </CardHeader>
-                  <CardBody>
-                    {lastJobByType("spectral")?.status === "failed" && (
-                      <div className="mb-4 rounded-lg border border-[var(--color-danger)] bg-surface-2 p-3">
-                        <p className="text-xs font-semibold text-[var(--color-danger)] mb-1">Error en el análisis espectral</p>
-                        <pre className="text-[11px] text-text-muted whitespace-pre-wrap line-clamp-6">
-                          {lastJobByType("spectral")?.error_message}
+                  {lastJobByType("design_beams")?.status === "failed" && (
+                    <CardBody>
+                      <div className="rounded-lg border border-[var(--color-danger)] bg-[var(--surface-2)] p-3">
+                        <p className="text-xs font-semibold text-[var(--color-danger)] mb-1">Error en el diseño de vigas</p>
+                        <pre className="text-[11px] text-[var(--text-muted)] whitespace-pre-wrap line-clamp-4">
+                          {lastJobByType("design_beams")?.error_message}
                         </pre>
                       </div>
-                    )}
-                    {(lastJobByType("spectral")?.status === "pending" || lastJobByType("spectral")?.status === "running") && (
-                      <div className="rounded-lg border border-border bg-surface-2 p-6 text-center mb-4">
-                        <p className="text-sm text-text-muted animate-pulse">Calculando análisis espectral RSA…</p>
-                      </div>
-                    )}
-                    {hasSpectral && spectralResult ? (
-                      <SpectralResultsPanel result={spectralResult} />
-                    ) : !hasSpectral && lastJobByType("spectral")?.status !== "failed" &&
-                        lastJobByType("spectral")?.status !== "running" &&
-                        lastJobByType("spectral")?.status !== "pending" ? (
-                      <div className="rounded-lg border border-dashed border-border p-6 text-center">
-                        <p className="text-sm text-text-muted">
-                          {!hasModal
-                            ? "Ejecuta el análisis modal primero"
-                            : !project.parameters_json
-                            ? "Configura los parámetros sísmicos y guárdalos"
-                            : "Ejecuta el análisis espectral RSA"}
-                        </p>
-                      </div>
-                    ) : null}
-                  </CardBody>
+                    </CardBody>
+                  )}
+                  {(lastJobByType("design_beams")?.status === "pending" ||
+                    lastJobByType("design_beams")?.status === "running") && (
+                    <CardBody>
+                      <p className="text-sm text-[var(--text-muted)] animate-pulse py-1">Calculando diseño de vigas…</p>
+                    </CardBody>
+                  )}
                 </Card>
-              </>
-            )}
-          </div>
-        )}
+              </div>
 
-        {/* ── Tabs bloqueados ────────────────────────────────────────────────── */}
-        {(activeTab === "design" || activeTab === "nonlinear") && (
-          <Card>
-            <CardBody className="py-16 text-center">
-              <p className="text-2xl mb-3">🔒</p>
-              <p className="text-text font-medium">Próximamente</p>
-              <p className="text-sm text-text-muted mt-2 max-w-sm mx-auto">
-                {activeTab === "design"
-                  ? "El módulo de diseño de elementos (columnas, vigas, muros) estará disponible una vez completado el análisis sísmico."
-                  : "La exportación del modelo no lineal (con refuerzo verificado) hacia el Módulo 3 estará disponible después del diseño."}
-              </p>
-            </CardBody>
-          </Card>
-        )}
-
-        {/* ── Historial de jobs (pie de página) ─────────────────────────────── */}
-        {jobs.length > 0 && (
-          <div className="mt-10">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-text-muted mb-3">
-              Historial de análisis
-            </h3>
-            <div className="flex flex-col gap-2">
-              {jobs.slice(0, 8).map((j) => (
+              {/* Navigator de frames + panel de detalle */}
+              {frameListData ? (
                 <div
-                  key={j.id}
-                  className="flex items-center justify-between rounded-lg border border-border bg-surface px-4 py-2.5 text-xs"
+                  className="flex border border-[var(--border)] rounded-xl overflow-hidden"
+                  style={{ height: "calc(100vh - 380px)", minHeight: "580px" }}
                 >
-                  <div className="flex items-center gap-3">
-                    <JobStatusBadge status={j.status} />
-                    <span className="text-text capitalize">
-                      {{
-                        import_validate: "Importar y Validar",
-                        modal:           "Análisis Modal",
-                        spectral:        "Análisis Espectral",
-                      }[j.analysis_type]}
-                    </span>
+                  {/* Sidebar izquierdo: navegador por piso */}
+                  <div className="w-64 flex-shrink-0 overflow-hidden">
+                    <FrameNavigator
+                      data={frameListData}
+                      selectedFrameId={selectedFrameId}
+                      onSelect={handleFrameSelect}
+                    />
                   </div>
-                  <div className="flex items-center gap-3">
-                    <span className="text-text-muted">
-                      {new Date(j.created_at).toLocaleString("es-CO", { dateStyle: "short", timeStyle: "short" })}
-                    </span>
-                    {(j.status === "pending" || j.status === "running") && (
-                      <Button
-                        variant="ghost"
-                        onClick={() => handleCancel(j.id)}
-                        className="text-xs py-0.5 px-2 h-auto"
-                      >
-                        Cancelar
-                      </Button>
+
+                  {/* Panel derecho: detalle del elemento seleccionado */}
+                  <div className="flex-1 overflow-y-auto bg-[var(--background)]">
+                    {loadingFrameDetail ? (
+                      <div className="flex items-center justify-center h-full">
+                        <p className="text-sm text-[var(--muted)] animate-pulse">Cargando detalle…</p>
+                      </div>
+                    ) : frameDetailData && selectedFrameType === "column" ? (
+                      <ColumnDetailPanel
+                        projectId={project.id}
+                        data={frameDetailData as ColumnDesignDetail}
+                        onReinforcementSaved={handleReinforcementSaved}
+                      />
+                    ) : frameDetailData && selectedFrameType === "beam" ? (
+                      <BeamDetailPanel
+                        projectId={project.id}
+                        data={frameDetailData as BeamDesignDetail}
+                        onReinforcementSaved={handleReinforcementSaved}
+                      />
+                    ) : (
+                      <div className="flex flex-col items-center justify-center h-full gap-3 text-[var(--muted)]">
+                        <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
+                          <rect x="6" y="6" width="32" height="32" rx="4" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 3"/>
+                          <path d="M16 22h12M22 16v12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                        </svg>
+                        <p className="text-sm">Selecciona un elemento del navegador</p>
+                      </div>
                     )}
                   </div>
                 </div>
-              ))}
+              ) : (hasDesign || hasBeamDesign) ? (
+                <div className="rounded-xl border border-[var(--border)] p-8 text-center">
+                  <p className="text-sm text-[var(--muted)] animate-pulse">Cargando navegador de elementos…</p>
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed border-[var(--border)] p-8 text-center">
+                  <p className="text-sm text-[var(--muted)]">
+                    Configura las combinaciones y ejecuta la verificación P-M de columnas o el diseño de vigas
+                  </p>
+                </div>
+              )}
             </div>
-          </div>
-        )}
-      </main>
+          )}
+
+          {/* ── Materiales ───────────────────────────────────────────────────── */}
+          {activeSection === "materiales" && (
+            <div className="flex flex-col gap-0 h-full" style={{ minHeight: "500px" }}>
+              {fullModelData ? (
+                <div className="flex h-full rounded-xl border border-[var(--border)] overflow-hidden m-4">
+                  <div className="w-80 flex-shrink-0 border-r border-[var(--border)] overflow-hidden">
+                    <ModelMaterialsPanel
+                      projectId={project.id}
+                      modelData={fullModelData}
+                      onModelDataChange={handleModelDataChange}
+                    />
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-6 bg-[var(--surface)]">
+                    <div className="max-w-xl">
+                      <h3 className="text-sm font-semibold text-[var(--text)] mb-1">Modelos constitutivos</h3>
+                      <p className="text-xs text-[var(--text-muted)] mb-4">
+                        Haz clic en un material de la lista para ver su curva tensión-deformación.
+                        Concreto: modelo parabólico de Mander. Acero: bilineal elástico-perfecto.
+                      </p>
+                      <div className="rounded-lg border border-[var(--border)]/50 bg-[var(--surface-2)] divide-y divide-[var(--border)]/30">
+                        <div className="px-4 py-3">
+                          <p className="text-[11px] font-semibold text-[var(--text)] mb-0.5">Concreto — Modelo de Mander</p>
+                          <p className="text-[10px] text-[var(--text-muted)]">
+                            fc = f&apos;c · (2x − x²) donde x = ε/ε₀, ε₀ = 2f&apos;c/Ec.
+                            Rama descendente lineal hasta 0.2f&apos;c en εcu = 0.003 (no confinado).
+                          </p>
+                        </div>
+                        <div className="px-4 py-3">
+                          <p className="text-[11px] font-semibold text-[var(--text)] mb-0.5">Acero — Bilineal elástico-perfecto</p>
+                          <p className="text-[10px] text-[var(--text-muted)]">
+                            σ = E·ε para ε &lt; εy = fy/E; σ = fy para ε ≥ εy.
+                            E = 200 GPa por defecto (acero estructural NSR-10).
+                          </p>
+                        </div>
+                        <div className="px-4 py-3">
+                          <p className="text-[11px] font-semibold text-[var(--text)] mb-0.5">En el modelo no lineal (OpenSees)</p>
+                          <p className="text-[10px] text-[var(--text-muted)]">
+                            Estos parámetros se usan para definir Concrete02 y Steel02 en el
+                            generador de modelos MVLEM/SFI. Las fibras de la sección toman la
+                            curva completa ciclo a ciclo.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-center flex-1">
+                  <p className="text-sm text-[var(--text-muted)] animate-pulse">Cargando materiales...</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Secciones ────────────────────────────────────────────────────── */}
+          {activeSection === "secciones" && (
+            <div className="flex flex-col gap-0 h-full" style={{ minHeight: "500px" }}>
+              {fullModelData ? (
+                <div className="flex h-full rounded-xl border border-[var(--border)] overflow-hidden m-4">
+                  <div className="w-80 flex-shrink-0 border-r border-[var(--border)] overflow-hidden">
+                    <ModelSectionsPanel
+                      projectId={project.id}
+                      modelData={fullModelData}
+                      onModelDataChange={handleModelDataChange}
+                    />
+                  </div>
+                  <div className="flex-1 overflow-y-auto p-6 bg-[var(--surface)]">
+                    <div className="max-w-xl">
+                      <h3 className="text-sm font-semibold text-[var(--text)] mb-1">Secciones transversales</h3>
+                      <p className="text-xs text-[var(--text-muted)] mb-4">
+                        Haz clic en &quot;Editar&quot; para ver el preview gráfico de la sección con
+                        sus propiedades geométricas calculadas.
+                      </p>
+                      <div className="rounded-lg border border-[var(--border)]/50 bg-[var(--surface-2)] divide-y divide-[var(--border)]/30">
+                        {Object.entries(fullModelData.sections).slice(0, 8).map(([name, sec]) => {
+                          const h_cm = sec.h_m * 100;
+                          const b_cm = sec.b_m * 100;
+                          const A    = sec.b_m * sec.h_m;
+                          const I33  = sec.b_m * sec.h_m ** 3 / 12;
+                          return (
+                            <div key={name} className="flex items-center gap-4 px-4 py-2.5">
+                              <svg width={36} height={28} viewBox="0 0 36 28">
+                                {(() => {
+                                  const maxD = Math.max(h_cm, b_cm, 1);
+                                  const s = 22 / maxD;
+                                  const rw = Math.max(b_cm * s, 2);
+                                  const rh = Math.max(h_cm * s, 2);
+                                  return (
+                                    <rect x={(36 - rw) / 2} y={(28 - rh) / 2}
+                                      width={rw} height={rh}
+                                      fill="#6366F1" fillOpacity="0.15"
+                                      stroke="#6366F1" strokeWidth="1" />
+                                  );
+                                })()}
+                              </svg>
+                              <div className="min-w-0 flex-1">
+                                <p className="text-xs font-semibold text-[var(--text)] truncate">{name}</p>
+                                <p className="text-[10px] text-[var(--text-muted)]">
+                                  {h_cm.toFixed(0)}×{b_cm.toFixed(0)} cm · {sec.material}
+                                </p>
+                              </div>
+                              <div className="text-right text-[10px] text-[var(--text-muted)]">
+                                <p>A = <span className="font-mono text-[var(--text)]">{(A * 1e4).toFixed(0)} cm²</span></p>
+                                <p>I₃₃ = <span className="font-mono text-[var(--text)]">{(I33 * 1e8).toFixed(0)} cm⁴</span></p>
+                              </div>
+                            </div>
+                          );
+                        })}
+                        {Object.keys(fullModelData.sections).length > 8 && (
+                          <p className="px-4 py-2 text-[10px] text-[var(--text-muted)]">
+                            … y {Object.keys(fullModelData.sections).length - 8} secciones más en la lista
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-center flex-1">
+                  <p className="text-sm text-[var(--text-muted)] animate-pulse">Cargando secciones...</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Muros ────────────────────────────────────────────────────────── */}
+          {activeSection === "muros" && (
+            <div className="flex flex-col gap-0 h-full" style={{ minHeight: "500px" }}>
+              {fullModelData ? (
+                <WallsPanel
+                  projectId={project.id}
+                  materials={Object.keys(fullModelData.materials)}
+                  steelTypes={["G420", "G60", "PDR60", "A60", "A615Gr60"]}
+                />
+              ) : (
+                <div className="flex items-center justify-center flex-1">
+                  <p className="text-sm text-[var(--text-muted)] animate-pulse">Cargando modelo...</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── No Lineal ────────────────────────────────────────────────────── */}
+          {activeSection === "no-lineal" && (
+            <div className="mx-auto max-w-5xl px-6 py-8 flex flex-col gap-6">
+
+              {/* Estado del diseño para NL */}
+              <Card>
+                <CardHeader>
+                  <h2 className="text-sm font-semibold text-[var(--text)]">Exportar al análisis no lineal</h2>
+                  <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                    Transfiere el modelo verificado al Módulo 3 — análisis pushover e IDA
+                  </p>
+                </CardHeader>
+                <CardBody>
+                  <div className="flex flex-col gap-4">
+                    {/* Checklist de requisitos */}
+                    <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] divide-y divide-[var(--border)]/40">
+                      {[
+                        {
+                          label: "Modelo importado y validado",
+                          ok: isValidated,
+                          detail: isValidated ? "Listo" : "Importa y valida el modelo primero",
+                        },
+                        {
+                          label: "Análisis modal completado",
+                          ok: hasModal,
+                          detail: hasModal ? "Períodos y modos disponibles" : "Ejecuta el análisis modal",
+                        },
+                        {
+                          label: "Análisis espectral completado",
+                          ok: hasSpectral,
+                          detail: hasSpectral ? "Cortantes y derivas disponibles" : "Ejecuta el análisis espectral",
+                        },
+                        {
+                          label: "Verificación P-M columnas",
+                          ok: hasDesign,
+                          detail: hasDesign ? "Refuerzo verificado" : "Opcional — ejecuta la verificación P-M",
+                        },
+                      ].map(({ label, ok, detail }) => (
+                        <div key={label} className="flex items-center justify-between px-4 py-3">
+                          <div className="flex items-center gap-2.5">
+                            <span
+                              className="flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-bold"
+                              style={{
+                                background: ok ? "var(--color-success)22" : "var(--color-border)",
+                                color: ok ? "var(--color-success)" : "var(--color-text-muted)",
+                              }}
+                            >
+                              {ok ? "✓" : "○"}
+                            </span>
+                            <span className="text-xs text-[var(--text)]">{label}</span>
+                          </div>
+                          <span className="text-[11px] text-[var(--text-muted)]">{detail}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Instrucciones */}
+                    <div className="rounded-lg border border-[var(--accent)]/20 bg-[color-mix(in_srgb,var(--accent)_5%,transparent)] px-4 py-3">
+                      <p className="text-xs font-semibold text-[var(--accent)] mb-1">Flujo de trabajo recomendado</p>
+                      <ol className="text-xs text-[var(--text-muted)] space-y-1 list-decimal list-inside">
+                        <li>Completa el análisis en este módulo (modal + espectral + diseño)</li>
+                        <li>Ve al Módulo 3 y crea un nuevo proyecto con el mismo archivo ETABS (.xlsx/.e2k)</li>
+                        <li>Ejecuta: Arquetipo → Modal → Pushover → Análisis Dinámico IDA</li>
+                      </ol>
+                    </div>
+
+                    {/* Botón de acceso */}
+                    <div className="flex justify-end">
+                      <button
+                        onClick={() => router.push("/building")}
+                        className="px-4 py-2 text-sm font-medium rounded-lg bg-[var(--accent)] text-white hover:opacity-80 transition-opacity"
+                      >
+                        Ir al Módulo 3 — Análisis No Lineal →
+                      </button>
+                    </div>
+                  </div>
+                </CardBody>
+              </Card>
+
+              {/* Info de archivos disponibles */}
+              {(project.input_file_path || project.e2k_file_path) && (
+                <Card>
+                  <CardHeader>
+                    <h2 className="text-sm font-semibold text-[var(--text)]">Archivos de este proyecto</h2>
+                    <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                      Sube estos mismos archivos en el Módulo 3
+                    </p>
+                  </CardHeader>
+                  <CardBody>
+                    <div className="flex flex-col gap-2">
+                      {project.input_file_path && (
+                        <div className="flex items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] px-4 py-2.5">
+                          <span className="text-base">📊</span>
+                          <div>
+                            <p className="text-xs font-medium text-[var(--text)]">Modelo ETABS (.xlsx)</p>
+                            <p className="text-[10px] text-[var(--text-muted)] font-mono truncate max-w-xs">
+                              {project.input_file_path.split(/[/\\]/).pop()}
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                      {project.e2k_file_path && (
+                        <div className="flex items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] px-4 py-2.5">
+                          <span className="text-base">📄</span>
+                          <div>
+                            <p className="text-xs font-medium text-[var(--text)]">ETABS Text (.e2k)</p>
+                            <p className="text-[10px] text-[var(--text-muted)] font-mono truncate max-w-xs">
+                              {project.e2k_file_path.split(/[/\\]/).pop()}
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </CardBody>
+                </Card>
+              )}
+            </div>
+          )}
+
+        </main>
+      </div>
     </div>
   );
 }

@@ -81,6 +81,7 @@ class E2KParser:
         self.mass_include_elements: bool = True
 
         self.pier_names: list = []
+        self.area_pier_assigns: dict = {}  # (area, story) → pier_name
 
         # element labels — assigned after parsing
         self._joint_label: dict = {}           # (pt, story) → int
@@ -498,6 +499,8 @@ class E2KParser:
             name, story = t[1], t[2]
             kv = _kv_from(t, 3)
             self.area_assigns[(name, story)] = {'section': kv.get('SECTION', '')}
+            if 'PIER' in kv:
+                self.area_pier_assigns[(name, story)] = kv['PIER']
 
     def _parse_frame_loads(self) -> None:
         for line in self._sections.get('FRAME OBJECT LOADS', []):
@@ -880,19 +883,60 @@ class E2KParser:
         return pd.DataFrame(rows) if rows else None
 
     def _build_pier_section_properties(self) -> pd.DataFrame:
-        rows = [
-            {'Story': story, 'Pier': pier, 'Length': 0.0, 'Thickness': 0.2}
-            for pier in self.pier_names
-            for story in self.story_order[1:]
-        ]
+        # group wall shell areas by (pier, story)
+        pier_story_areas: dict = {}
+        for (area, story), pier in self.area_pier_assigns.items():
+            pier_story_areas.setdefault((pier, story), []).append(area)
+
+        rows = []
+        for pier in self.pier_names:
+            for story in self.story_order[1:]:
+                areas = pier_story_areas.get((pier, story), [])
+                total_length = 0.0
+                thickness = 0.2
+                for area in areas:
+                    pts = self.area_conns.get(area, {}).get('pts', [])
+                    coords = [self.points[p] for p in pts if p in self.points]
+                    unique: list = []
+                    for c in coords:
+                        if c not in unique:
+                            unique.append(c)
+                    if len(unique) >= 2:
+                        max_dist = 0.0
+                        for i in range(len(unique)):
+                            for j in range(i + 1, len(unique)):
+                                d = math.hypot(
+                                    unique[j][0] - unique[i][0],
+                                    unique[j][1] - unique[i][1],
+                                )
+                                if d > max_dist:
+                                    max_dist = d
+                        total_length += max_dist
+                    sec = self.area_assigns.get((area, story), {}).get('section', '')
+                    wp = self.wall_props.get(sec, {})
+                    if wp:
+                        thickness = wp.get('Thickness', thickness)
+                rows.append({
+                    'Story': story,
+                    'Pier': pier,
+                    'Length': round(total_length, 4),
+                    'Thickness': round(thickness, 4),
+                })
         return pd.DataFrame(rows)
 
     def _build_shell_pier_assignments(self, df_shells: pd.DataFrame) -> pd.DataFrame:
-        rows = [
-            {'Story': row['Story'], 'Unique Name': row['Element Label'], 'Pier': ''}
-            for _, row in df_shells.iterrows()
-            if str(row.get('Area Type', '')).lower() == 'wall'
-        ]
+        rows = []
+        for _, row in df_shells.iterrows():
+            if str(row.get('Area Type', '')).lower() != 'wall':
+                continue
+            ar = row['Area Label']
+            story = row['Story']
+            pier = self.area_pier_assigns.get((ar, story), '')
+            rows.append({
+                'Story': story,
+                'Unique Name': row['Element Label'],
+                'Pier': pier,
+            })
         return pd.DataFrame(rows)
 
     # ── supplemental merge ────────────────────────────────────────────────────

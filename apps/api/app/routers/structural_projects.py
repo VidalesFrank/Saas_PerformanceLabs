@@ -250,6 +250,10 @@ def list_project_jobs(project_id: str, user: CurrentUser, db: DB):
     return [JobOut.from_orm_extra(j) for j in jobs]
 
 
+class CombinationsIn(BaseModel):
+    selected_ids: list[str]
+
+
 class SpectrumPreviewRequest(BaseModel):
     Aa: float
     Av: float
@@ -304,6 +308,31 @@ def model_geometry(project_id: str, user: CurrentUser, db: DB):
         "n_frames":      len(frames_slim),
         "n_stories":     len(stories_full),
     }
+
+
+@router.get("/{project_id}/combinations")
+def get_combinations(project_id: str, user: CurrentUser, db: DB):
+    """
+    Retorna el catálogo completo de combinaciones NSR-10 B.3.4 y los IDs
+    actualmente seleccionados para este proyecto.
+    """
+    from engine.building.design.combinations import NSR10_COMBINATIONS, DEFAULT_SELECTED_IDS
+    project = _get_project_or_404(db, project_id, user)
+    params = json.loads(project.parameters_json) if project.parameters_json else {}
+    selected = params.get("combinations", DEFAULT_SELECTED_IDS)
+    return {"combinations": NSR10_COMBINATIONS, "selected_ids": selected}
+
+
+@router.put("/{project_id}/combinations")
+def save_combinations(project_id: str, payload: CombinationsIn, user: CurrentUser, db: DB):
+    """Persiste los IDs de combinaciones seleccionadas dentro de parameters_json."""
+    from engine.building.design.combinations import validate_selected_ids
+    project = _get_project_or_404(db, project_id, user)
+    params = json.loads(project.parameters_json) if project.parameters_json else {}
+    params["combinations"] = validate_selected_ids(payload.selected_ids)
+    project.parameters_json = json.dumps(params, ensure_ascii=False)
+    db.commit()
+    return {"selected_ids": params["combinations"]}
 
 
 @router.post("/{project_id}/spectrum-preview")

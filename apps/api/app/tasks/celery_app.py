@@ -14,6 +14,8 @@ celery_app = Celery(
         "app.tasks.structural_import_task",
         "app.tasks.structural_modal_task",
         "app.tasks.structural_spectral_task",
+        "app.tasks.structural_design_task",
+        "app.tasks.structural_beam_task",
     ],
 )
 
@@ -38,4 +40,6 @@ celery_app.conf.task_annotations = {
     "app.tasks.structural_import_task.run_import":     {"time_limit": 1800, "soft_time_limit": 1700},
     "app.tasks.structural_modal_task.run_modal":       {"time_limit": 3600, "soft_time_limit": 3500},
     "app.tasks.structural_spectral_task.run_spectral": {"time_limit": 1800, "soft_time_limit": 1700},
+    "app.tasks.structural_design_task.run_design_columns": {"time_limit": 600, "soft_time_limit": 550},
+    "app.tasks.structural_beam_task.run_design_beams":     {"time_limit": 600, "soft_time_limit": 550},
 }

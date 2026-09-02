@@ -130,6 +130,24 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
                 detail="Configura los parámetros sísmicos NSR-10 antes del análisis espectral.",
             )
 
+    elif payload.analysis_type in (
+        StructuralAnalysisType.design_columns,
+        StructuralAnalysisType.design_beams,
+    ):
+        if not project.canonical_model_path:
+            raise HTTPException(
+                status_code=400,
+                detail="El modelo debe estar validado antes del diseño.",
+            )
+        # Verifica que exista spectral_results.json
+        work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+        spectral_path = os.path.join(work_dir, "results", "spectral_results.json")
+        if not os.path.exists(spectral_path):
+            raise HTTPException(
+                status_code=400,
+                detail="Ejecuta el análisis espectral RSA antes del diseño.",
+            )
+
     # Crear el registro del job
     job = StructuralJob(
         analysis_type=payload.analysis_type,
@@ -156,6 +174,8 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
             StructuralAnalysisType.import_validate: "app.tasks.structural_import_task.run_import",
             StructuralAnalysisType.modal:           "app.tasks.structural_modal_task.run_modal",
             StructuralAnalysisType.spectral:        "app.tasks.structural_spectral_task.run_spectral",
+            StructuralAnalysisType.design_columns:  "app.tasks.structural_design_task.run_design_columns",
+            StructuralAnalysisType.design_beams:    "app.tasks.structural_beam_task.run_design_beams",
         }
 
         kwargs: dict = {

@@ -34,12 +34,25 @@ export interface InteractionPoint2 {
   m_knm: number;
 }
 
+export interface PMKeyPoint {
+  p_kn: number;
+  m_knm: number;
+}
+
 export interface InteractionResult {
   section_id: string;
   points: InteractionPoint2[];
   p_max_kn: number;
   p_min_kn: number;
   m_max_knm: number;
+  key_points?: {
+    compression_pure?: PMKeyPoint;
+    balanced?: PMKeyPoint;
+    pure_flexure?: PMKeyPoint;
+    tension_pure?: PMKeyPoint;
+  };
+  theta_deg?: number;
+  num_points_computed?: number;
 }
 
 export interface MCPoint2 {
@@ -112,7 +125,7 @@ export const sectionEditorApi = {
   delete: (id: string) => req<void>(`/${id}`, { method: "DELETE" }),
 
   // Análisis (POST — el engine corre en el servidor)
-  interaction: (id: string, numPoints = 15, thetaDeg = 0) =>
+  interaction: (id: string, numPoints = 40, thetaDeg = 0) =>
     req<InteractionResult>(`/${id}/interaction-diagram`, {
       method: "POST",
       body: JSON.stringify({ num_points: numPoints, theta_deg: thetaDeg }),

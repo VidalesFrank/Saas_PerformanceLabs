@@ -405,7 +405,9 @@ class DataValidator:
     ) -> list[ValidationIssue]:
         issues = []
 
-        if "Section" not in assign_df.columns:
+        # La columna puede llamarse "Section" (E17) o "Analysis Section" (E23 adaptado)
+        sec_col = next((c for c in ("Section", "Analysis Section") if c in assign_df.columns), None)
+        if sec_col is None:
             return issues
 
         defined_secs = set()
@@ -413,7 +415,7 @@ class DataValidator:
             defined_secs = set(secs_df["Name"].dropna().astype(str).str.strip())
 
         # Secciones asignadas pero no definidas
-        assigned_secs = set(assign_df["Section"].dropna().astype(str).str.strip())
+        assigned_secs = set(assign_df[sec_col].dropna().astype(str).str.strip())
         undefined = assigned_secs - defined_secs
         if undefined:
             issues.append(ValidationIssue(
