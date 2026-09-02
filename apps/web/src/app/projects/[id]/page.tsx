@@ -21,6 +21,7 @@ import BeamDetailPanel from "@/components/linear/BeamDetailPanel";
 import WallsPanel from "@/components/linear/WallsPanel";
 import ModelMaterialsPanel from "@/components/linear/ModelMaterialsPanel";
 import ModelSectionsPanel from "@/components/linear/ModelSectionsPanel";
+import { NonlinearSpecPanel } from "@/components/linear/NonlinearSpecPanel";
 import { ApiError } from "@/lib/api";
 import { structuralProjectsApi, structuralAnalysisApi, structuralDesignApi, structuralEditorApi } from "@/lib/structural-api";
 import type {
@@ -1451,120 +1452,11 @@ export default function StructuralProjectPage() {
 
           {/* ── No Lineal ────────────────────────────────────────────────────── */}
           {activeSection === "no-lineal" && (
-            <div className="mx-auto max-w-5xl px-6 py-8 flex flex-col gap-6">
-
-              {/* Estado del diseño para NL */}
-              <Card>
-                <CardHeader>
-                  <h2 className="text-sm font-semibold text-[var(--text)]">Exportar al análisis no lineal</h2>
-                  <p className="text-xs text-[var(--text-muted)] mt-0.5">
-                    Transfiere el modelo verificado al Módulo 3 — análisis pushover e IDA
-                  </p>
-                </CardHeader>
-                <CardBody>
-                  <div className="flex flex-col gap-4">
-                    {/* Checklist de requisitos */}
-                    <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] divide-y divide-[var(--border)]/40">
-                      {[
-                        {
-                          label: "Modelo importado y validado",
-                          ok: isValidated,
-                          detail: isValidated ? "Listo" : "Importa y valida el modelo primero",
-                        },
-                        {
-                          label: "Análisis modal completado",
-                          ok: hasModal,
-                          detail: hasModal ? "Períodos y modos disponibles" : "Ejecuta el análisis modal",
-                        },
-                        {
-                          label: "Análisis espectral completado",
-                          ok: hasSpectral,
-                          detail: hasSpectral ? "Cortantes y derivas disponibles" : "Ejecuta el análisis espectral",
-                        },
-                        {
-                          label: "Verificación P-M columnas",
-                          ok: hasDesign,
-                          detail: hasDesign ? "Refuerzo verificado" : "Opcional — ejecuta la verificación P-M",
-                        },
-                      ].map(({ label, ok, detail }) => (
-                        <div key={label} className="flex items-center justify-between px-4 py-3">
-                          <div className="flex items-center gap-2.5">
-                            <span
-                              className="flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-bold"
-                              style={{
-                                background: ok ? "var(--color-success)22" : "var(--color-border)",
-                                color: ok ? "var(--color-success)" : "var(--color-text-muted)",
-                              }}
-                            >
-                              {ok ? "✓" : "○"}
-                            </span>
-                            <span className="text-xs text-[var(--text)]">{label}</span>
-                          </div>
-                          <span className="text-[11px] text-[var(--text-muted)]">{detail}</span>
-                        </div>
-                      ))}
-                    </div>
-
-                    {/* Instrucciones */}
-                    <div className="rounded-lg border border-[var(--accent)]/20 bg-[color-mix(in_srgb,var(--accent)_5%,transparent)] px-4 py-3">
-                      <p className="text-xs font-semibold text-[var(--accent)] mb-1">Flujo de trabajo recomendado</p>
-                      <ol className="text-xs text-[var(--text-muted)] space-y-1 list-decimal list-inside">
-                        <li>Completa el análisis en este módulo (modal + espectral + diseño)</li>
-                        <li>Ve al Módulo 3 y crea un nuevo proyecto con el mismo archivo ETABS (.xlsx/.e2k)</li>
-                        <li>Ejecuta: Arquetipo → Modal → Pushover → Análisis Dinámico IDA</li>
-                      </ol>
-                    </div>
-
-                    {/* Botón de acceso */}
-                    <div className="flex justify-end">
-                      <button
-                        onClick={() => router.push("/building")}
-                        className="px-4 py-2 text-sm font-medium rounded-lg bg-[var(--accent)] text-white hover:opacity-80 transition-opacity"
-                      >
-                        Ir al Módulo 3 — Análisis No Lineal →
-                      </button>
-                    </div>
-                  </div>
-                </CardBody>
-              </Card>
-
-              {/* Info de archivos disponibles */}
-              {(project.input_file_path || project.e2k_file_path) && (
-                <Card>
-                  <CardHeader>
-                    <h2 className="text-sm font-semibold text-[var(--text)]">Archivos de este proyecto</h2>
-                    <p className="text-xs text-[var(--text-muted)] mt-0.5">
-                      Sube estos mismos archivos en el Módulo 3
-                    </p>
-                  </CardHeader>
-                  <CardBody>
-                    <div className="flex flex-col gap-2">
-                      {project.input_file_path && (
-                        <div className="flex items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] px-4 py-2.5">
-                          <span className="text-base">📊</span>
-                          <div>
-                            <p className="text-xs font-medium text-[var(--text)]">Modelo ETABS (.xlsx)</p>
-                            <p className="text-[10px] text-[var(--text-muted)] font-mono truncate max-w-xs">
-                              {project.input_file_path.split(/[/\\]/).pop()}
-                            </p>
-                          </div>
-                        </div>
-                      )}
-                      {project.e2k_file_path && (
-                        <div className="flex items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] px-4 py-2.5">
-                          <span className="text-base">📄</span>
-                          <div>
-                            <p className="text-xs font-medium text-[var(--text)]">ETABS Text (.e2k)</p>
-                            <p className="text-[10px] text-[var(--text-muted)] font-mono truncate max-w-xs">
-                              {project.e2k_file_path.split(/[/\\]/).pop()}
-                            </p>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </CardBody>
-                </Card>
-              )}
+            <div className="mx-auto max-w-3xl px-6 py-8">
+              <NonlinearSpecPanel
+                projectId={project.id}
+                isValidated={isValidated}
+              />
             </div>
           )}
 

@@ -751,6 +751,45 @@ export interface AssignSectionResult {
   previous_sections: Record<string, string>;
 }
 
+// ── Modelo No Lineal ──────────────────────────────────────────────────────────
+
+export type NLSpecStatus = "missing" | "current" | "stale";
+
+export interface NLSpecMetadata {
+  project_id:          string;
+  generated_at:        string;
+  source_digest:       string;
+  n_stories:           number;
+  n_columns:           number;
+  n_beams:             number;
+  n_columns_designed:  number;
+  n_beams_designed:    number;
+  energy_dissipation:  string;
+  structure_system:    string;
+  units:               string;
+}
+
+export interface NLSpecValidation {
+  n_columns_no_design: number;
+  n_beams_no_design:   number;
+  n_warnings:          number;
+  ready_for_analysis:  boolean;
+  warnings:            string[];
+}
+
+export interface NLSpecStatusResult {
+  status:     NLSpecStatus;
+  metadata:   NLSpecMetadata | null;
+  validation: NLSpecValidation | null;
+}
+
+export interface NLSpecGenerateResult {
+  ok:         boolean;
+  message:    string;
+  metadata:   NLSpecMetadata;
+  validation: NLSpecValidation;
+}
+
 /** Modo de color del viewport 3D. */
 export type ColorMode = "type" | "section" | "story";
 

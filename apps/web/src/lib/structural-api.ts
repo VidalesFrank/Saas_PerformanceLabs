@@ -25,6 +25,8 @@ import type {
   SectionData,
   MaterialData,
   AssignSectionResult,
+  NLSpecStatusResult,
+  NLSpecGenerateResult,
 } from "./structural-types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -248,4 +250,70 @@ export const structuralDesignApi = {
         body: JSON.stringify({ reinforcement }),
       },
     ),
+};
+
+const NL_BASE = `${API_URL}/api/v1/projects/nonlinear`;
+
+function authHeadersNL(): Headers {
+  const h = new Headers();
+  const token = getToken();
+  if (token) h.set("Authorization", `Bearer ${token}`);
+  return h;
+}
+
+async function nlReq<T>(path: string, opts: RequestInit = {}): Promise<T> {
+  const headers = new Headers(opts.headers);
+  const token = getToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (!(opts.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
+  const res = await fetch(`${NL_BASE}${path}`, { ...opts, headers });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new ApiError(res.status, err.detail ?? "Error desconocido");
+  }
+  return res.json() as Promise<T>;
+}
+
+export const nlSpecApi = {
+  getStatus: (projectId: string) =>
+    nlReq<NLSpecStatusResult>(`/${projectId}/spec`),
+
+  generate: (projectId: string) =>
+    nlReq<NLSpecGenerateResult>(`/${projectId}/spec/generate`, { method: "POST" }),
+
+  download: async (projectId: string): Promise<void> => {
+    const token = getToken();
+    const headers = new Headers();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    const res = await fetch(`${NL_BASE}/${projectId}/spec/download`, { headers });
+    if (!res.ok) throw new ApiError(res.status, "Error descargando spec");
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = `nonlinear_model_${projectId.slice(0, 8)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  },
+
+  upload: async (projectId: string, file: File): Promise<NLSpecGenerateResult> => {
+    const headers = authHeadersNL();
+    const form    = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${NL_BASE}/${projectId}/spec/upload`, {
+      method: "POST",
+      headers,
+      body: form,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new ApiError(res.status, err.detail ?? "Error cargando spec");
+    }
+    return res.json() as Promise<NLSpecGenerateResult>;
+  },
+
+  deleteSpec: (projectId: string) =>
+    nlReq<{ ok: boolean; message: string }>(`/${projectId}/spec`, { method: "DELETE" }),
 };

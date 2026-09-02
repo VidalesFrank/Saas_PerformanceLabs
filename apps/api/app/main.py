@@ -12,6 +12,7 @@ from app.routers import building_projects, building_analysis, building_performan
 from app.routers import section_editor
 from app.routers import structural_projects, structural_analysis, structural_design, structural_editor
 from app.routers import wall_analytical
+from app.routers import structural_nonlinear
 
 
 def _create_tables() -> None:
@@ -106,6 +107,7 @@ app.include_router(building_performance.router)
 app.include_router(structural_analysis.router)
 app.include_router(structural_design.router)
 app.include_router(structural_editor.router)
+app.include_router(structural_nonlinear.router)
 app.include_router(wall_analytical.router)
 app.include_router(structural_projects.router)
 
