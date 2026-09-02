@@ -299,10 +299,23 @@ def model_geometry(project_id: str, user: CurrentUser, db: DB):
         for lbl, fd in frames_full.items()
     }
 
+    masses_full = model.get("masses", {})
+    masses_slim = {
+        k: {
+            "story":     md["story"],
+            "mass_x_t":  md.get("mass_x_t", 0.0),
+            "x_cm_m":    md.get("x_cm_m", 0.0),
+            "y_cm_m":    md.get("y_cm_m", 0.0),
+            "z_m":       md.get("z_m", 0.0),
+        }
+        for k, md in masses_full.items()
+    }
+
     return {
         "joints":        joints_slim,
         "frames":        frames_slim,
         "stories":       stories_full,
+        "masses":        masses_slim,
         "load_patterns": metadata.get("load_patterns", []),
         "n_joints":      len(joints_slim),
         "n_frames":      len(frames_slim),

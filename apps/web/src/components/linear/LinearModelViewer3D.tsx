@@ -262,6 +262,51 @@ function buildLegendTraces(opts: ViewerOptions): object[] {
   return [];
 }
 
+// Flechas de carga gravitacional: un cone Plotly por piso en el CM, escalado por masa
+function buildLoadArrows(geometry: ModelGeometry, totalHeight: number): object[] {
+  const masses = geometry.masses;
+  if (!masses || Object.keys(masses).length === 0) return [];
+
+  const massValues = Object.values(masses).map(m => m.mass_x_t);
+  const maxMass = Math.max(...massValues, 1e-9);
+  const baseLen = Math.max(totalHeight * 0.10, 1.5);   // longitud base = 10% altura, min 1.5 m
+
+  const xs: number[] = [], ys: number[] = [], zs: number[] = [];
+  const us: number[] = [], vs: number[] = [], ws: number[] = [];
+  const labels: string[] = [];
+
+  for (const md of Object.values(masses)) {
+    const ratio = md.mass_x_t / maxMass;
+    const len   = Math.max(baseLen * ratio, baseLen * 0.25);  // mínimo 25% del base
+    const W_kN  = Math.round(md.mass_x_t * 9.81);
+
+    xs.push(md.x_cm_m);
+    ys.push(md.y_cm_m);
+    zs.push(md.z_m);       // punta de la flecha toca el nivel del piso
+    us.push(0);
+    vs.push(0);
+    ws.push(-len);          // vector apunta hacia abajo
+    labels.push(`<b>${md.story}</b><br>W = ${W_kN} kN<br>m = ${md.mass_x_t.toFixed(1)} t<extra></extra>`);
+  }
+
+  return [{
+    type: "cone",
+    x: xs, y: ys, z: zs,
+    u: us, v: vs, w: ws,
+    anchor: "tip",
+    sizemode: "absolute",
+    sizeref: baseLen * 0.9,
+    colorscale: [[0, "#3B82F6"], [1, "#60A5FA"]],
+    cmin: 0, cmax: maxMass,
+    color: massValues,
+    showscale: false,
+    opacity: 0.82,
+    hovertemplate: labels,
+    name: "Cargas",
+    showlegend: true,
+  }];
+}
+
 function buildSupports(geometry: ModelGeometry): object {
   const sx:number[]=[], sy:number[]=[], sz:number[]=[];
   for (const jd of Object.values(geometry.joints))
@@ -351,6 +396,7 @@ export function LinearModelViewer3D({
   const [plotlyReady, setPlotlyReady] = useState(false);
   const [viewModeInternal, setViewModeInternal] = useState<ViewMode>("lines");
   const [showNodes, setShowNodes] = useState(false);
+  const [showLoads, setShowLoads] = useState(false);
   const { theme } = useTheme();
   const isDark = theme === "dark";
 
@@ -391,6 +437,7 @@ export function LinearModelViewer3D({
       ...dataTraces,
       buildSupports(geometry),
       ...(showNodes ? [buildNodes(geometry)] : []),
+      ...(showLoads ? buildLoadArrows(geometry, totalHeight) : []),
     ];
 
     const config = {
@@ -414,7 +461,7 @@ export function LinearModelViewer3D({
       Plotly.react(el, traces, layout, config);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [plotlyReady, geometry, viewMode, showNodes, isDark, colorMode, storyFilter, typeFilter, isolationMode, selectedIds, sectionFilter, materialFilter, modelSections]);
+  }, [plotlyReady, geometry, viewMode, showNodes, showLoads, isDark, colorMode, storyFilter, typeFilter, isolationMode, selectedIds, sectionFilter, materialFilter, modelSections]);
 
   // ── Registrar eventos de clic (una sola vez tras plotlyReady) ──────────────
   const onClickRef = useRef(onClickElement);
@@ -528,6 +575,10 @@ export function LinearModelViewer3D({
             <button onClick={() => setShowNodes(v=>!v)}
               className={`${btnBase} border rounded-lg ${showNodes?btnOn:btnOff}`}>
               Nodos
+            </button>
+            <button onClick={() => setShowLoads(v=>!v)}
+              className={`${btnBase} border rounded-lg ${showLoads?btnOn:btnOff}`}>
+              Cargas
             </button>
           </div>
         </div>

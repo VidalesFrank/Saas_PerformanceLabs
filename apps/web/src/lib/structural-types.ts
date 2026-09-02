@@ -140,10 +140,19 @@ export interface StoryInfo {
   height_m: number;
 }
 
+export interface StoryMass {
+  story: string;
+  mass_x_t: number;
+  x_cm_m: number;
+  y_cm_m: number;
+  z_m: number;
+}
+
 export interface ModelGeometry {
   joints: Record<string, JointGeometry>;
   frames: Record<string, FrameGeometry>;
   stories: Record<string, StoryInfo>;
+  masses: Record<string, StoryMass>;
   load_patterns: string[];
   n_joints: number;
   n_frames: number;
