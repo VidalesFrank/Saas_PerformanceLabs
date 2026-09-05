@@ -1,0 +1,17 @@
+- [Módulo 1 Constructor de Modelos](project_module1_constructor.md) — F0–F11 + Editor v2 (2026-08-31): diseño detallado, editor interactivo con menú contextual, filtros sección/material, panel de tablas sync 3D
+- [Estado plataforma 2026-09-03](project_state_2026_09_03.md) — vistas 2D viewer, cargas losas (mapa calor azul→rojo), _build_shell_loads backend, Docker rebuild completo
+- [Estado plataforma 2026-09-02](project_state_2026_09_02.md) — sidebar ETABS en projects/[id], fixes extruido LinearModelViewer3D, curvas constitutivas materiales, preview secciones, todo sin commitear
+- [Estado plataforma 2026-08-31](project_state_2026_08_31.md) — TODO sin commitear (F7-F11+Módulo4+Editorv2), comandos Docker rebuild, próximos pasos (cargas #14, sync tabla↔3D, commit)
+- [Estado plataforma 2026-07-29](project_platform_state_2026_07_28.md) — snapshot completo: módulos activos, Docker (bug healthcheck pg_isready corregido), pendientes sprint 10-12
+- [Módulo Editor de Secciones /sections](project_section_editor_module.md) — sprints 1-10 completos: editor canvas, análisis P-M/M-φ/PMM/NSR-10, tema claro/oscuro, thumbnails, verificación NSR-10
+- [Módulo Espectros NSR-10](project_seismic_module.md) — estado del módulo /seismic: engine Python, API, mapa Leaflet, gráficas SVG, CSV+PDF export
+- [Módulo Interacción Biaxial P-M-M](project_pmm_module.md) — superficie P-M-M completa, ruta /analysis/pmm, engine con rotación de fibras y optimización de simetría
+- [Módulo 4 Evaluación de Desempeño CSM](project_module4_performance.md) — CSM ATC-40/NSR-10 completo (2026-08-29): engine corregido, router síncrono, PerformanceChart Plotly ADRS, integrado en Step 5 building page
+- [Módulo 5 — Muros RC 3D](project_module5_wall_analysis.md) — Phase 1 backend completo (2026-09-02): WallProject DB, presets ConcreteCM, router CRUD + script export, Celery skeleton, catálogo
+- [numpy version constraint](feedback_numpy_version.md) — numpy==1.26.4 en Docker; no usar APIs numpy 2.x (np.trapezoid, etc.)
+- [Responder en español](feedback_language.md) — todas las respuestas deben ser en español
+- [Módulo 1 — Unidades ETABS y flujo](project_module1_units_etabs.md) — E17: cm²/cm⁴ en secciones (÷1e4/1e8 en _load_raw_data); E23: m²/m⁴ vía adaptador; _joint_tag usa int(float())
+- [Módulo Muros — E-SFI-MVLEM-3D](project_wall_analytical_module.md) — arquitectura completa (2026-09-01): engine Python walls/, router wall_analytical.py, 5 componentes UI
+- [Módulo 1 — Demandas Muros FHE MVLEM_3D](project_module1_wall_demands.md) — pipeline E2K→MVLEM_3D→FHE NSR-10→P/V/M completo (2026-09-02): 270 pieres VitaTorre verificados, 4 bugs resueltos
+- [Módulo Ground Motion Analysis](project_ground_motion_module.md) — Fase 1 completa (2026-09-04): 33 tests OK, 13 rutas API, 10 componentes frontend, 3 bugs corregidos en engine
+- [Calibración Modal OpenSees vs ETABS](project_module1_modal_calibration.md) — T1: 0.065s→0.187s (ETABS 0.246s); fix masa muros 69t/piso; factor restante 1.32× = secciones fisuradas NSR-10

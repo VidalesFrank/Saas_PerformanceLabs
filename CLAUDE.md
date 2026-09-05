@@ -35,6 +35,16 @@ cd apps/web && npm install
 Copy `.env.example` -> `.env.local` (apps/web) and `.env.example` -> `.env` (apps/api) if you
 need non-default config; both have sane local defaults (SQLite, localhost).
 
+**Claude Code memory** — after cloning on a new machine, restore conversation context:
+```powershell
+# Windows — adjust <USER> and the project path hash as needed
+$dest = "$env:USERPROFILE\.claude\projects\C--00-Desarrollo-Saas-PerformanceLabs\memory"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Copy-Item .claude\memory\*.md $dest\
+```
+The project path hash (`C--00-Desarrollo-Saas-PerformanceLabs`) is derived from the absolute
+clone path. If you clone to a different drive/folder, update the hash accordingly.
+
 **Known pin**: `apps/api/requirements.txt` pins `bcrypt==4.0.1` — `passlib==1.7.4` is
 incompatible with `bcrypt>=4.1` (its self-test crashes with `ValueError: password cannot be
 longer than 72 bytes`). Don't upgrade bcrypt without also replacing passlib's bcrypt backend.
