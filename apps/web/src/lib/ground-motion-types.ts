@@ -32,6 +32,10 @@ export interface DetectedStructure {
   warnings: string[]
   preview_rows: (number | null)[][]
   columns: ColumnInfo[]
+  // true si el archivo parece ser UNA sola serie de tiempo repartida en
+  // varias columnas por línea (formato típico PEER/NGA/FEMA P-695), en vez
+  // de n_cols canales independientes. Ver ImportWizard "serie continua".
+  wrapped_series_hint: boolean
 }
 
 // ── Mapeo de columnas (wizard step 2) ─────────────────────────────────────
@@ -238,4 +242,7 @@ export interface CreateRecordRequest {
   column_mappings: ColumnMappingIn[]
   dt: number | null
   metadata: Record<string, string>
+  // true si el archivo es una sola serie continua repartida en varias
+  // columnas por línea (formato PEER/NGA) — ver DetectedStructure.wrapped_series_hint.
+  flatten?: boolean
 }

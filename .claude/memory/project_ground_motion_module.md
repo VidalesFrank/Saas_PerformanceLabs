@@ -1,66 +1,79 @@
 ---
-name: Módulo Ground Motion Analysis
-description: Estado completo del módulo de análisis de acelerogramas (2026-09-04): engine Python, API, frontend, tests
-type: project
-originSessionId: 3670d197-cb59-49d6-9c57-674c30efaea6
+name: project-ground-motion-module
+description: Estado del módulo de análisis de acelerogramas — bug real de formato PEER/NGA corregido (2026-09-05)
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 01f0eb4f-257e-400c-9f99-6f0b131f931e
+  modified: 2026-09-05T17:13:41.447Z
 ---
-Estado al 2026-09-04: **Fase 1 + Fase 2 (espectros inelásticos) completas**.
 
-## Archivos backend (engine)
+Estado al 2026-09-05: el usuario reportó que cargar un .txt real "no dio". Causa raíz
+encontrada y corregida — ver detalle abajo. Estado previo (Fase 1+2, cerrado 2026-09-04):
+engine Python + 13 rutas API + 10 componentes frontend (todo en español), 33 tests OK en
+ese momento (ahora 44). Componentes clave: `apps/api/app/engine/ground_motion/` (units,
+record, io/{detector,parser}, processing/{integration,baseline,filtering},
+analysis/{intensity,frequency,spectra,inelastic_spectra}); `apps/web/src/app/ground-motion/`
++ `src/components/ground-motion/*` (ImportWizard, TimeHistoryPanel, IntensityPanel,
+FrequencyPanel, SpectrumPanel, ProcessingPanel, InelasticSpectrumPanel).
 
-- `apps/api/app/engine/ground_motion/units.py` — conversiones SI, G_STD=9.80665
-- `apps/api/app/engine/ground_motion/record.py` — GroundMotionRecord, SignalChannel, ProcessingStep
-- `apps/api/app/engine/ground_motion/io/detector.py` — detect_structure(), sin asumir Δt silenciosamente
-- `apps/api/app/engine/ground_motion/io/parser.py` — build_record(), ColumnMapping
-- `apps/api/app/engine/ground_motion/processing/integration.py` — integrate_trapz_vec (formula: dt*(cumsum - 0.5*(signal[0]+signal)))
-- `apps/api/app/engine/ground_motion/processing/baseline.py` — remove_mean/linear/polynomial
-- `apps/api/app/engine/ground_motion/processing/filtering.py` — butterworth_filter con sosfiltfilt (scipy requerido)
-- `apps/api/app/engine/ground_motion/analysis/intensity.py` — PGA, Arias, CAV, D5-95, RMS; usa _trapz() propio (compatible numpy 1.x/2.x)
-- `apps/api/app/engine/ground_motion/analysis/frequency.py` — FFT + PSD Welch
-- `apps/api/app/engine/ground_motion/analysis/spectra.py` — Newmark-β (β=0.25, γ=0.5), k_eff=m+γ·dt·c+β·dt²·k (forma directa)
-- `apps/api/app/engine/ground_motion/analysis/inelastic_spectra.py` — EPP SDOF bisección, espectros ductilidad constante
+## Bug real encontrado (2026-09-05): formato PEER/NGA no soportado
 
-## Bugs corregidos
+Los acelerogramas reales (PEER NGA-West2, FEMA P-695 — los 44 registros que el propio
+proyecto usa para el Módulo 3, ver `apps/api/.env.example`) vienen en formato Fortran de
+ancho fijo: **una sola serie de tiempo repartida en N valores por línea** (5, 6, 8...),
+NO N canales paralelos. Dos problemas distintos, ambos corregidos:
 
-1. **integrate_trapz_vec**: fórmula incorrecta → corregida a `dt*(cumsum - 0.5*(signal[0]+signal))`
-2. **np.trapz removido en numpy 2.x**: reemplazado con `_trapz()` propio en intensity.py
-3. **k_eff Newmark**: forma incremental → corregida a forma directa predictor-corrector
-4. **scipy no instalado**: agregado a requirements.txt como `scipy>=1.11`
-5. **AppHeader default export**: corregido a named import `{ AppHeader }`
-6. **ground-motion-api.ts URL relativa**: `BASE = '/api/v1/ground-motion'` → `BASE = \`${API_URL}/api/v1/ground-motion\`` (BUG CRÍTICO — causaba que todos los fetch fueran al Next.js server en lugar del backend FastAPI)
+1. **Números "pegados" sin espacio**: el signo negativo ocupa el espacio que separaría
+   un valor positivo del anterior (ej. `...E-02-3.616...E-02`). `detector.py`/`parser.py`
+   solo hacían `line.split()` por espacios → fusionaban dos números en un token inválido
+   → filas/columnas totalmente descuadradas. Fix: tokenizador regex
+   `_NUM_TOKEN_RE`/`_tokenize_numeric_line()` que extrae números individuales aunque
+   estén pegados, aplicado tanto en la clasificación header-vs-datos
+   (`_robust_numeric_token_count()`) como en el parseo final. Cuidado: la clasificación
+   robusta SOLO se activa si la línea es puramente numérica en caracteres
+   (`_NUMERIC_LINE_RE`) — si no, un header como "NPTS=500, DT=0.01" hace que la regex
+   capture "500"/"0.01" como si fueran datos y rompe la extracción de metadata (regresión
+   real que apareció y se corrigió en el mismo fix).
 
-## API
+2. **Modelo conceptual faltante**: el wizard trataba cada columna detectada como un canal
+   físico independiente (mapeo por columna). Para un archivo envuelto, eso da N series
+   basura sub-muestreadas (cada una = cada N-ésima muestra real) en vez de LA serie
+   continua. Fix: nuevo modo `flatten` end-to-end:
+   - `detector.py`: `DetectedStructure.wrapped_series_hint` (heurística: ninguna columna
+     monótona + todas oscilatorias + n_rows*n_cols ≈ NPTS del header) + warning sugiriendo
+     activar el modo.
+   - `parser.py`: `build_record(..., flatten=True)` → `_build_record_flattened()`
+     concatena todas las columnas activas (misma quantity/unit, sin columna de tiempo)
+     en orden fila-mayor → reconstruye la serie real. Verificado exacto (diff ~1e-8)
+     contra la señal de referencia.
+   - `routers/ground_motion.py`: `CreateRecordRequest.flatten`, expuesto en `/detect`.
+   - `ImportWizard.tsx`: checkbox "serie continua envuelta" auto-marcado cuando
+     `wrapped_series_hint` es true; `effectiveNSamples()` corrige el conteo de muestras
+     mostrado (n_rows×n_cols, no n_rows) cuando flatten está activo.
+   - Tests: `TestPeerWrappedFormat` en `test_ground_motion_engine.py` (5 tests, fixture
+     `peer_wrapped_content()`/`peer_acc_truth()` con números pegados reales).
 
-- `apps/api/app/routers/ground_motion.py` — 13 rutas en /api/v1/ground-motion + endpoint inelastic-spectrum
-- `apps/api/alembic/versions/a1b2c3d4e5f6_add_ground_motion_tables.py` — tablas gm_records, gm_jobs
-- `apps/api/alembic/versions/b0c1d2e3f4a5_merge_wall_demands_and_ground_motion.py` — merge de dos branches alembic
+Verificado end-to-end: servidor real levantado, registro creado vía API con
+`flatten=true`, pipeline completo (timeseries, intensity, fft, spectrum, baseline,
+inelastic-spectrum) corrido sobre el registro reconstruido — todo correcto.
 
-## Frontend (todo en español)
+**Why:** el usuario (ingeniero estructural/sísmico) siempre va a cargar archivos reales
+en formato PEER/NGA — es el estándar de facto del campo. Sin el modo `flatten`, el
+importador silenciosamente corrompía cualquier archivo real de más de 1 valor por línea.
+**How to apply:** al tocar detector.py/parser.py, correr
+`apps/api/tests/test_ground_motion_engine.py` (44 tests) — cualquier cambio a la
+tokenización debe mantener `TestPeerWrappedFormat` en verde. Si se agrega un nuevo campo
+a `ColumnMapping`/`CreateRecordRequest`, revisar también `_build_record_flattened()`.
 
-- `apps/web/src/lib/ground-motion-types.ts` — tipos TypeScript
-- `apps/web/src/lib/ground-motion-api.ts` — funciones API (CORREGIDO: usa API_URL)
-- `apps/web/src/app/ground-motion/page.tsx` — lista de registros + wizard (español)
-- `apps/web/src/app/ground-motion/[id]/page.tsx` — detalle con 7 tabs (español)
-- `apps/web/src/components/ground-motion/ImportWizard.tsx` — 4 pasos (español)
-- `apps/web/src/components/ground-motion/TimeHistoryPanel.tsx` — a, v, d (español)
-- `apps/web/src/components/ground-motion/IntensityPanel.tsx` — PGA, Arias, CAV, D5-95 (español)
-- `apps/web/src/components/ground-motion/FrequencyPanel.tsx` — FFT + PSD Welch (español)
-- `apps/web/src/components/ground-motion/SpectrumPanel.tsx` — espectro multi-xi (español)
-- `apps/web/src/components/ground-motion/ProcessingPanel.tsx` — baseline + filtrado (español)
-- `apps/web/src/components/ground-motion/InelasticSpectrumPanel.tsx` — espectros EPP (español)
+## Nota de entorno (no relacionada, encontrada en el camino)
 
-## Tests
-
-33/33 pasan: `apps/api/tests/test_ground_motion_engine.py`
-
-## Estado de pendientes
-
-- Migración alembic: aplicada ✅
-- Tests: 33/33 ✅
-- TypeScript: 0 errores ✅
-- UI en español: ✅ (completado 2026-09-04)
-- Bug importación TXT: ✅ corregido (URL relativa → absoluta en ground-motion-api.ts)
-- Docker rebuild: pendiente (necesario para producción)
-
-**Why:** Módulo independiente de análisis sísmico profesional integrado al SaaS.
-**How to apply:** Al modificar el motor, correr tests primero. Newmark usa forma directa (no incremental). La API siempre usa API_URL env var (NEXT_PUBLIC_API_URL o http://localhost:8000).
+En Windows nativo (fuera de Docker), `openseespywin` (dependencia de `openseespy`) trae
+un wheel mal etiquetado `py3-none-any` pero el `.pyd` interno solo funciona con
+**Python 3.12** (requiere `python312.dll`) — con un venv en Python 3.11 (la versión que
+sí usa el Dockerfile, `python:3.11-slim`, vía `openseespylinux` que sí está bien
+empaquetado) la API completa falla al arrancar (`RuntimeError: Failed to import
+openseespy on Windows`), porque `app/main.py` importa `sections.py` a nivel de módulo y
+esta importa OpenSees. Si `.venv` se recrea en una máquina nueva y algo "no arranca nada"
+(no solo ground-motion), verificar primero con `python --version` que el venv se creó con
+3.12, no 3.11. Detalle completo en [[env-openseespy-windows-python312]].

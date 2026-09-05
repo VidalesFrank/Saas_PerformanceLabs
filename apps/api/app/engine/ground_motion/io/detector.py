@@ -49,6 +49,7 @@ class DetectedStructure:
     n_skipped_rows: int           # líneas de texto antes de los datos
     warnings: list[str]
     preview_rows: list[list[Any]] # primeras 15 filas
+    wrapped_series_hint: bool = False  # ver _looks_like_wrapped_series()
 
 
 # ── Heurísticas de detección ──────────────────────────────────────────────────
@@ -67,9 +68,43 @@ _NUMBER_RE = re.compile(
     r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$"
 )
 
+# Formato Fortran de ancho fijo (PEER/NGA, FEMA P-695, la mayoría de acelerogramas
+# reales): cada campo mide siempre N caracteres, y el signo negativo ocupa el
+# espacio que normalmente separaría un valor positivo del anterior. Resultado:
+# "...E-02-3.616...E-02" — dos números sin ningún espacio entre ellos. split()
+# los fusiona en un solo token inválido. Esta regex extrae números individuales
+# de la línea completa sin depender de que haya espacio entre ellos.
+_NUM_TOKEN_RE = re.compile(
+    r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?"
+)
+
+# Una línea compuesta ÚNICAMENTE por estos caracteres es casi con certeza una
+# fila de datos (con o sin números pegados) y no texto de encabezado — evita
+# que _tokenize_numeric_line() capture números embebidos en texto como
+# "NPTS=500" (que sí contiene letras ajenas a la notación científica).
+_NUMERIC_LINE_RE = re.compile(r"^[\d.\+\-eE,;\t\s]+$")
+
 
 def _is_number(s: str) -> bool:
     return bool(_NUMBER_RE.match(s.strip()))
+
+
+def _tokenize_numeric_line(line: str) -> list[str]:
+    """Extrae todos los números de una línea, incluso si están pegados sin
+    espacio (ver _NUM_TOKEN_RE)."""
+    return _NUM_TOKEN_RE.findall(line)
+
+
+def _robust_numeric_token_count(stripped: str, parts: list[str]) -> int:
+    """Cuenta tokens numéricos en una línea, tolerando números pegados sin
+    espacio (ancho fijo). Solo aplica el tokenizador regex cuando la línea es
+    puramente numérica en su composición de caracteres — si tiene letras de
+    texto (ej. "NPTS=500 DT=..."), esas letras podrían hacer que la regex
+    capture números embebidos que no representan datos reales."""
+    naive = sum(1 for p in parts if _is_number(p))
+    if _NUMERIC_LINE_RE.match(stripped):
+        return max(naive, len(_tokenize_numeric_line(stripped)))
+    return naive
 
 
 def _try_parse_float(s: str) -> float | None:
@@ -99,7 +134,7 @@ def _detect_delimiter(lines: list[str]) -> str:
 def _parse_line(line: str, sep: str) -> list[float | None]:
     """Parsea una línea de texto usando el separador indicado."""
     if sep == " ":
-        parts = line.split()
+        parts = _tokenize_numeric_line(line)
     else:
         parts = line.split(sep)
     return [_try_parse_float(p) for p in parts]
@@ -187,6 +222,38 @@ def _analyze_column(values: list[float], header: str, idx: int) -> ColumnInfo:
     )
 
 
+def _looks_like_wrapped_series(
+    n_cols: int, n_rows: int, columns: list[ColumnInfo], header_metadata: dict,
+) -> bool:
+    """Heurística: ¿es este archivo una ÚNICA serie de tiempo repartida en
+    varias columnas por línea (formato típico PEER/NGA, FEMA P-695, la
+    inmensa mayoría de acelerogramas reales), en vez de N canales paralelos
+    independientes (ej. tiempo+aceleración, o X/Y/Z simultáneos)?
+
+    Señales: ninguna columna es monótona (no hay columna de tiempo), todas
+    las columnas oscilan con estadística similar (mismo origen físico), y si
+    hay NPTS en el encabezado, n_rows * n_cols coincide con NPTS (la última
+    línea puede tener menos valores).
+    """
+    if n_cols < 2 or n_rows == 0:
+        return False
+    if any(c.is_monotonic_increasing for c in columns):
+        return False  # hay columna de tiempo → son canales paralelos, no envueltos
+    if not all(c.is_oscillatory for c in columns):
+        return False
+
+    npts = header_metadata.get("npts")
+    if npts:
+        total = n_rows * n_cols
+        # la última línea puede estar incompleta (total >= npts > total - n_cols)
+        return total - n_cols < npts <= total
+
+    # Sin NPTS: usar similitud estadística entre columnas como señal secundaria
+    means = [c.mean_val for c in columns]
+    stds = [max(c.max_val - c.min_val, 1e-12) for c in columns]
+    return (max(means) - min(means)) < 0.5 * max(stds)
+
+
 # ── Función principal ─────────────────────────────────────────────────────────
 
 def detect_structure(filename: str, content: bytes) -> DetectedStructure:
@@ -227,8 +294,8 @@ def detect_structure(filename: str, content: bytes) -> DetectedStructure:
         if not stripped:
             continue
         parts = stripped.split()
-        # Si al menos el 50% de los tokens son numéricos → línea de datos
-        num_count = sum(1 for p in parts if _is_number(p))
+        # Si al menos el 50% de los tokens son numéricos → línea de datos.
+        num_count = _robust_numeric_token_count(stripped, parts)
         ratio = num_count / max(len(parts), 1)
         if ratio >= 0.5:
             numeric_lines.append(stripped)
@@ -314,14 +381,33 @@ def detect_structure(filename: str, content: bytes) -> DetectedStructure:
         total_nan = sum(c.n_nan for c in columns)
         warnings.append(f"Se detectaron {total_nan} valores NaN o no numéricos.")
 
-    # Verificar consistencia con NPTS del encabezado
+    # ¿Es una sola serie envuelta en n_cols columnas por línea (PEER/NGA)?
+    wrapped_hint = _looks_like_wrapped_series(n_cols, n_rows, columns, header_metadata)
+
+    # Verificar consistencia con NPTS del encabezado. En modo envuelto NPTS
+    # cuenta MUESTRAS totales (n_rows * n_cols), no filas de la tabla.
     if "npts" in header_metadata:
         expected = header_metadata["npts"]
-        if abs(n_rows - expected) > 2:
+        if wrapped_hint:
+            total = n_rows * n_cols
+            if abs(total - expected) > n_cols:
+                warnings.append(
+                    f"El encabezado indica NPTS={expected} pero se encontraron "
+                    f"{total} muestras ({n_rows} filas × {n_cols} columnas)."
+                )
+        elif abs(n_rows - expected) > 2:
             warnings.append(
                 f"El encabezado indica NPTS={expected} pero se encontraron "
                 f"{n_rows} filas de datos."
             )
+
+    if wrapped_hint:
+        warnings.append(
+            f"Este archivo parece ser UNA sola serie de tiempo repartida en "
+            f"{n_cols} columnas por línea (formato típico PEER/NGA), no {n_cols} "
+            f"canales independientes. Activa 'serie continua envuelta' en el "
+            f"siguiente paso para reconstruirla correctamente."
+        )
 
     return DetectedStructure(
         filename=filename,
@@ -335,6 +421,7 @@ def detect_structure(filename: str, content: bytes) -> DetectedStructure:
         n_skipped_rows=len(header_lines),
         warnings=warnings,
         preview_rows=preview,
+        wrapped_series_hint=wrapped_hint,
     )
 
 

@@ -44,8 +44,34 @@ class ColumnMapping:
 
 _NUMBER_RE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
 
+# Formato Fortran de ancho fijo (PEER/NGA, FEMA P-695, la mayoría de acelerogramas
+# reales): cada campo mide siempre N caracteres y el signo negativo ocupa el
+# espacio que separaría un valor positivo del anterior, produciendo números
+# pegados sin espacio (ej. "...E-02-3.616...E-02"). split() los fusiona en un
+# solo token inválido; esta regex los extrae individualmente.
+_NUM_TOKEN_RE = re.compile(r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?")
+
+# Una línea compuesta ÚNICAMENTE por estos caracteres es casi con certeza una
+# fila de datos (con o sin números pegados) y no texto de encabezado — evita
+# que _tokenize_numeric_line() capture números embebidos en texto como
+# "NPTS=500" (que sí contiene letras ajenas a la notación científica).
+_NUMERIC_LINE_RE = re.compile(r"^[\d.\+\-eE,;\t\s]+$")
+
 def _is_number(s: str) -> bool:
     return bool(_NUMBER_RE.match(s.strip()))
+
+def _tokenize_numeric_line(line: str) -> list[str]:
+    """Extrae todos los números de una línea, incluso si están pegados sin
+    espacio (ver _NUM_TOKEN_RE)."""
+    return _NUM_TOKEN_RE.findall(line)
+
+def _robust_numeric_token_count(stripped: str, parts: list[str]) -> int:
+    """Cuenta tokens numéricos en una línea, tolerando números pegados sin
+    espacio (ancho fijo) — ver detector.py::_robust_numeric_token_count."""
+    naive = sum(1 for p in parts if _is_number(p))
+    if _NUMERIC_LINE_RE.match(stripped):
+        return max(naive, len(_tokenize_numeric_line(stripped)))
+    return naive
 
 def _try_float(s: str) -> float | None:
     try:
@@ -86,7 +112,8 @@ def _read_numeric_lines(content: bytes, filename: str) -> tuple[list[list[float]
         if not stripped:
             continue
         parts = stripped.split()
-        ratio = sum(1 for p in parts if _is_number(p)) / max(len(parts), 1)
+        num_count = _robust_numeric_token_count(stripped, parts)
+        ratio = num_count / max(len(parts), 1)
         if ratio >= 0.5:
             numeric_lines.append(stripped)
             found = True
@@ -98,7 +125,7 @@ def _read_numeric_lines(content: bytes, filename: str) -> tuple[list[list[float]
     rows: list[list[float]] = []
     for ln in numeric_lines:
         if sep == " ":
-            parts = ln.split()
+            parts = _tokenize_numeric_line(ln)
         else:
             parts = ln.split(sep)
         row = [_try_float(p) for p in parts]
@@ -138,6 +165,111 @@ def _read_excel_lines(content: bytes) -> tuple[list[list[float]], dict]:
     return rows, {}
 
 
+# ── Constructor de GroundMotionRecord (serie envuelta en columnas) ───────────
+
+def _build_record_flattened(
+    filename: str,
+    rows: list[list[float]],
+    header_meta: dict,
+    active: list[ColumnMapping],
+    dt: float | None,
+    record_name: str,
+    metadata: dict | None,
+) -> GroundMotionRecord:
+    """Reconstruye la serie continua real cuando el archivo la reparte en
+    varias columnas por línea (formato PEER/NGA — ver build_record(flatten=)).
+    """
+    if any(m.quantity == "time" for m in active):
+        raise ValueError(
+            "El modo 'serie continua envuelta' no admite columna de tiempo: "
+            "el Δt debe indicarse directamente (o venir del encabezado NPTS/DT)."
+        )
+
+    if dt is None:
+        raise ValueError(
+            "Se debe indicar Δt para reconstruir la serie continua envuelta."
+        )
+    if dt <= 0:
+        raise ValueError(f"Δt inválido: {dt}. Debe ser un número positivo.")
+
+    quantities = {m.quantity for m in active}
+    units = {m.unit for m in active}
+    if len(quantities) > 1:
+        raise ValueError(
+            "En modo 'serie continua envuelta' todas las columnas activas "
+            f"deben tener la misma magnitud (se encontraron: {sorted(quantities)})."
+        )
+    if len(units) > 1:
+        raise ValueError(
+            "En modo 'serie continua envuelta' todas las columnas activas "
+            f"deben tener la misma unidad (se encontraron: {sorted(units)})."
+        )
+
+    # Orden fila-mayor: para cada fila, los valores en orden de índice de columna
+    ordered = sorted(active, key=lambda m: m.col_index)
+    flat_vals: list[float] = []
+    for row in rows:
+        for m in ordered:
+            if m.col_index < len(row):
+                v = row[m.col_index]
+                if v is not None and np.isfinite(v):
+                    flat_vals.append(v)
+
+    raw_vals = np.array(flat_vals, dtype=float)
+
+    # Recortar al NPTS del encabezado si aplica (la última línea suele traer
+    # menos valores o quedar rellenada de más)
+    npts = header_meta.get("npts")
+    if npts and 0 < npts < len(raw_vals):
+        raw_vals = raw_vals[:npts]
+
+    if raw_vals.size == 0:
+        raise ValueError("No se encontraron valores numéricos al reconstruir la serie envuelta.")
+
+    quantity = ordered[0].quantity
+    unit = ordered[0].unit
+    if quantity == "acceleration":
+        vals_si = acc_to_ms2(raw_vals, unit)
+        si_unit = "m/s²"
+    elif quantity == "velocity":
+        vals_si = raw_vals * VEL_TO_MS.get(unit, 1.0)
+        si_unit = "m/s"
+    elif quantity == "displacement":
+        vals_si = raw_vals * DISP_TO_M.get(unit, 1.0)
+        si_unit = "m"
+    else:
+        vals_si = raw_vals.copy()
+        si_unit = unit
+
+    channel = SignalChannel(
+        name=ordered[0].name or quantity.capitalize(),
+        quantity=quantity,
+        component=ordered[0].component,
+        original_unit=unit,
+        si_unit=si_unit,
+        raw_values=raw_vals.copy(),
+        values_si=vals_si,
+        processed_values=None,
+        processing_history=[],
+    )
+
+    n_samples = int(raw_vals.size)
+    record = GroundMotionRecord(
+        name=record_name or Path(filename).stem,
+        source_file=filename,
+        source_format=Path(filename).suffix.lower().lstrip("."),
+        dt=dt,
+        n_samples=n_samples,
+        duration=float((n_samples - 1) * dt),
+        fs=1.0 / dt,
+        nyquist=0.5 / dt,
+        channels=[channel],
+        metadata=metadata or {},
+    )
+    record.time = np.arange(n_samples) * dt
+    return record
+
+
 # ── Constructor de GroundMotionRecord ─────────────────────────────────────────
 
 def build_record(
@@ -148,6 +280,7 @@ def build_record(
     record_name: str = "",
     metadata: dict | None = None,
     dt_unit: str = "s",
+    flatten: bool = False,
 ) -> GroundMotionRecord:
     """Construye un GroundMotionRecord a partir del archivo y el mapeo de columnas.
 
@@ -160,6 +293,12 @@ def build_record(
         record_name: nombre para el registro. Si vacío usa el nombre del archivo.
         metadata: dict con metadata adicional (earthquake, station, etc.).
         dt_unit: unidad del tiempo cuando hay columna de tiempo ('s', 'ms').
+        flatten: True cuando el archivo es UNA sola serie de tiempo repartida
+                 en varias columnas por línea (formato PEER/NGA — ver
+                 detector.DetectedStructure.wrapped_series_hint). En ese caso
+                 todas las columnas mapeadas (mismo quantity/unit) se
+                 concatenan en orden fila-mayor para reconstruir la serie
+                 continua real, en vez de tratarse como canales paralelos.
 
     Returns:
         GroundMotionRecord normalizado.
@@ -180,6 +319,11 @@ def build_record(
     acc_mappings = [m for m in active if m.quantity == "acceleration"]
     if not acc_mappings:
         raise ValueError("Se debe mapear al menos una columna como 'acceleration'.")
+
+    if flatten:
+        return _build_record_flattened(
+            filename, rows, header_meta, active, dt, record_name, metadata,
+        )
 
     # ── Extraer columna de tiempo si existe ───────────────────────────────────
     time_mapping = next((m for m in active if m.quantity == "time"), None)

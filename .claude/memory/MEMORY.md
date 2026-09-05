@@ -13,5 +13,6 @@
 - [Módulo 1 — Unidades ETABS y flujo](project_module1_units_etabs.md) — E17: cm²/cm⁴ en secciones (÷1e4/1e8 en _load_raw_data); E23: m²/m⁴ vía adaptador; _joint_tag usa int(float())
 - [Módulo Muros — E-SFI-MVLEM-3D](project_wall_analytical_module.md) — arquitectura completa (2026-09-01): engine Python walls/, router wall_analytical.py, 5 componentes UI
 - [Módulo 1 — Demandas Muros FHE MVLEM_3D](project_module1_wall_demands.md) — pipeline E2K→MVLEM_3D→FHE NSR-10→P/V/M completo (2026-09-02): 270 pieres VitaTorre verificados, 4 bugs resueltos
-- [Módulo Ground Motion Analysis](project_ground_motion_module.md) — Fase 1 completa (2026-09-04): 33 tests OK, 13 rutas API, 10 componentes frontend, 3 bugs corregidos en engine
+- [Módulo Ground Motion Analysis](project_ground_motion_module.md) — Fase 1 completa (2026-09-04) + fix formato PEER/NGA real (2026-09-05): números pegados sin espacio + modo "serie envuelta" (flatten), 44 tests OK
 - [Calibración Modal OpenSees vs ETABS](project_module1_modal_calibration.md) — T1: 0.065s→0.187s (ETABS 0.246s); fix masa muros 69t/piso; factor restante 1.32× = secciones fisuradas NSR-10
+- [openseespywin requiere Python 3.12 en Windows](env-openseespy-windows-python312.md) — venv con 3.11 rompe TODA la API silenciosamente, no solo OpenSees

@@ -39,6 +39,7 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
   const [file, setFile]               = useState<File | null>(null)
   const [detected, setDetected]       = useState<DetectedStructure | null>(null)
   const [mappings, setMappings]       = useState<ColumnMappingIn[]>([])
+  const [flatten, setFlatten]         = useState(false)
   const [dt, setDt]                   = useState('')
   const [useDt, setUseDt]             = useState(true)
   const [fs, setFs]                   = useState('')
@@ -75,6 +76,7 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
         name:      c.header,
       }))
       setMappings(initial)
+      setFlatten(d.wrapped_series_hint)
       setStep(2)
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Error analizando el archivo.')
@@ -91,7 +93,14 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
 
   const hasAccChannel    = mappings.some(m => m.quantity === 'acceleration')
   const hasTimeChannel   = mappings.some(m => m.quantity === 'time')
-  const needsDt          = !hasTimeChannel && hasAccChannel
+  // En modo "serie continua envuelta" no se admite columna de tiempo — el
+  // Δt siempre se da directamente (o viene del NPTS/DT del encabezado).
+  const needsDt          = flatten || (!hasTimeChannel && hasAccChannel)
+
+  const activeMappings   = mappings.filter(m => m.quantity !== 'ignore')
+  const flattenQuantitiesOk = !flatten || new Set(activeMappings.map(m => m.quantity)).size <= 1
+  const flattenUnitsOk      = !flatten || new Set(activeMappings.map(m => m.unit)).size <= 1
+  const flattenValid        = !flatten || (!hasTimeChannel && flattenQuantitiesOk && flattenUnitsOk)
 
   // ── Paso 3: Muestreo y unidades ───────────────────────────────────────────
 
@@ -112,9 +121,19 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
     return fsVal ? fsVal / 2 : null
   }
 
+  // En modo "serie continua envuelta" las muestras reales son n_rows * n_cols
+  // (o el NPTS del encabezado si está disponible), no n_rows.
+  const effectiveNSamples = () => {
+    if (!detected) return 0
+    if (!flatten) return detected.n_rows
+    const npts = detected.header_metadata.npts
+    const total = detected.n_rows * detected.n_cols
+    return typeof npts === 'number' && npts > 0 && npts <= total ? npts : total
+  }
+
   const dtValue = computedDt()
   const durPreview = dtValue && detected
-    ? ((detected.n_rows - 1) * dtValue).toFixed(3) + ' s'
+    ? ((effectiveNSamples() - 1) * dtValue).toFixed(3) + ' s'
     : '—'
 
   // ── Paso 4: Validación y creación ─────────────────────────────────────────
@@ -128,6 +147,7 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
         column_mappings: mappings.filter(m => m.quantity !== 'ignore'),
         dt:              dtFinal,
         metadata,
+        flatten,
       })
       onSuccess(record)
     } catch (err: unknown) {
@@ -264,6 +284,28 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
                   <p key={i} className="text-xs text-amber-400">⚠ {w}</p>
                 ))}
               </div>
+            )}
+
+            {/* Serie continua envuelta en columnas (formato PEER/NGA) */}
+            {detected.n_cols > 1 && (
+              <label className={`flex items-start gap-3 rounded-lg px-4 py-3 cursor-pointer border transition-colors
+                ${flatten ? 'bg-[var(--accent)]/10 border-[var(--accent)]/40' : 'border-[var(--border)] hover:border-[var(--accent)]/30'}`}>
+                <input
+                  type="checkbox"
+                  checked={flatten}
+                  onChange={(e) => setFlatten(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span className="text-sm">
+                  <span className="font-medium">Es UNA sola serie continua repartida en {detected.n_cols} columnas por línea</span>
+                  <span className="block text-xs text-[var(--muted)] mt-0.5">
+                    Formato típico de acelerogramas reales (PEER/NGA, FEMA P-695): no son {detected.n_cols} canales
+                    independientes, sino un único registro de aceleración escrito {detected.n_cols} valores por línea.
+                    {detected.wrapped_series_hint && ' Performance Labs detectó este patrón automáticamente.'}
+                    {' '}Requiere Δt (no admite columna de tiempo).
+                  </span>
+                </span>
+              </label>
             )}
 
             {/* Tabla de mapeo de columnas */}
@@ -469,7 +511,7 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
                       ['fs', (computedFs() ?? 0).toFixed(2) + ' Hz'],
                       ['Nyquist', (nyquist() ?? 0).toFixed(2) + ' Hz'],
                       ['Duración', durPreview],
-                      ['Muestras', detected ? detected.n_rows.toLocaleString() : '—'],
+                      ['Muestras', detected ? effectiveNSamples().toLocaleString() : '—'],
                     ].map(([k, v]) => (
                       <div key={k} className="bg-[var(--surface)] rounded-lg px-3 py-2">
                         <div className="text-xs text-[var(--muted)]">{k}</div>
@@ -537,7 +579,8 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
               <Kv label="Nombre"       value={recordName || detected.filename} />
               <Kv label="Archivo"      value={detected.filename} />
               <Kv label="Formato"      value={detected.file_format.toUpperCase()} />
-              <Kv label="Muestras"     value={detected.n_rows.toLocaleString()} />
+              <Kv label="Muestras"     value={effectiveNSamples().toLocaleString()} />
+              <Kv label="Modo"         value={flatten ? `Serie continua (${detected.n_cols} col/línea)` : 'Canales independientes'} />
               <Kv label="Δt"           value={needsDt
                 ? (computedDt() ? computedDt()!.toFixed(5) + ' s' : '—')
                 : (detected.header_metadata.dt ? detected.header_metadata.dt + ' s' : '(de columna tiempo)')} />
@@ -573,6 +616,10 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
                 [needsDt ? !!computedDt() : true, 'Paso de tiempo definido'],
                 [needsDt ? (computedDt() ?? 0) > 0 : true, 'Δt > 0'],
                 [detected.n_rows > 0, `Filas de datos: ${detected.n_rows.toLocaleString()}`],
+                ...(flatten ? [
+                  [!hasTimeChannel, 'Sin columna de tiempo (requerido en modo serie continua)'] as [boolean, string],
+                  [flattenQuantitiesOk && flattenUnitsOk, 'Todas las columnas comparten magnitud y unidad'] as [boolean, string],
+                ] : []),
                 [detected.warnings.length === 0, detected.warnings.length === 0 ? 'Sin advertencias' : `${detected.warnings.length} advertencia(s)`],
               ].map(([ok, label], i) => (
                 <div key={i} className={`flex items-center gap-3 px-4 py-2.5 text-sm border-t border-[var(--border)]
@@ -603,7 +650,7 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
           {step < 4 ? (
             <button
               disabled={
-                (step === 2 && !hasAccChannel) ||
+                (step === 2 && (!hasAccChannel || !flattenValid)) ||
                 (step === 3 && needsDt && !computedDt())
               }
               onClick={() => setStep((step + 1) as WizardStep)}
@@ -614,7 +661,7 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
             </button>
           ) : (
             <button
-              disabled={isLoading || !hasAccChannel || (needsDt && !computedDt())}
+              disabled={isLoading || !hasAccChannel || !flattenValid || (needsDt && !computedDt())}
               onClick={handleCreate}
               className="px-8 py-2 rounded-lg text-sm font-medium bg-[var(--accent)] text-white
                          disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90 transition-opacity"

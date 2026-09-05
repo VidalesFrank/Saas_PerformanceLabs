@@ -55,6 +55,36 @@ def synthetic_sine(freq: float = 2.0, dt: float = 0.01, duration: float = 10.0,
     return amplitude * np.sin(2 * np.pi * freq * t)
 
 
+def peer_acc_truth(n: int, dt: float) -> np.ndarray:
+    """Señal de referencia (en g) usada por peer_wrapped_content — determinista,
+    sin ruido, para poder comparar exactamente contra la reconstrucción."""
+    t = np.arange(n) * dt
+    return 0.3 * np.exp(-0.15 * t) * np.sin(2 * np.pi * 2.0 * t)
+
+
+def peer_wrapped_content(n: int = 1000, dt: float = 0.02, vals_per_line: int = 5) -> bytes:
+    """Genera contenido en el formato REAL PEER/NGA de ancho fijo (el mismo que
+    usan los registros FEMA P-695 y prácticamente todo acelerograma real):
+    NPTS/DT en el encabezado, N valores por línea en notación científica de
+    ancho fijo (14 caracteres), sin separador entre un valor y el siguiente
+    cuando este es negativo — el signo ocupa el espacio que normalmente
+    separaría los campos (ej. "...E-02-3.616...E-02"). Esta ausencia de
+    espacio es la causa real de por qué los acelerogramas reales rompían el
+    importador antes del fix de tokenización en detector.py / parser.py.
+    """
+    acc = peer_acc_truth(n, dt)
+    lines = [
+        "PEER STRONG MOTION DATABASE RECORD (SAMPLE)",
+        "SAMPLE EARTHQUAKE, SAMPLE STATION",
+        "ACCELERATION TIME HISTORY IN UNITS OF G",
+        f"NPTS=  {n}, DT= {dt} SEC",
+    ]
+    for i in range(0, n, vals_per_line):
+        chunk = acc[i:i + vals_per_line]
+        lines.append("".join(f"{v: 14.7E}" for v in chunk))
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 # ── Tests del importador ──────────────────────────────────────────────────────
 
 class TestDetector:
@@ -101,6 +131,71 @@ class TestDetector:
         # (el dt solo viene de columna de tiempo o lo da el usuario)
         assert "dt" not in result.header_metadata or result.header_metadata.get("dt") is None, \
             "No debe asumir Δt de una señal sin metadata"
+
+
+class TestPeerWrappedFormat:
+    """Formato real PEER/NGA: NPTS valores de una sola serie continua
+    repartidos en varias columnas por línea, ancho fijo, con números negativos
+    pegados al valor anterior (sin espacio). Es el formato estándar de facto
+    de acelerogramas reales — incluye los 44 registros FEMA P-695 usados en
+    el Módulo 3 (apps/api/data/records/fema_records/*.txt)."""
+
+    def test_detects_wrapped_series_hint(self):
+        content = peer_wrapped_content(n=1000, dt=0.02, vals_per_line=5)
+        result = detect_structure("peer_sample.txt", content)
+        assert result.wrapped_series_hint is True
+        assert result.n_cols == 5
+
+    def test_glued_negative_numbers_dont_break_row_count(self):
+        """Antes del fix, un valor negativo pegado al anterior (sin espacio de
+        separación) fusionaba ambos en un solo token inválido y descuadraba
+        filas/columnas — perdiendo silenciosamente la mayoría de los datos."""
+        content = peer_wrapped_content(n=1000, dt=0.02, vals_per_line=5)
+        result = detect_structure("peer_sample.txt", content)
+        assert result.n_rows * result.n_cols == 1000, (
+            f"{result.n_rows} filas x {result.n_cols} columnas debería dar 1000 muestras"
+        )
+        assert not any("inconsistente" in w for w in result.warnings)
+
+    def test_flatten_reconstructs_exact_series(self):
+        """build_record(flatten=True) debe reconstruir exactamente la serie
+        continua original, no 5 canales paralelos sub-muestreados."""
+        dt, n = 0.02, 1000
+        content = peer_wrapped_content(n=n, dt=dt, vals_per_line=5)
+        result = detect_structure("peer_sample.txt", content)
+
+        mappings = [
+            ColumnMapping(col_index=i, quantity="acceleration", unit="g")
+            for i in range(result.n_cols)
+        ]
+        record = build_record(
+            "peer_sample.txt", content, mappings, dt=None, flatten=True,
+        )
+
+        assert record.n_samples == n
+        assert abs(record.dt - dt) < 1e-12
+
+        acc_truth_ms2 = peer_acc_truth(n, dt) * G_STD
+        ch = record.get_acceleration_channel()
+        assert ch is not None
+        np.testing.assert_allclose(ch.values_si, acc_truth_ms2, atol=1e-5,
+            err_msg="La serie envuelta reconstruida debe coincidir con la señal original")
+
+    def test_flatten_requires_matching_quantities(self):
+        content = peer_wrapped_content(n=1000, dt=0.02, vals_per_line=5)
+        mappings = [ColumnMapping(col_index=0, quantity="acceleration", unit="g")] + [
+            ColumnMapping(col_index=i, quantity="velocity", unit="cm/s") for i in range(1, 5)
+        ]
+        with pytest.raises(ValueError):
+            build_record("peer_sample.txt", content, mappings, dt=0.02, flatten=True)
+
+    def test_flatten_rejects_time_column(self):
+        content = peer_wrapped_content(n=1000, dt=0.02, vals_per_line=5)
+        mappings = [ColumnMapping(col_index=0, quantity="time", unit="s")] + [
+            ColumnMapping(col_index=i, quantity="acceleration", unit="g") for i in range(1, 5)
+        ]
+        with pytest.raises(ValueError):
+            build_record("peer_sample.txt", content, mappings, dt=None, flatten=True)
 
 
 class TestParser:

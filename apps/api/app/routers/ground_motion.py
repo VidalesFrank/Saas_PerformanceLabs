@@ -103,6 +103,14 @@ class CreateRecordRequest(BaseModel):
     column_mappings: list[ColumnMappingIn]
     dt: float | None = Field(None, description="Δt en segundos (requerido si no hay columna de tiempo)")
     metadata: dict = Field(default_factory=dict)
+    flatten: bool = Field(
+        False,
+        description=(
+            "True si el archivo es UNA sola serie de tiempo repartida en varias "
+            "columnas por línea (formato PEER/NGA — ver detect().wrapped_series_hint). "
+            "Las columnas mapeadas se concatenan fila-mayor en un único canal."
+        ),
+    )
 
 
 class RecordOut(BaseModel):
@@ -174,6 +182,7 @@ async def detect_file_structure(file: UploadFile = File(...)) -> dict:
         "n_skipped_rows":  result.n_skipped_rows,
         "warnings":        result.warnings,
         "preview_rows":    result.preview_rows,
+        "wrapped_series_hint": result.wrapped_series_hint,
         "columns": [
             {
                 "index":                    c.index,
@@ -235,6 +244,7 @@ async def create_record(
             dt=req.dt,
             record_name=req.name or Path(filename).stem,
             metadata=req.metadata,
+            flatten=req.flatten,
         )
     except ValueError as exc:
         raise HTTPException(422, str(exc))
