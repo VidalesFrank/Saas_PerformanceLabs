@@ -205,6 +205,7 @@ class StructuralAnalysisType(str, enum.Enum):
     spectral        = "spectral"         # RSA modal espectral + ajuste FHE NSR-10
     design_columns  = "design_columns"   # Verificación PM de columnas (NSR-10 B.3.4)
     design_beams    = "design_beams"     # Diseño flexión + cortante de vigas (NSR-10)
+    wall_demands    = "wall_demands"     # FHE NSR-10 + combinaciones por pier (MVLEM_3D)
 
 
 class StructuralJobStatus(str, enum.Enum):
@@ -281,4 +282,175 @@ class StructuralJob(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     project: Mapped["StructuralProject"] = relationship("StructuralProject", back_populates="jobs")
+    owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Módulo 5 — Análisis de Muros RC 3D (E-SFI-MVLEM-3D / MVLEM_3D)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WallProjectStatus(str, enum.Enum):
+    empty   = "empty"    # Sin document configurado
+    ready   = "ready"    # Document guardado, listo para analizar
+    running = "running"  # Análisis en curso
+    done    = "done"     # Tiene resultados de análisis
+
+
+class WallJobType(str, enum.Enum):
+    gravity  = "gravity"   # Análisis gravitacional (elastic + nonlinear)
+    modal    = "modal"     # Análisis modal
+    pushover = "pushover"  # Pushover estático no lineal
+
+
+class WallJobStatus(str, enum.Enum):
+    pending   = "pending"
+    running   = "running"
+    success   = "success"
+    failed    = "failed"
+    cancelled = "cancelled"
+
+
+class WallProject(Base):
+    """Proyecto de análisis no lineal de muros RC — Módulo 5.
+
+    Almacena el documento de configuración del proyecto (materiales, muros,
+    discretización macrofibra) como JSON en disco. Completamente independiente
+    de los proyectos ETABS del Módulo 1.
+    """
+    __tablename__ = "wall_projects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Ruta al JSON del proyecto (wall_project.json)
+    document_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    # SHA256 del documento para detectar cambios desde el último análisis
+    document_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    status: Mapped[WallProjectStatus] = mapped_column(
+        Enum(WallProjectStatus), default=WallProjectStatus.empty, nullable=False
+    )
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
+    jobs: Mapped[list["WallJob"]] = relationship(
+        "WallJob", back_populates="project", cascade="all, delete-orphan"
+    )
+
+
+class WallJob(Base):
+    """Job de análisis asincrónico de muros RC (Celery)."""
+    __tablename__ = "wall_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    celery_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+
+    job_type: Mapped[WallJobType] = mapped_column(Enum(WallJobType), nullable=False)
+    status: Mapped[WallJobStatus] = mapped_column(
+        Enum(WallJobStatus), default=WallJobStatus.pending, nullable=False
+    )
+
+    # Dirección del pushover si aplica: "X" | "-X" | "Y" | "-Y"
+    push_direction: Mapped[str | None] = mapped_column(String(4), nullable=True)
+
+    result_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("wall_projects.id"), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    project: Mapped["WallProject"] = relationship("WallProject", back_populates="jobs")
+    owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ground Motion Analysis — Análisis de Acelerogramas
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GMJobStatus(str, enum.Enum):
+    pending   = "pending"
+    running   = "running"
+    success   = "success"
+    failed    = "failed"
+    cancelled = "cancelled"
+
+
+class GroundMotionRecord(Base):
+    """Registro de movimiento del suelo importado por el usuario.
+
+    Almacena el archivo original y la configuración de importación.
+    El JSON completo del registro (señales, metadata, historial de procesamiento)
+    se guarda en disco en raw_data_path — la BD solo guarda el resumen ligero.
+    """
+    __tablename__ = "gm_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_file: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # Ruta al JSON completo del registro (record_data.json) con todas las señales
+    raw_data_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    # Resumen rápido para listado sin leer el JSON completo
+    dt: Mapped[float | None] = mapped_column(Float, nullable=True)
+    n_samples: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    acc_unit_original: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # Metadata del evento (estación, sismo, magnitud, etc.)
+    metadata_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
+    jobs: Mapped[list["GMJob"]] = relationship(
+        "GMJob", back_populates="record", cascade="all, delete-orphan"
+    )
+
+
+class GMJob(Base):
+    """Job de cálculo asincrónico asociado a un GroundMotionRecord (Celery).
+
+    Usado para cómputos pesados como el espectro de respuesta con muchos periodos.
+    """
+    __tablename__ = "gm_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    celery_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+
+    # Tipo de análisis: 'spectrum' | 'nonlinear_spectrum' | 'scaling'
+    job_type: Mapped[str] = mapped_column(String(30), nullable=False)
+
+    status: Mapped[GMJobStatus] = mapped_column(
+        Enum(GMJobStatus), default=GMJobStatus.pending, nullable=False
+    )
+
+    result_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    record_id: Mapped[str] = mapped_column(String(36), ForeignKey("gm_records.id"), nullable=False)
+    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    record: Mapped["GroundMotionRecord"] = relationship("GroundMotionRecord", back_populates="jobs")
     owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])

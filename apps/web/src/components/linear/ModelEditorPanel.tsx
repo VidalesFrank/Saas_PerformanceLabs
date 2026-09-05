@@ -11,6 +11,7 @@ import type {
   UndoAssignSection,
   FrameSummary,
   SectionData,
+  ShellSummary,
 } from "@/lib/structural-types";
 import { structuralEditorApi } from "@/lib/structural-api";
 import { LinearModelViewer3D } from "./LinearModelViewer3D";
@@ -23,7 +24,7 @@ import ModelHealthPanel from "./ModelHealthPanel";
 
 type RightPanelTab = "properties" | "sections" | "materials" | "health";
 type UndoAction = UndoAssignSection;
-type TableTab = "frames" | "sections" | "materials";
+type TableTab = "frames" | "shells" | "sections" | "materials";
 type SortKey = "element_type" | "story" | "section" | "object_label";
 
 interface ZoomBbox {
@@ -94,6 +95,7 @@ interface CtxMenuProps {
   x: number; y: number;
   nSelected: number;
   singleFrame: FrameSummary | null;
+  singleShell: ShellSummary | null;
   singleSection: SectionData | null;
   onClose: () => void;
   onSelectByType: () => void;
@@ -106,7 +108,7 @@ interface CtxMenuProps {
 }
 
 function ContextMenuPopup({
-  x, y, nSelected, singleFrame, singleSection,
+  x, y, nSelected, singleFrame, singleShell, singleSection,
   onClose, onSelectByType, onSelectBySection,
   onSelectByMaterial, onSelectByStory, onIsolate, onZoom, onClearSel,
 }: CtxMenuProps) {
@@ -119,10 +121,12 @@ function ContextMenuPopup({
   const safeX = Math.min(x, (typeof window !== "undefined" ? window.innerWidth : 1200) - 240);
   const safeY = Math.min(y, (typeof window !== "undefined" ? window.innerHeight : 800) - 280);
 
-  const typeLabel  = singleFrame?.element_type === "column" ? "Columna" : "Viga";
-  const secLabel   = singleFrame?.section || "—";
+  const typeLabel = singleShell
+    ? (singleShell.element_type === "wall" ? "Muro" : "Losa")
+    : singleFrame?.element_type === "column" ? "Columna" : "Viga";
+  const secLabel   = (singleFrame?.section ?? singleShell?.section) || "—";
   const matLabel   = singleSection?.material || "—";
-  const storyLabel = singleFrame?.story || "—";
+  const storyLabel = (singleFrame?.story ?? singleShell?.story) || "—";
 
   return (
     <div
@@ -134,6 +138,12 @@ function ContextMenuPopup({
         {nSelected === 1 ? "1 elemento" : `${nSelected} elementos`}
       </div>
 
+      {singleShell?.pier && (
+        <div className="px-3 py-0.5 text-[10px] text-text-muted">
+          Pier: <span className="text-text font-mono">{singleShell.pier}</span>
+        </div>
+      )}
+
       <div className="h-px bg-border/50 my-1" />
 
       <div className="px-3 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-text-muted">
@@ -141,23 +151,23 @@ function ContextMenuPopup({
       </div>
       <CtxItem onClick={onSelectByType}>
         <span className="opacity-50 text-xs">≡</span> Por tipo
-        {singleFrame && <span className="ml-auto text-accent text-[10px]">{typeLabel}</span>}
+        {(singleFrame || singleShell) && <span className="ml-auto text-accent text-[10px]">{typeLabel}</span>}
       </CtxItem>
       <CtxItem onClick={onSelectBySection}>
         <span className="opacity-50 text-xs">▣</span> Por sección
-        {singleFrame && (
+        {(singleFrame || singleShell) && (
           <span className="ml-auto text-accent text-[10px] max-w-[100px] truncate">{secLabel}</span>
         )}
       </CtxItem>
       <CtxItem onClick={onSelectByMaterial}>
         <span className="opacity-50 text-xs">◈</span> Por material
-        {singleFrame && (
+        {(singleFrame || singleShell) && (
           <span className="ml-auto text-accent text-[10px] max-w-[100px] truncate">{matLabel}</span>
         )}
       </CtxItem>
       <CtxItem onClick={onSelectByStory}>
         <span className="opacity-50 text-xs">━</span> Por piso
-        {singleFrame && <span className="ml-auto text-accent text-[10px]">{storyLabel}</span>}
+        {(singleFrame || singleShell) && <span className="ml-auto text-accent text-[10px]">{storyLabel}</span>}
       </CtxItem>
 
       <div className="h-px bg-border/50 my-1" />
@@ -178,6 +188,104 @@ const RIGHT_TABS: { id: RightPanelTab; label: string }[] = [
   { id: "materials",  label: "Materiales" },
   { id: "health",     label: "Check" },
 ];
+
+// Botón de grupo (sin bordes individuales, para usar dentro de TGroup)
+function TBtn({ active, onClick, children, title }: {
+  active?: boolean; onClick: () => void; children: React.ReactNode; title?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      className={[
+        "px-2.5 py-1 text-[11px] font-medium transition-colors select-none",
+        active
+          ? "bg-accent/20 text-accent"
+          : "text-text-muted hover:text-text hover:bg-surface-2",
+      ].join(" ")}
+    >
+      {children}
+    </button>
+  );
+}
+
+// Grupo de botones con borde contenedor
+function TGroup({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex rounded-md overflow-hidden border border-border divide-x divide-border">
+      {children}
+    </div>
+  );
+}
+
+// Fila de checkbox en el panel de display
+function CheckRow({
+  label, checked, onChange, color, colorValue, onColorChange,
+}: {
+  label: string; checked: boolean; onChange: (v: boolean) => void;
+  color?: string; colorValue?: string; onColorChange?: (v: string) => void;
+}) {
+  return (
+    <label className="flex items-center justify-between py-0.5 cursor-pointer group">
+      <div className="flex items-center gap-2">
+        <div
+          className="w-2.5 h-2.5 rounded-sm flex-shrink-0"
+          style={{ background: color ?? "var(--color-text-muted)", opacity: checked ? 1 : 0.3 }}
+        />
+        <span className={["text-[11px] transition-colors", checked ? "text-text" : "text-text-muted"].join(" ")}>
+          {label}
+        </span>
+      </div>
+      <div className="flex items-center gap-1">
+        {onColorChange && colorValue && (
+          <input
+            type="color"
+            value={colorValue}
+            onChange={e => onColorChange(e.target.value)}
+            onClick={e => e.stopPropagation()}
+            className="w-4 h-4 rounded cursor-pointer border-0 p-0 bg-transparent"
+            title={`Color de ${label}`}
+          />
+        )}
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={e => onChange(e.target.checked)}
+          className="w-3.5 h-3.5 rounded accent-[var(--color-accent)] cursor-pointer"
+        />
+      </div>
+    </label>
+  );
+}
+
+// Fila de select en el panel de display
+function FilterRow({
+  label, value, options, onChange,
+}: {
+  label: string;
+  value: string | null;
+  options: string[];
+  onChange: (v: string | null) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between py-0.5">
+      <span className="text-[11px] text-text-muted">{label}</span>
+      <select
+        value={value ?? ""}
+        onChange={e => onChange(e.target.value || null)}
+        className={[
+          "text-[10px] rounded border px-1 py-0.5 max-w-[110px] focus:outline-none focus:border-accent",
+          value
+            ? "border-accent bg-accent/10 text-accent"
+            : "border-border bg-surface-2 text-text",
+        ].join(" ")}
+      >
+        <option value="">Todos</option>
+        {options.map(o => <option key={o} value={o}>{o}</option>)}
+      </select>
+    </div>
+  );
+}
 
 // ── Main component ─────────────────────────────────────────────────────────────
 
@@ -200,12 +308,21 @@ export default function ModelEditorPanel({
   const [viewMode, setViewMode]     = useState<"lines" | "extruded">("lines");
   const [colorMode, setColorMode]   = useState<ColorMode>("type");
   const [storyFilter, setStoryFilter]       = useState<string | null>(null);
+  const [pierFilter, setPierFilter]         = useState<string | null>(null);
   const [sectionFilter, setSectionFilter]   = useState<string | null>(null);
   const [materialFilter, setMaterialFilter] = useState<string | null>(null);
   const [typeFilter, setTypeFilter] = useState<ViewerTypeFilter>({
-    columns: true, beams: true, walls: false, slabs: false,
+    columns: true, beams: true, walls: true, slabs: false,
   });
   const [isolationMode, setIsolationMode] = useState(false);
+  const [showLoads, setShowLoads]           = useState(false);
+  const [showNodes, setShowNodes]           = useState(false);
+  const [cameraViewMode, setCameraViewMode] = useState<"3d" | "plan" | "elevX" | "elevY">("3d");
+  const [wallColor, setWallColor]           = useState("#10B981");
+  const [slabColor, setSlabColor]           = useState("#F59E0B");
+  const [shellLoadPattern, setShellLoadPattern] = useState<string | null>(null);
+  const [showDisplay, setShowDisplay]       = useState(false);
+  const [leftTab, setLeftTab]               = useState<"model" | "stories" | "sections">("model");
 
   // ── Right panel ────────────────────────────────────────────────────────────
   const [rightPanel, setRightPanel] = useState<RightPanelTab>("properties");
@@ -287,13 +404,15 @@ export default function ModelEditorPanel({
 
   function selectByStory(story: string) {
     if (!modelData) return;
+    const frameIds = Object.entries(modelData.frames)
+      .filter(([, f]) => f.story === story)
+      .map(([id]) => id);
+    const shellIds = Object.entries(modelData.shells ?? {})
+      .filter(([, s]) => s.story === story)
+      .map(([id]) => id);
     setState(prev => ({
       ...prev,
-      selectedIds: new Set(
-        Object.entries(modelData.frames)
-          .filter(([, f]) => f.story === story)
-          .map(([id]) => id),
-      ),
+      selectedIds: new Set([...frameIds, ...shellIds]),
     }));
     setRightPanel("properties");
   }
@@ -324,6 +443,19 @@ export default function ModelEditorPanel({
     setRightPanel("properties");
   }
 
+  function selectByShellType(type: "wall" | "slab") {
+    if (!modelData) return;
+    setState(prev => ({
+      ...prev,
+      selectedIds: new Set(
+        Object.entries(modelData.shells ?? {})
+          .filter(([, s]) => s.element_type === type)
+          .map(([id]) => id),
+      ),
+    }));
+    setRightPanel("properties");
+  }
+
   // ── Zoom to selection ──────────────────────────────────────────────────────
   function triggerZoom() {
     if (!modelData || state.selectedIds.size === 0) return;
@@ -335,6 +467,36 @@ export default function ModelEditorPanel({
       if (!frame) continue;
       for (const jid of [frame.joint_i, frame.joint_j]) {
         const j = modelData.joints[String(jid)];
+        if (!j) continue;
+        xMin = Math.min(xMin, j.x); xMax = Math.max(xMax, j.x);
+        yMin = Math.min(yMin, j.y); yMax = Math.max(yMax, j.y);
+        zMin = Math.min(zMin, j.z); zMax = Math.max(zMax, j.z);
+      }
+    }
+    if (!isFinite(xMin)) return;
+    setZoomBbox({ xMin, xMax, yMin, yMax, zMin, zMax });
+    setTimeout(() => setZoomBbox(null), 300);
+  }
+
+  function triggerStoryZoom(story: string) {
+    let xMin = Infinity, xMax = -Infinity;
+    let yMin = Infinity, yMax = -Infinity;
+    let zMin = Infinity, zMax = -Infinity;
+
+    for (const [, frame] of Object.entries(geometry.frames)) {
+      if (frame.story !== story) continue;
+      for (const jid of [frame.joint_i, frame.joint_j]) {
+        const j = geometry.joints[String(jid)];
+        if (!j) continue;
+        xMin = Math.min(xMin, j.x); xMax = Math.max(xMax, j.x);
+        yMin = Math.min(yMin, j.y); yMax = Math.max(yMax, j.y);
+        zMin = Math.min(zMin, j.z); zMax = Math.max(zMax, j.z);
+      }
+    }
+    for (const [, shell] of Object.entries(geometry.shells ?? {})) {
+      if (shell.story !== story) continue;
+      for (const jid of shell.joints) {
+        const j = geometry.joints[String(jid)];
         if (!j) continue;
         xMin = Math.min(xMin, j.x); xMax = Math.max(xMax, j.x);
         yMin = Math.min(yMin, j.y); yMax = Math.max(yMax, j.y);
@@ -416,12 +578,13 @@ export default function ModelEditorPanel({
     }
   }
 
-  function getCtxSingleInfo(): { frame: FrameSummary | null; section: SectionData | null } {
-    if (state.selectedIds.size !== 1 || !modelData) return { frame: null, section: null };
+  function getCtxSingleInfo(): { frame: FrameSummary | null; section: SectionData | null; shell: ShellSummary | null } {
+    if (state.selectedIds.size !== 1 || !modelData) return { frame: null, section: null, shell: null };
     const id = [...state.selectedIds][0];
     const frame = modelData.frames[id] ?? null;
+    const shell = frame ? null : (modelData.shells?.[id] ?? null);
     const section = frame ? (modelData.sections[frame.section] ?? null) : null;
-    return { frame, section };
+    return { frame, section, shell };
   }
 
   // ── Table data (memoized for performance) ──────────────────────────────────
@@ -450,6 +613,27 @@ export default function ModelEditorPanel({
     return entries;
   }, [modelData, tableSearch, sortKey, sortAsc]);
 
+  const tableShells = useMemo(() => {
+    if (!modelData) return [] as [string, ShellSummary][];
+    let entries = Object.entries(modelData.shells ?? {}) as [string, ShellSummary][];
+    if (tableSearch.trim()) {
+      const q = tableSearch.toLowerCase();
+      entries = entries.filter(([id, s]) =>
+        id.toLowerCase().includes(q) ||
+        s.story.toLowerCase().includes(q) ||
+        s.section.toLowerCase().includes(q) ||
+        (s.pier ?? "").toLowerCase().includes(q) ||
+        s.element_type.toLowerCase().includes(q),
+      );
+    }
+    entries.sort(([, a], [, b]) => {
+      const cmp = a.story.localeCompare(b.story, undefined, { numeric: true });
+      if (cmp !== 0) return sortAsc ? cmp : -cmp;
+      return a.element_type.localeCompare(b.element_type);
+    });
+    return entries;
+  }, [modelData, tableSearch, sortAsc]);
+
   function toggleSort(key: SortKey) {
     if (sortKey === key) setSortAsc(v => !v);
     else { setSortKey(key); setSortAsc(true); }
@@ -459,6 +643,12 @@ export default function ModelEditorPanel({
   const stories = Object.keys(geometry.stories).sort(
     (a, b) => (geometry.stories[a]?.elevation_m ?? 0) - (geometry.stories[b]?.elevation_m ?? 0),
   ).reverse();
+
+  const piers = [...new Set(
+    Object.values(geometry.shells ?? {})
+      .filter(s => s.element_type === "wall" && s.pier)
+      .map(s => s.pier as string)
+  )].sort();
 
   const nSelected = state.selectedIds.size;
   const canUndo   = undoStack.length > 0 && !undoing;
@@ -476,7 +666,7 @@ export default function ModelEditorPanel({
     : undefined;
 
   // ── Context menu data ──────────────────────────────────────────────────────
-  const { frame: ctxFrame, section: ctxSection } = getCtxSingleInfo();
+  const { frame: ctxFrame, section: ctxSection, shell: ctxShell } = getCtxSingleInfo();
   const ctxFirstFrame = state.selectedIds.size > 0
     ? (ctxFrame ?? modelData?.frames[[...state.selectedIds][0]])
     : null;
@@ -492,10 +682,13 @@ export default function ModelEditorPanel({
           y={ctxMenu.y}
           nSelected={nSelected}
           singleFrame={ctxFrame}
+          singleShell={ctxShell}
           singleSection={ctxSection}
           onClose={() => setCtxMenu(null)}
           onSelectByType={() => {
-            if (ctxFirstFrame) selectByType(ctxFirstFrame.element_type as "column" | "beam");
+            if (ctxFrame) selectByType(ctxFrame.element_type as "column" | "beam");
+            else if (ctxShell) selectByShellType(ctxShell.element_type);
+            else if (ctxFirstFrame) selectByType(ctxFirstFrame.element_type as "column" | "beam");
             setCtxMenu(null);
           }}
           onSelectBySection={() => {
@@ -509,6 +702,7 @@ export default function ModelEditorPanel({
           }}
           onSelectByStory={() => {
             if (ctxFirstFrame?.story) selectByStory(ctxFirstFrame.story);
+            else if (ctxShell?.story) selectByStory(ctxShell.story);
             setCtxMenu(null);
           }}
           onIsolate={() => { setIsolationMode(true); setCtxMenu(null); }}
@@ -517,134 +711,96 @@ export default function ModelEditorPanel({
         />
       )}
 
-      {/* ── Toolbar superior ─────────────────────────────────────────────── */}
-      <div className="flex items-center gap-1.5 px-3 py-2 border-b border-border bg-surface-2 flex-shrink-0 flex-wrap">
+      {/* ── Toolbar principal ──────────────────────────────────────────── */}
+      <div className="relative flex items-center gap-2 px-3 py-1.5 border-b border-border bg-surface-2 flex-shrink-0 flex-wrap">
 
-        {/* Vista */}
-        <div className="flex gap-1">
-          <ToolbarBtn active={viewMode === "lines"} onClick={() => setViewMode("lines")}>Líneas</ToolbarBtn>
-          <ToolbarBtn active={viewMode === "extruded"} onClick={() => setViewMode("extruded")}>Extruido</ToolbarBtn>
-        </div>
-
-        <Sep />
-
-        {/* Color mode */}
-        <div className="flex items-center gap-1">
-          <span className="text-[10px] text-text-muted">Color:</span>
-          <select
-            value={colorMode}
-            onChange={e => setColorMode(e.target.value as ColorMode)}
-            className="text-[11px] rounded-md border border-border bg-surface-2 px-1.5 py-0.5 text-text focus:outline-none focus:border-accent"
-          >
-            <option value="type">Por tipo</option>
-            <option value="section">Por sección</option>
-            <option value="story">Por piso</option>
-          </select>
-        </div>
+        {/* Modo de render */}
+        <TGroup>
+          <TBtn active={viewMode === "lines"}    onClick={() => setViewMode("lines")}>Líneas</TBtn>
+          <TBtn active={viewMode === "extruded"} onClick={() => setViewMode("extruded")}>Extruido</TBtn>
+        </TGroup>
 
         <Sep />
 
-        {/* Visibilidad por tipo */}
-        <div className="flex gap-1">
-          <ToolbarBtn active={typeFilter.columns} onClick={() => setTypeFilter(p => ({ ...p, columns: !p.columns }))}>
-            Columnas
-          </ToolbarBtn>
-          <ToolbarBtn active={typeFilter.beams} onClick={() => setTypeFilter(p => ({ ...p, beams: !p.beams }))}>
-            Vigas
-          </ToolbarBtn>
-        </div>
+        {/* Cámara */}
+        <TGroup>
+          <TBtn active={cameraViewMode === "3d"}    onClick={() => setCameraViewMode("3d")}    title="Vista 3D perspectiva">3D</TBtn>
+          <TBtn active={cameraViewMode === "plan"}  onClick={() => setCameraViewMode("plan")}  title="Vista en planta ortográfica">Planta</TBtn>
+          <TBtn active={cameraViewMode === "elevX"} onClick={() => setCameraViewMode("elevX")} title="Elevación eje X">Elev X</TBtn>
+          <TBtn active={cameraViewMode === "elevY"} onClick={() => setCameraViewMode("elevY")} title="Elevación eje Y">Elev Y</TBtn>
+        </TGroup>
 
         <Sep />
 
-        {/* Filtro por piso */}
-        <div className="flex items-center gap-1">
-          <span className="text-[10px] text-text-muted">Piso:</span>
-          <select
-            value={storyFilter ?? ""}
-            onChange={e => setStoryFilter(e.target.value || null)}
-            className="text-[11px] rounded-md border border-border bg-surface-2 px-1.5 py-0.5 text-text focus:outline-none focus:border-accent max-w-[120px]"
-          >
-            <option value="">Todos</option>
-            {stories.map(s => <option key={s} value={s}>{s}</option>)}
-          </select>
-        </div>
+        {/* Filtro de piso (acción frecuente) */}
+        <select
+          value={storyFilter ?? ""}
+          onChange={e => setStoryFilter(e.target.value || null)}
+          className={[
+            "text-[11px] rounded-md border px-1.5 py-0.5 focus:outline-none focus:border-accent max-w-[140px]",
+            storyFilter
+              ? "border-accent bg-accent/10 text-accent"
+              : "border-border bg-surface-2 text-text",
+          ].join(" ")}
+          title="Filtrar por piso"
+        >
+          <option value="">Todos los pisos</option>
+          {stories.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
 
-        {/* Filtro por sección */}
-        {modelData && Object.keys(modelData.sections).length > 0 && (
-          <div className="flex items-center gap-1">
-            <span className="text-[10px] text-text-muted">Secc.:</span>
-            <select
-              value={sectionFilter ?? ""}
-              onChange={e => {
-                setSectionFilter(e.target.value || null);
-                if (e.target.value) setMaterialFilter(null);
-              }}
-              className={[
-                "text-[11px] rounded-md border px-1.5 py-0.5 focus:outline-none focus:border-accent max-w-[130px]",
-                sectionFilter
-                  ? "border-accent bg-accent/10 text-accent"
-                  : "border-border bg-surface-2 text-text",
-              ].join(" ")}
-            >
-              <option value="">Todas</option>
-              {Object.keys(modelData.sections).map(s => (
-                <option key={s} value={s}>{s}</option>
-              ))}
-            </select>
-          </div>
-        )}
-
-        {/* Filtro por material */}
-        {modelData && Object.keys(modelData.materials).length > 0 && (
-          <div className="flex items-center gap-1">
-            <span className="text-[10px] text-text-muted">Mat.:</span>
-            <select
-              value={materialFilter ?? ""}
-              onChange={e => {
-                setMaterialFilter(e.target.value || null);
-                if (e.target.value) setSectionFilter(null);
-              }}
-              className={[
-                "text-[11px] rounded-md border px-1.5 py-0.5 focus:outline-none focus:border-accent max-w-[130px]",
-                materialFilter
-                  ? "border-accent bg-accent/10 text-accent"
-                  : "border-border bg-surface-2 text-text",
-              ].join(" ")}
-            >
-              <option value="">Todos</option>
-              {Object.keys(modelData.materials).map(m => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
-          </div>
-        )}
+        {/* Botón Display Options */}
+        <ToolbarBtn
+          active={showDisplay}
+          onClick={() => setShowDisplay(v => !v)}
+          title="Opciones de visualización"
+        >
+          ⚙ Display
+        </ToolbarBtn>
 
         <Sep />
 
-        {/* Selección múltiple */}
+        {/* Selección */}
         <ToolbarBtn
           active={state.multiSelectMode}
           onClick={() => setState(p => ({ ...p, multiSelectMode: !p.multiSelectMode }))}
-          title="Activar selección múltiple (o Ctrl+Clic)"
+          title="Selección múltiple (Ctrl+Clic)"
         >
           Multi
         </ToolbarBtn>
 
         {nSelected > 0 && (
           <>
-            <ToolbarBtn
-              active={isolationMode}
-              onClick={() => setIsolationMode(v => !v)}
-              title="Aislar selección (ocultar el resto)"
-            >
+            <ToolbarBtn active={isolationMode} onClick={() => setIsolationMode(v => !v)} title="Aislar selección">
               Aislar
             </ToolbarBtn>
-            <ToolbarBtn onClick={triggerZoom} title="Zoom a selección (⊡)">
-              ⊡
-            </ToolbarBtn>
+            <ToolbarBtn onClick={triggerZoom} title="Zoom a selección">⊡</ToolbarBtn>
+            {storyFilter && (
+              <ToolbarBtn onClick={() => selectByStory(storyFilter)} title={`Seleccionar todo en ${storyFilter}`}>
+                Sel. Piso
+              </ToolbarBtn>
+            )}
             <ToolbarBtn onClick={clearSelection} title="Limpiar selección (Esc)">
               ✕ {nSelected}
             </ToolbarBtn>
+          </>
+        )}
+
+        {nSelected === 0 && (
+          <>
+            <ToolbarBtn onClick={() => selectByType("column")} title="Seleccionar todas las columnas">
+              Sel. Col.
+            </ToolbarBtn>
+            <ToolbarBtn onClick={() => selectByType("beam")} title="Seleccionar todas las vigas">
+              Sel. Vig.
+            </ToolbarBtn>
+            <ToolbarBtn onClick={() => selectByShellType("wall")} title="Seleccionar todos los muros">
+              Sel. Muros
+            </ToolbarBtn>
+            {typeFilter.slabs && (
+              <ToolbarBtn onClick={() => selectByShellType("slab")} title="Seleccionar todas las losas">
+                Sel. Losas
+              </ToolbarBtn>
+            )}
           </>
         )}
 
@@ -656,33 +812,10 @@ export default function ModelEditorPanel({
 
         <Sep />
 
-        {/* Selección rápida por tipo */}
-        <div className="flex gap-1">
-          <ToolbarBtn onClick={() => selectByType("column")} title="Seleccionar todas las columnas">
-            Sel. Col.
-          </ToolbarBtn>
-          <ToolbarBtn onClick={() => selectByType("beam")} title="Seleccionar todas las vigas">
-            Sel. Vig.
-          </ToolbarBtn>
-          {storyFilter && (
-            <ToolbarBtn onClick={() => selectByStory(storyFilter)} title={`Seleccionar todo en ${storyFilter}`}>
-              Sel. Piso
-            </ToolbarBtn>
-          )}
-        </div>
-
-        <Sep />
-
-        {/* Tablas */}
-        <ToolbarBtn
-          active={showTables}
-          onClick={() => setShowTables(v => !v)}
-          title="Mostrar/ocultar tabla de elementos"
-        >
+        <ToolbarBtn active={showTables} onClick={() => setShowTables(v => !v)} title="Tabla de elementos">
           Tabla
         </ToolbarBtn>
 
-        {/* Análisis rápido */}
         {onLaunchAnalysis && (
           <>
             <Sep />
@@ -696,11 +829,133 @@ export default function ModelEditorPanel({
                   : "bg-accent/10 border-accent/40 text-accent hover:bg-accent/20",
                 analysisRunning ? "opacity-40 cursor-not-allowed" : "",
               ].join(" ")}
-              title="Relanzar análisis modal con las secciones actuales"
+              title="Relanzar análisis modal"
             >
               {analysisRunning ? "Calculando…" : modelModified ? "↺ Modal ⚠" : "↺ Modal"}
             </button>
           </>
+        )}
+
+        {/* ── Display Options Panel (flotante) ───────────────────────────── */}
+        {showDisplay && (
+          <div
+            className="absolute top-full left-0 mt-1 z-40 w-56 rounded-xl border border-border bg-surface shadow-2xl shadow-black/20"
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between px-3 py-2 border-b border-border">
+              <span className="text-[9px] font-bold uppercase tracking-widest text-text-muted">
+                Opciones de Visualización
+              </span>
+              <button
+                onClick={() => setShowDisplay(false)}
+                className="text-text-muted hover:text-text text-[10px] leading-none"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* ELEMENTOS */}
+            <div className="px-3 py-2 border-b border-border/60">
+              <p className="text-[9px] font-bold uppercase tracking-widest text-text-muted mb-2">Elementos</p>
+              <CheckRow
+                label="Columnas" checked={typeFilter.columns} color="#818CF8"
+                onChange={v => setTypeFilter(p => ({ ...p, columns: v }))}
+              />
+              <CheckRow
+                label="Vigas" checked={typeFilter.beams} color="#38BDF8"
+                onChange={v => setTypeFilter(p => ({ ...p, beams: v }))}
+              />
+              <CheckRow
+                label="Muros" checked={typeFilter.walls} color={wallColor}
+                colorValue={wallColor} onColorChange={setWallColor}
+                onChange={v => setTypeFilter(p => ({ ...p, walls: v }))}
+              />
+              <CheckRow
+                label="Losas" checked={typeFilter.slabs} color={slabColor}
+                colorValue={slabColor} onColorChange={setSlabColor}
+                onChange={v => setTypeFilter(p => ({ ...p, slabs: v }))}
+              />
+              <CheckRow
+                label="Nodos" checked={showNodes} color="#475569"
+                onChange={setShowNodes}
+              />
+              <CheckRow
+                label="Cargas" checked={showLoads} color="#3B82F6"
+                onChange={setShowLoads}
+              />
+            </div>
+
+            {/* COLOR */}
+            <div className="px-3 py-2 border-b border-border/60">
+              <p className="text-[9px] font-bold uppercase tracking-widest text-text-muted mb-2">Color</p>
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] text-text-muted">Esquema</span>
+                <select
+                  value={colorMode}
+                  onChange={e => setColorMode(e.target.value as ColorMode)}
+                  className="text-[10px] rounded border border-border bg-surface-2 px-1 py-0.5 text-text focus:outline-none focus:border-accent"
+                >
+                  <option value="type">Por tipo</option>
+                  <option value="section">Por sección</option>
+                  <option value="story">Por piso</option>
+                </select>
+              </div>
+            </div>
+
+            {/* CARGAS LOSAS */}
+            {geometry.load_patterns.length > 0 && (
+              <div className="px-3 py-2 border-b border-border/60">
+                <p className="text-[9px] font-bold uppercase tracking-widest text-text-muted mb-2">Cargas losas</p>
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-text-muted">Patrón</span>
+                  <select
+                    value={shellLoadPattern ?? ""}
+                    onChange={e => {
+                      const v = e.target.value;
+                      setShellLoadPattern(v || null);
+                      if (v) setTypeFilter(p => ({ ...p, slabs: true }));
+                    }}
+                    className="text-[10px] rounded border border-border bg-surface-2 px-1 py-0.5 text-text focus:outline-none focus:border-accent max-w-[120px]"
+                  >
+                    <option value="">— ninguno —</option>
+                    {geometry.load_patterns.map(lp => (
+                      <option key={lp} value={lp}>{lp}</option>
+                    ))}
+                  </select>
+                </div>
+                {shellLoadPattern && (
+                  <p className="text-[9px] text-text-muted mt-1.5 leading-tight">
+                    Vista Planta activa para ver mapa de colores
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* FILTROS */}
+            <div className="px-3 py-2">
+              <p className="text-[9px] font-bold uppercase tracking-widest text-text-muted mb-2">Filtros</p>
+              {piers.length > 0 && (
+                <FilterRow label="Pier" value={pierFilter} options={piers} onChange={setPierFilter} />
+              )}
+              {modelData && Object.keys(modelData.sections).length > 0 && (
+                <FilterRow
+                  label="Sección"
+                  value={sectionFilter}
+                  options={Object.keys(modelData.sections)}
+                  onChange={v => { setSectionFilter(v); if (v) setMaterialFilter(null); }}
+                />
+              )}
+              {modelData && Object.keys(modelData.materials).length > 0 && (
+                <FilterRow
+                  label="Material"
+                  value={materialFilter}
+                  options={Object.keys(modelData.materials)}
+                  onChange={v => { setMaterialFilter(v); if (v) setSectionFilter(null); }}
+                />
+              )}
+            </div>
+          </div>
         )}
       </div>
 
@@ -722,102 +977,159 @@ export default function ModelEditorPanel({
       {/* ── Cuerpo: árbol | viewport | inspector ─────────────────────────── */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
 
-        {/* Panel izquierdo: árbol del modelo */}
-        <div className="w-48 flex-shrink-0 border-r border-border flex flex-col overflow-hidden bg-surface">
-          <div className="px-3 py-2 border-b border-border bg-surface-2 flex-shrink-0">
-            <p className="text-[10px] font-semibold uppercase tracking-widest text-text-muted">Modelo</p>
+        {/* Panel izquierdo: árbol del modelo con tabs ───────────────────── */}
+        <div className="w-52 flex-shrink-0 border-r border-border flex flex-col overflow-hidden bg-surface">
+
+          {/* Tabs */}
+          <div className="flex border-b border-border flex-shrink-0 bg-surface-2">
+            {(["model", "stories", "sections"] as const).map(tab => (
+              <button
+                key={tab}
+                onClick={() => setLeftTab(tab)}
+                className={[
+                  "flex-1 py-2 text-[9px] font-bold uppercase tracking-wider transition-colors border-b-2",
+                  leftTab === tab
+                    ? "text-accent border-accent"
+                    : "text-text-muted border-transparent hover:text-text",
+                ].join(" ")}
+              >
+                {tab === "model" ? "Modelo" : tab === "stories" ? "Pisos" : "Secc."}
+              </button>
+            ))}
           </div>
+
           <div className="flex-1 overflow-y-auto text-[11px]">
 
-            {/* Estadísticas */}
-            {modelData && (
-              <div className="px-3 py-2 border-b border-border/50">
-                <div className="space-y-0.5 text-text-muted">
-                  {(([
-                    ["Pisos",      modelData.metadata.n_stories],
-                    ["Nodos",      modelData.metadata.n_joints],
-                    ["Frames",     modelData.metadata.n_frames],
-                    ["Shells",     modelData.metadata.n_shells],
-                    ["Secciones",  modelData.metadata.n_sections],
-                    ["Materiales", modelData.metadata.n_materials],
-                  ]) as [string, number][]).map(([label, val]) => (
-                    <div key={label} className="flex justify-between">
-                      <span>{label}</span>
-                      <span className="font-mono text-text">{val}</span>
+            {/* TAB: MODELO */}
+            {leftTab === "model" && (
+              <div className="py-1">
+                {modelData ? (
+                  <>
+                    {/* Stats estructurales */}
+                    <div className="px-3 py-2 border-b border-border/50">
+                      <p className="text-[9px] font-bold uppercase tracking-widest text-text-muted mb-2">Estadísticas</p>
+                      {([
+                        ["Pisos",      modelData.metadata.n_stories],
+                        ["Nodos",      modelData.metadata.n_joints],
+                        ["Columnas",   Object.values(modelData.frames).filter(f => f.element_type === "column").length],
+                        ["Vigas",      Object.values(modelData.frames).filter(f => f.element_type === "beam").length],
+                        ["Muros",      Object.values(modelData.shells ?? {}).filter(s => s.element_type === "wall").length],
+                        ["Losas",      Object.values(modelData.shells ?? {}).filter(s => s.element_type === "slab").length],
+                        ["Secciones",  modelData.metadata.n_sections],
+                        ["Materiales", modelData.metadata.n_materials],
+                      ] as [string, number][]).map(([label, val]) => (
+                        <div key={label} className="flex justify-between items-center py-0.5">
+                          <span className="text-text-muted">{label}</span>
+                          <span className="font-mono text-text font-semibold">{val}</span>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
+
+                    {/* Masas por piso */}
+                    {Object.keys(modelData.masses).length > 0 && (
+                      <div className="px-3 py-2">
+                        <p className="text-[9px] font-bold uppercase tracking-widest text-text-muted mb-2">Masas por piso</p>
+                        {Object.values(modelData.masses)
+                          .sort((a, b) => b.z_m - a.z_m)
+                          .map(m => (
+                            <div key={m.story} className="flex justify-between items-center py-0.5">
+                              <span className="text-text-muted truncate">{m.story}</span>
+                              <span className="font-mono text-[10px] text-text">{m.mass_x_t.toFixed(1)} t</span>
+                            </div>
+                          ))}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p className="px-3 py-4 text-text-muted text-center">Cargando…</p>
+                )}
               </div>
             )}
 
-            {/* Pisos */}
-            {stories.length > 0 && (
-              <div className="border-b border-border/50">
+            {/* TAB: PISOS */}
+            {leftTab === "stories" && (
+              <div className="py-1">
                 <button
-                  className="w-full px-3 py-1.5 text-left font-semibold text-text-muted hover:text-text flex items-center gap-1"
                   onClick={() => setStoryFilter(null)}
+                  className={[
+                    "w-full px-3 py-1.5 text-left transition-colors flex items-center gap-2",
+                    !storyFilter ? "text-accent bg-accent/10" : "text-text-muted hover:text-text hover:bg-surface-2",
+                  ].join(" ")}
                 >
-                  <span className="text-[9px]">▼</span> Pisos ({stories.length})
+                  <span className="w-1.5 h-1.5 rounded-full bg-current opacity-60 flex-shrink-0" />
+                  Todos los pisos
                 </button>
-                {stories.map(s => (
-                  <button key={s}
-                    onClick={() => setStoryFilter(prev => prev === s ? null : s)}
-                    className={[
-                      "w-full px-4 py-1 text-left transition-colors",
-                      storyFilter === s
-                        ? "text-accent bg-accent/10"
-                        : "text-text-muted hover:text-text hover:bg-surface-2",
-                    ].join(" ")}
-                  >
-                    {s}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {/* Secciones en uso */}
-            {modelData && Object.keys(modelData.sections).length > 0 && (
-              <div className="border-b border-border/50">
-                <p className="px-3 py-1.5 font-semibold text-text-muted">
-                  Secciones ({Object.keys(modelData.sections).length})
-                </p>
-                {Object.keys(modelData.sections).map(sec => {
-                  const count = Object.values(modelData.frames).filter(f => f.section === sec).length;
+                {stories.map(s => {
+                  const storyInfo = geometry.stories[s];
+                  const frameCount = Object.values(geometry.frames).filter(f => f.story === s).length;
+                  const shellCount = Object.values(geometry.shells ?? {}).filter(sh => sh.story === s).length;
                   return (
-                    <button key={sec}
-                      onClick={() => selectBySection(sec)}
+                    <button
+                      key={s}
+                      onClick={() => {
+                        const newFilter = storyFilter === s ? null : s;
+                        setStoryFilter(newFilter);
+                        if (newFilter) triggerStoryZoom(newFilter);
+                      }}
                       className={[
-                        "w-full px-4 py-1 text-left transition-colors flex items-center justify-between",
-                        sectionFilter === sec
+                        "w-full px-3 py-1.5 text-left transition-colors",
+                        storyFilter === s
                           ? "text-accent bg-accent/10"
                           : "text-text-muted hover:text-text hover:bg-surface-2",
                       ].join(" ")}
-                      title={`Seleccionar frames con sección ${sec}`}
                     >
-                      <span className="truncate">{sec}</span>
-                      <span className="text-[9px] text-accent font-mono flex-shrink-0 ml-1">{count}</span>
+                      <div className="flex items-center justify-between">
+                        <span className="truncate font-medium">{s}</span>
+                        <div className="flex items-center gap-1.5 flex-shrink-0 ml-1">
+                          <span className="text-[9px] font-mono opacity-60">{storyInfo?.elevation_m.toFixed(2)}m</span>
+                          <span className="text-[9px] text-accent font-mono">{frameCount + shellCount}</span>
+                        </div>
+                      </div>
                     </button>
                   );
                 })}
               </div>
             )}
 
-            {/* Masas por piso */}
-            {modelData && Object.keys(modelData.masses).length > 0 && (
-              <div className="border-b border-border/50">
-                <p className="px-3 py-1.5 font-semibold text-text-muted">Masas por piso</p>
-                {Object.values(modelData.masses)
-                  .sort((a, b) => b.z_m - a.z_m)
-                  .map(m => (
-                    <div key={m.story} className="px-4 py-1 flex items-center justify-between">
-                      <span className="text-text-muted truncate">{m.story}</span>
-                      <span className="text-[9px] font-mono text-text flex-shrink-0 ml-1">
-                        {m.mass_x_t.toFixed(1)} t
-                      </span>
-                    </div>
-                  ))}
+            {/* TAB: SECCIONES */}
+            {leftTab === "sections" && modelData && (
+              <div className="py-1">
+                <button
+                  onClick={() => setSectionFilter(null)}
+                  className={[
+                    "w-full px-3 py-1.5 text-left transition-colors",
+                    !sectionFilter ? "text-accent bg-accent/10" : "text-text-muted hover:text-text hover:bg-surface-2",
+                  ].join(" ")}
+                >
+                  Todas las secciones
+                </button>
+                {Object.keys(modelData.sections).map(sec => {
+                  const frameCount = Object.values(modelData.frames).filter(f => f.section === sec).length;
+                  const shellCount = Object.values(modelData.shells ?? {}).filter(s => s.section === sec).length;
+                  const total = frameCount + shellCount;
+                  return (
+                    <button
+                      key={sec}
+                      onClick={() => {
+                        setSectionFilter(prev => prev === sec ? null : sec);
+                        setMaterialFilter(null);
+                      }}
+                      className={[
+                        "w-full px-3 py-1.5 text-left transition-colors flex items-center justify-between",
+                        sectionFilter === sec
+                          ? "text-accent bg-accent/10"
+                          : "text-text-muted hover:text-text hover:bg-surface-2",
+                      ].join(" ")}
+                      title={`${sec} — ${total} elemento(s)`}
+                    >
+                      <span className="truncate">{sec}</span>
+                      <span className="text-[9px] text-accent font-mono flex-shrink-0 ml-1">{total}</span>
+                    </button>
+                  );
+                })}
               </div>
             )}
+
           </div>
         </div>
 
@@ -844,15 +1156,23 @@ export default function ModelEditorPanel({
                 onClickElement={handleClickElement}
                 colorMode={colorMode}
                 storyFilter={storyFilter}
+                pierFilter={pierFilter}
                 typeFilter={typeFilter}
                 isolationMode={isolationMode}
                 hideControls={true}
                 externalViewMode={viewMode}
                 onViewModeChange={setViewMode}
+                externalShowLoads={showLoads}
+                externalShowNodes={showNodes}
                 modelSections={modelSectionsForViewer}
                 sectionFilter={sectionFilter}
                 materialFilter={materialFilter}
                 zoomBbox={zoomBbox}
+                cameraViewMode={cameraViewMode}
+                wallColor={wallColor}
+                slabColor={slabColor}
+                shellLoads={geometry.shell_loads}
+                shellLoadPattern={shellLoadPattern}
               />
             </div>
           )}
@@ -929,12 +1249,14 @@ export default function ModelEditorPanel({
 
           {/* Header de tabs */}
           <div className="flex items-center border-b border-border bg-surface-2 flex-shrink-0">
-            {(["frames", "sections", "materials"] as TableTab[]).map(t => {
+            {(["frames", "shells", "sections", "materials"] as TableTab[]).map(t => {
               const label = t === "frames"
                 ? `Frames (${Object.keys(modelData.frames).length})`
-                : t === "sections"
-                  ? `Secciones (${Object.keys(modelData.sections).length})`
-                  : `Materiales (${Object.keys(modelData.materials).length})`;
+                : t === "shells"
+                  ? `Shells (${Object.keys(modelData.shells ?? {}).length})`
+                  : t === "sections"
+                    ? `Secciones (${Object.keys(modelData.sections).length})`
+                    : `Materiales (${Object.keys(modelData.materials).length})`;
               return (
                 <button key={t}
                   onClick={() => { setTableTab(t); setTableSearch(""); }}
@@ -1051,6 +1373,72 @@ export default function ModelEditorPanel({
                     <tr>
                       <td colSpan={5} className="px-3 py-4 text-center text-xs text-text-muted">
                         Sin resultados para ese filtro.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            )}
+
+            {/* ── Shells table ────────────────────────────────────────────── */}
+            {tableTab === "shells" && (
+              <table className="w-full text-[11px] border-collapse">
+                <thead className="sticky top-0 bg-surface-2 border-b border-border z-10">
+                  <tr>
+                    <th className="text-left px-3 py-1.5 font-semibold text-text-muted">Label</th>
+                    <th className="text-left px-2 py-1.5 font-semibold text-text-muted">Tipo</th>
+                    <th className="text-left px-2 py-1.5 font-semibold text-text-muted">Pier</th>
+                    <th className="text-left px-2 py-1.5 font-semibold text-text-muted">Piso</th>
+                    <th className="text-left px-2 py-1.5 font-semibold text-text-muted">Sección</th>
+                    <th className="text-left px-2 py-1.5 font-semibold text-text-muted">e (cm)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tableShells.slice(0, 500).map(([id, shell]) => {
+                    const isSelected = state.selectedIds.has(id);
+                    return (
+                      <tr
+                        key={id}
+                        onClick={() => {
+                          setState(prev => ({ ...prev, selectedIds: new Set([id]) }));
+                          setRightPanel("properties");
+                        }}
+                        className={[
+                          "border-b border-border/30 cursor-pointer transition-colors",
+                          isSelected ? "bg-accent/10 hover:bg-accent/15" : "hover:bg-surface-2",
+                        ].join(" ")}
+                      >
+                        <td className="px-3 py-1 font-mono font-medium text-text">{id}</td>
+                        <td className="px-2 py-1">
+                          <span className={[
+                            "inline-flex items-center rounded-full px-1.5 py-px text-[10px] font-semibold",
+                            shell.element_type === "wall"
+                              ? "bg-emerald-500/15 text-emerald-400"
+                              : "bg-amber-500/15 text-amber-400",
+                          ].join(" ")}>
+                            {shell.element_type === "wall" ? "Muro" : "Losa"}
+                          </span>
+                        </td>
+                        <td className="px-2 py-1 text-text-muted font-mono text-[10px]">{shell.pier || "—"}</td>
+                        <td className="px-2 py-1 text-text-muted">{shell.story}</td>
+                        <td className="px-2 py-1 font-mono text-text">{shell.section || "—"}</td>
+                        <td className="px-2 py-1 font-mono text-text">
+                          {shell.thickness_m ? (shell.thickness_m * 100).toFixed(1) : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {tableShells.length > 500 && (
+                    <tr>
+                      <td colSpan={6} className="px-3 py-2 text-center text-[10px] text-text-muted">
+                        Mostrando 500 de {tableShells.length}. Usa el buscador para filtrar.
+                      </td>
+                    </tr>
+                  )}
+                  {tableShells.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="px-3 py-4 text-center text-xs text-text-muted">
+                        Sin resultados.
                       </td>
                     </tr>
                   )}

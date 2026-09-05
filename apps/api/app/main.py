@@ -6,13 +6,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db import engine
-from app.models import Base, BuildingJob, BuildingJobStatus, StructuralJob, StructuralJobStatus
+from app.models import Base, BuildingJob, BuildingJobStatus, StructuralJob, StructuralJobStatus, WallJob, WallJobStatus, GMJob, GMJobStatus
 from app.routers import auth, catalog, sections, seismic
+from app.routers import ground_motion as ground_motion_router
 from app.routers import building_projects, building_analysis, building_performance
 from app.routers import section_editor
 from app.routers import structural_projects, structural_analysis, structural_design, structural_editor
 from app.routers import wall_analytical
 from app.routers import structural_nonlinear
+from app.routers import wall_projects as wall_projects_router
 
 
 def _create_tables() -> None:
@@ -53,6 +55,30 @@ def _cleanup_orphaned_jobs() -> None:
             job.error_message = "Worker reiniciado o caído — job interrumpido"
             job.finished_at = datetime.now(timezone.utc)
         n_total += len(orphaned_structural)
+
+        orphaned_wall = (
+            db.query(WallJob)
+            .filter(WallJob.status.in_([WallJobStatus.running, WallJobStatus.pending]))
+            .all()
+        )
+        for job in orphaned_wall:
+            job.status = WallJobStatus.failed
+            job.error_message = "Worker reiniciado o caído — job interrumpido"
+            job.finished_at = datetime.now(timezone.utc)
+        n_total += len(orphaned_wall)
+
+        # GMJob — Ground Motion Analysis
+        from app.models import GMJob as _GMJob
+        orphaned_gm = (
+            db.query(_GMJob)
+            .filter(_GMJob.status.in_([GMJobStatus.running, GMJobStatus.pending]))
+            .all()
+        )
+        for job in orphaned_gm:
+            job.status = GMJobStatus.failed
+            job.error_message = "Worker reiniciado o caído — job interrumpido"
+            job.finished_at = datetime.now(timezone.utc)
+        n_total += len(orphaned_gm)
 
         if n_total:
             db.commit()
@@ -110,6 +136,16 @@ app.include_router(structural_editor.router)
 app.include_router(structural_nonlinear.router)
 app.include_router(wall_analytical.router)
 app.include_router(structural_projects.router)
+
+# ── Módulo 5: Análisis de Muros RC 3D ────────────────────────────────────────
+app.include_router(wall_projects_router.router)
+
+# ── Módulo 5b: Diseño de Muros RC (NSR-10 / ACI 318-25) ──────────────────────
+from app.routers import wall_design as wall_design_router
+app.include_router(wall_design_router.router)
+
+# ── Ground Motion Analysis — Análisis de Acelerogramas ───────────────────────
+app.include_router(ground_motion_router.router)
 
 
 @app.get("/api/v1/health")

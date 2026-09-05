@@ -311,14 +311,30 @@ def model_geometry(project_id: str, user: CurrentUser, db: DB):
         for k, md in masses_full.items()
     }
 
+    shells_full = model.get("shells", {})
+    shells_slim = {
+        lbl: {
+            "joints":       sd["joints"],
+            "element_type": sd.get("element_type", "slab"),
+            "story":        sd.get("story", ""),
+            "section":      sd.get("section", ""),
+            "thickness_m":  sd.get("thickness_m", 0.0),
+            "pier":         sd.get("pier", ""),
+        }
+        for lbl, sd in shells_full.items()
+    }
+
     return {
         "joints":        joints_slim,
         "frames":        frames_slim,
+        "shells":        shells_slim,
         "stories":       stories_full,
         "masses":        masses_slim,
         "load_patterns": metadata.get("load_patterns", []),
+        "shell_loads":   model.get("shell_loads", {}),
         "n_joints":      len(joints_slim),
         "n_frames":      len(frames_slim),
+        "n_shells":      len(shells_slim),
         "n_stories":     len(stories_full),
     }
 

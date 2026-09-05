@@ -131,3 +131,139 @@ export function bulkAssignFormulation(
     body: JSON.stringify(request),
   });
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Módulo 5 — WallProject API  (/api/v1/wall-projects)
+// ════════════════════════════════════════════════════════════════════════════
+
+import type {
+  WallProject5,
+  WallJob5,
+  WRCDocument,
+  ModalResult5,
+  PushoverResult5,
+  MaterialPresets,
+  PushoverDirection,
+} from "./wall-types";
+
+const WP_BASE = `${API_URL}/api/v1/wall-projects`;
+
+function authH(): Headers {
+  const h = new Headers({ "Content-Type": "application/json" });
+  const t = getToken();
+  if (t) h.set("Authorization", `Bearer ${t}`);
+  return h;
+}
+
+async function wpReq<T>(path: string, opts: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${WP_BASE}${path}`, { ...opts, headers: authH() });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+    throw new ApiError(res.status, detail);
+  }
+  if (res.status === 204) return undefined as T;
+  return res.json() as Promise<T>;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Wall Design API  (/api/v1/wall-design)
+// ════════════════════════════════════════════════════════════════════════════
+import type { WallDesignRequest, WallDesignResult } from "./wall-types";
+
+const WD_BASE = `${API_URL}/api/v1/wall-design`;
+
+async function wdReq<T>(path: string, opts: RequestInit = {}): Promise<T> {
+  const h = new Headers({ "Content-Type": "application/json" });
+  const token = getToken();
+  if (token) h.set("Authorization", `Bearer ${token}`);
+  const res = await fetch(`${WD_BASE}${path}`, { ...opts, headers: h });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+    throw new ApiError(res.status, detail);
+  }
+  return res.json() as Promise<T>;
+}
+
+export const wallDesignApi = {
+  compute: (req: WallDesignRequest) =>
+    wdReq<WallDesignResult>("/compute", {
+      method: "POST",
+      body: JSON.stringify(req),
+    }),
+
+  barDatabase: () =>
+    wdReq<{ db_mm: number; area_mm2: number }[]>("/bar-database"),
+};
+
+export const wallProjectsApi = {
+  // Projects
+  list: () =>
+    wpReq<WallProject5[]>(""),
+
+  create: (name: string, description?: string) =>
+    wpReq<WallProject5>("", {
+      method: "POST",
+      body: JSON.stringify({ name, description, initialize_document: true }),
+    }),
+
+  get: (id: string) =>
+    wpReq<WallProject5>(`/${id}`),
+
+  delete: (id: string) =>
+    wpReq<void>(`/${id}`, { method: "DELETE" }),
+
+  // Document
+  getDocument: (id: string) =>
+    wpReq<WRCDocument>(`/${id}/document`),
+
+  saveDocument: (id: string, doc: WRCDocument) =>
+    wpReq<{ ok: boolean; document_hash: string; hash_changed: boolean; status: string }>(
+      `/${id}/document`,
+      { method: "PUT", body: JSON.stringify(doc) },
+    ),
+
+  // Presets
+  getDefaultMaterials: () =>
+    wpReq<{ schema_version: string; materials: Record<string, import("./wall-types").WRCMaterial> }>("/presets/materials"),
+
+  getAllPresets: () =>
+    wpReq<MaterialPresets>("/presets/materials/all"),
+
+  getMvlemBasicSet: (fc_mpa: number, fy_mpa: number, detailing: string, id_prefix: string) =>
+    wpReq<{ materials: Record<string, import("./wall-types").WRCMaterial> }>("/presets/mvlem-basic-set", {
+      method: "POST",
+      body: JSON.stringify({ fc_mpa, fy_mpa, detailing, id_prefix }),
+    }),
+
+  // Analysis
+  launch: (id: string, job_type: "gravity" | "modal" | "pushover", direction?: PushoverDirection) =>
+    wpReq<{ job_id: string; job_type: string; status: string; celery_id: string }>(
+      `/${id}/analyze`,
+      { method: "POST", body: JSON.stringify({ job_type, direction: direction ?? "X" }) },
+    ),
+
+  jobStatus: (projectId: string, jobId: string) =>
+    wpReq<WallJob5>(`/${projectId}/jobs/${jobId}/status`),
+
+  jobResult: <T = ModalResult5 | PushoverResult5>(projectId: string, jobId: string) =>
+    wpReq<T>(`/${projectId}/jobs/${jobId}/result`),
+
+  listJobs: (projectId: string) =>
+    wpReq<WallJob5[]>(`/${projectId}/jobs`),
+
+  // Script export
+  downloadScript: async (id: string, name: string) => {
+    const token = getToken();
+    const h = new Headers();
+    if (token) h.set("Authorization", `Bearer ${token}`);
+    const res = await fetch(`${WP_BASE}/${id}/export-script`, { method: "POST", headers: h });
+    if (!res.ok) throw new ApiError(res.status, "Error exportando script");
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = `wall_analysis_${name.slice(0,20).replace(/\s/g,"_")}.py`;
+    a.click(); URL.revokeObjectURL(url);
+  },
+};

@@ -83,6 +83,9 @@ class E2KParser:
         self.pier_names: list = []
         self.area_pier_assigns: dict = {}  # (area, story) → pier_name
 
+        # sd_pier_sections: name → {concrete_material, rebar_material, polygon, rebar_lines}
+        self.sd_pier_sections: dict = {}
+
         # element labels — assigned after parsing
         self._joint_label: dict = {}           # (pt, story) → int
         self._frame_elem_label: dict = {}      # (line, story) → int
@@ -108,6 +111,7 @@ class E2KParser:
         self._parse_shell_loads()
         self._parse_mass_source()
         self._parse_pier_spandrel_names()
+        self._parse_sdsections()
         self._assign_element_labels()
 
     def write_xlsx(self, output_path: str,
@@ -127,6 +131,7 @@ class E2KParser:
         df_fr_loads   = self._build_frame_loads_df()
         df_sh_loads   = self._build_shell_loads_df()
         df_col_rebar  = self._build_column_rebar_data()
+        df_pier_reinf = self._build_pier_reinforcement_data()
 
         wb = Workbook()
         wb.remove(wb.active)
@@ -187,8 +192,8 @@ class E2KParser:
         _write_sheet(wb, 'Frame Assignments - Sections',
                      'TABLE:  "FRAME ASSIGNMENTS - SECTIONS"',
                      ['Story', 'Label', 'Unique Name', 'Analysis Section',
-                      'Design Section'],
-                     [None, None, None, None, None],
+                      'Design Section', 'Release'],
+                     [None, None, None, None, None, None],
                      df_fr_asgn)
 
         _write_sheet(wb, 'Shell Sections - Slab',
@@ -233,6 +238,17 @@ class E2KParser:
                           '# Long. Bars 2-axis', 'Corner Bar Area', 'Cover'],
                          [None, None, None, 'mm2', 'm'],
                          df_col_rebar)
+
+        if df_pier_reinf is not None and len(df_pier_reinf):
+            _write_sheet(wb, 'Pier Reinforcement Data',
+                         'TABLE:  "PIER REINFORCEMENT DATA"',
+                         ['Pier Name', 'Concrete Material', 'Rebar Material',
+                          'lw (m)', 'tw (m)', 'Rebar Line',
+                          'Bar Area (mm2)', 'Spacing (mm)', 'End Bar',
+                          'X1 (m)', 'Y1 (m)', 'X2 (m)', 'Y2 (m)', 'Est. n Bars'],
+                         [None, None, None, 'm', 'm', None,
+                          'mm2', 'mm', None, 'm', 'm', 'm', 'm', None],
+                         df_pier_reinf)
 
         if self.pier_names:
             _write_sheet(wb, 'Pier Section Properties',
@@ -445,7 +461,9 @@ class E2KParser:
                 continue
             if len(t) < 3:
                 continue
-            self.point_assigns[(t[1], t[2])] = True
+            kv = _kv_from(t, 3)
+            # Store restraint string (e.g. "UX UY UZ") or empty string if none
+            self.point_assigns[(t[1], t[2])] = kv.get('RESTRAINT', '')
 
     def _parse_line_conns(self) -> None:
         for line in self._sections.get('LINE CONNECTIVITIES', []):
@@ -470,7 +488,10 @@ class E2KParser:
                 continue
             name, story = t[1], t[2]
             kv = _kv_from(t, 3)
-            self.line_assigns[(name, story)] = {'section': kv.get('SECTION', '')}
+            self.line_assigns[(name, story)] = {
+                'section': kv.get('SECTION', ''),
+                'release': kv.get('RELEASE', ''),
+            }
 
     def _parse_area_conns(self) -> None:
         for line in self._sections.get('AREA CONNECTIVITIES', []):
@@ -559,6 +580,88 @@ class E2KParser:
             if t and t[0].upper() == 'PIERNAME' and len(t) > 1:
                 self.pier_names.append(t[1])
 
+    def _parse_sdsections(self) -> None:
+        """Parse SECTION DESIGNER SECTIONS — extract geometry and LINE REBAR for TYPE=PIER."""
+        lines = self._sections.get('SECTION DESIGNER SECTIONS', [])
+
+        sec_types: dict = {}
+        # name → {shape_idx → {type, material, corners, rebar}}
+        sec_shapes: dict = {}
+
+        for line in lines:
+            t = _tok(line)
+            if len(t) < 2 or t[0].upper() != 'SDSECTION':
+                continue
+            name = t[1]
+            kv = _kv_from(t, 2)
+
+            if 'TYPE' in kv:
+                sec_types[name] = kv['TYPE'].strip('"').upper()
+                sec_shapes.setdefault(name, {})
+                continue
+
+            if 'SHAPE' not in kv:
+                continue
+
+            shape_idx = int(kv['SHAPE'])
+            sec_shapes.setdefault(name, {})
+            if shape_idx not in sec_shapes[name]:
+                sec_shapes[name][shape_idx] = {
+                    'type': '', 'material': '', 'corners': {}, 'rebar': None,
+                }
+            shape = sec_shapes[name][shape_idx]
+
+            if 'SHAPETYPE' in kv:
+                shape['type'] = kv['SHAPETYPE'].strip('"').upper()
+                if 'MATERIAL' in kv:
+                    shape['material'] = kv['MATERIAL']
+
+            if 'POLYCORNER' in kv:
+                ci = int(kv['POLYCORNER'])
+                shape['corners'][ci] = (float(kv.get('X', 0)), float(kv.get('Y', 0)))
+
+            if 'BARAREA' in kv or ('X1' in kv and 'X2' in kv):
+                shape['type'] = 'LINE REBAR'
+                if 'MATERIAL' in kv and not shape['material']:
+                    shape['material'] = kv['MATERIAL']
+                shape['rebar'] = {
+                    'bar_area_m2': float(kv.get('BARAREA', 0)),
+                    'spacing_m':   float(kv.get('SPACING', 0)),
+                    'end_bar':     kv.get('ENDBAR', 'NO').strip('"').upper() == 'YES',
+                    'x1': float(kv.get('X1', 0)),
+                    'y1': float(kv.get('Y1', 0)),
+                    'x2': float(kv.get('X2', 0)),
+                    'y2': float(kv.get('Y2', 0)),
+                }
+
+        for name, shapes in sec_shapes.items():
+            if sec_types.get(name, '') != 'PIER':
+                continue
+
+            polygon_pts: list = []
+            rebar_lines: list = []
+            concrete_mat = ''
+            rebar_mat = ''
+
+            for idx in sorted(shapes.keys()):
+                s = shapes[idx]
+                if s['type'] == 'POLYGON':
+                    if not concrete_mat:
+                        concrete_mat = s['material']
+                    polygon_pts = [s['corners'][k] for k in sorted(s['corners'])]
+                elif s['type'] == 'LINE REBAR' and s['rebar']:
+                    if not rebar_mat:
+                        rebar_mat = s['material']
+                    rebar_lines.append(s['rebar'])
+
+            if polygon_pts:
+                self.sd_pier_sections[name] = {
+                    'concrete_material': concrete_mat,
+                    'rebar_material':    rebar_mat,
+                    'polygon':           polygon_pts,
+                    'rebar_lines':       rebar_lines,
+                }
+
     # ── element label assignment ──────────────────────────────────────────────
 
     def _assign_element_labels(self) -> None:
@@ -628,9 +731,29 @@ class E2KParser:
         for (ar, story), label in self._shell_elem_label.items():
             conn  = self.area_conns.get(ar, {})
             pts   = conn.get('pts', [])
-            atype = conn.get('type', 'FLOOR').capitalize()
+            raw_atype = conn.get('type', 'FLOOR').upper()
+            atype = raw_atype.capitalize()
 
-            js = [self._joint_label.get((p, story), 0) for p in pts[:4]]
+            if raw_atype != 'FLOOR':
+                # Muro (PANEL/WALL): corners 1&2 en story_below (pie del muro),
+                # corners 3&4 en el story actual (cabeza del muro) — igual que columnas.
+                s_below = self._story_below(story)
+                if s_below is None:
+                    js = [self._joint_label.get((p, story), 0) for p in pts[:4]]
+                else:
+                    p0 = pts[0] if len(pts) > 0 else ''
+                    p1 = pts[1] if len(pts) > 1 else ''
+                    p2 = pts[2] if len(pts) > 2 else ''
+                    p3 = pts[3] if len(pts) > 3 else ''
+                    js = [
+                        self._joint_label.get((p0, s_below), 0),
+                        self._joint_label.get((p1, s_below), 0),
+                        self._joint_label.get((p2, story),   0),
+                        self._joint_label.get((p3, story),   0),
+                    ]
+            else:
+                # Losa: todos los corners en el mismo story
+                js = [self._joint_label.get((p, story), 0) for p in pts[:4]]
             while len(js) < 4:
                 js.append(js[-1] if js else 0)
 
@@ -774,16 +897,24 @@ class E2KParser:
         return pd.DataFrame(rows)
 
     def _build_restraints(self, df_joints: pd.DataFrame) -> pd.DataFrame:
-        base_story = self.story_order[0] if self.story_order else ''
         rows = []
         for _, row in df_joints.iterrows():
-            if row['Story'] == base_story:
-                rows.append({
-                    'Story': row['Story'],
-                    'Unique Name': row['Element Label'],
-                    'UX': 'Yes', 'UY': 'Yes', 'UZ': 'Yes',
-                    'RX': 'Yes', 'RY': 'Yes', 'RZ': 'Yes',
-                })
+            pt    = str(row['Object Label'])
+            story = str(row['Story'])
+            restraint_val = self.point_assigns.get((pt, story), '')
+            if not restraint_val:
+                continue
+            active = set(restraint_val.upper().split())
+            rows.append({
+                'Story':       story,
+                'Unique Name': row['Element Label'],
+                'UX': 'Yes' if 'UX' in active else 'No',
+                'UY': 'Yes' if 'UY' in active else 'No',
+                'UZ': 'Yes' if 'UZ' in active else 'No',
+                'RX': 'Yes' if 'RX' in active else 'No',
+                'RY': 'Yes' if 'RY' in active else 'No',
+                'RZ': 'Yes' if 'RZ' in active else 'No',
+            })
         return pd.DataFrame(rows)
 
     def _build_frame_sections(self) -> pd.DataFrame:
@@ -800,13 +931,16 @@ class E2KParser:
         for _, row in df_frames.iterrows():
             ln = row['Object Label']
             story = row['Story']
-            sec = self.line_assigns.get((ln, story), {}).get('section', '')
+            asgn = self.line_assigns.get((ln, story), {})
+            sec = asgn.get('section', '')
+            release = asgn.get('release', '')
             rows.append({
                 'Story': story,
                 'Label': ln,
                 'Unique Name': row['Element Label'],
                 'Analysis Section': sec,
                 'Design Section': sec,
+                'Release': release,
             })
         return pd.DataFrame(rows)
 
@@ -925,19 +1059,82 @@ class E2KParser:
         return pd.DataFrame(rows)
 
     def _build_shell_pier_assignments(self, df_shells: pd.DataFrame) -> pd.DataFrame:
+        # Filter by pier assignment (not by Area Type — VitaTorre uses PANEL, others use WALL)
         rows = []
         for _, row in df_shells.iterrows():
-            if str(row.get('Area Type', '')).lower() != 'wall':
-                continue
-            ar = row['Area Label']
+            ar    = row['Area Label']
             story = row['Story']
-            pier = self.area_pier_assigns.get((ar, story), '')
-            rows.append({
-                'Story': story,
-                'Unique Name': row['Element Label'],
-                'Pier': pier,
-            })
+            pier  = self.area_pier_assigns.get((ar, story), '')
+            if pier:
+                rows.append({
+                    'Story': story,
+                    'Unique Name': row['Element Label'],
+                    'Pier': pier,
+                })
         return pd.DataFrame(rows)
+
+    def _build_pier_reinforcement_data(self):
+        """Build DataFrame from SDSECTION TYPE=PIER entries (polygon + LINE REBAR)."""
+        rows = []
+        for name, data in self.sd_pier_sections.items():
+            pts = data['polygon']
+            if pts:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                dim_x = max(xs) - min(xs)
+                dim_y = max(ys) - min(ys)
+                lw = max(dim_x, dim_y)
+                tw = min(dim_x, dim_y)
+            else:
+                lw = tw = 0.0
+
+            rebar_lines = data['rebar_lines']
+            if rebar_lines:
+                for i, rb in enumerate(rebar_lines, start=1):
+                    dx = rb['x2'] - rb['x1']
+                    dy = rb['y2'] - rb['y1']
+                    rb_len = math.hypot(dx, dy)
+                    s = rb['spacing_m']
+                    if s > 1e-9 and rb['end_bar']:
+                        n_bars = round(rb_len / s) + 1
+                    elif s > 1e-9:
+                        n_bars = round(rb_len / s)
+                    else:
+                        n_bars = 1
+                    rows.append({
+                        'Pier Name':        name,
+                        'Concrete Material': data['concrete_material'],
+                        'Rebar Material':   data['rebar_material'],
+                        'lw (m)':           round(lw, 4),
+                        'tw (m)':           round(tw, 4),
+                        'Rebar Line':       i,
+                        'Bar Area (mm2)':   round(rb['bar_area_m2'] * 1e6, 2),
+                        'Spacing (mm)':     round(s * 1000, 2),
+                        'End Bar':          'Yes' if rb['end_bar'] else 'No',
+                        'X1 (m)':           round(rb['x1'], 6),
+                        'Y1 (m)':           round(rb['y1'], 6),
+                        'X2 (m)':           round(rb['x2'], 6),
+                        'Y2 (m)':           round(rb['y2'], 6),
+                        'Est. n Bars':      n_bars,
+                    })
+            else:
+                rows.append({
+                    'Pier Name':        name,
+                    'Concrete Material': data['concrete_material'],
+                    'Rebar Material':   data['rebar_material'],
+                    'lw (m)':           round(lw, 4),
+                    'tw (m)':           round(tw, 4),
+                    'Rebar Line':       0,
+                    'Bar Area (mm2)':   None,
+                    'Spacing (mm)':     None,
+                    'End Bar':          None,
+                    'X1 (m)':           None,
+                    'Y1 (m)':           None,
+                    'X2 (m)':           None,
+                    'Y2 (m)':           None,
+                    'Est. n Bars':      None,
+                })
+        return pd.DataFrame(rows) if rows else None
 
     # ── supplemental merge ────────────────────────────────────────────────────
 

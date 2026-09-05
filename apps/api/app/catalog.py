@@ -164,6 +164,43 @@ CATALOG = [
         ],
     },
     {
+        "id": "muros-rc-3d",
+        "name": "Módulo 5 - Análisis de Muros RC 3D",
+        "products": [
+            {
+                "id": "muros-esfi-mvlem",
+                "name": "Análisis no lineal de muros RC (E-SFI-MVLEM-3D / MVLEM_3D)",
+                "nivel": "premium",
+                "estado": "en_desarrollo",
+                "route": "/wall-projects",
+            },
+            {
+                "id": "muros-pushover",
+                "name": "Pushover monotónico ±X / ±Y — curvas de capacidad y derivas NSR-10",
+                "nivel": "premium",
+                "estado": "en_desarrollo",
+                "route": "/wall-projects",
+                "hidden": True,
+            },
+            {
+                "id": "muros-fibras-calor",
+                "name": "Mapa de deformaciones en fibras de macroelementos",
+                "nivel": "premium",
+                "estado": "idea",
+                "route": None,
+                "hidden": True,
+            },
+            {
+                "id": "muros-script-export",
+                "name": "Exportación de script standalone OpenSeesPy",
+                "nivel": "pro",
+                "estado": "en_desarrollo",
+                "route": "/wall-projects",
+                "hidden": True,
+            },
+        ],
+    },
+    {
         "id": "desempeno",
         "name": "Módulo 4 - Evaluación del Desempeño",
         "products": [
@@ -196,6 +233,77 @@ CATALOG = [
             {"id": "perdidas-economicas", "name": "Perdidas economicas", "nivel": None, "estado": "idea", "route": None},
             {"id": "tiempo-recuperacion", "name": "Tiempo de recuperacion", "nivel": None, "estado": "idea", "route": None},
             {"id": "riesgo-anual", "name": "Riesgo anual esperado", "nivel": None, "estado": "idea", "route": None},
+        ],
+    },
+    {
+        "id": "ground-motion",
+        "name": "Análisis de Acelerogramas",
+        "products": [
+            {
+                "id": "gm-import",
+                "name": "Importación y configuración de acelerogramas (TXT, CSV, XLSX)",
+                "nivel": "free", "estado": "en_desarrollo", "route": "/ground-motion",
+            },
+            {
+                "id": "gm-timeseries",
+                "name": "Visualización de historia de tiempo (a, v, d) con integración numérica",
+                "nivel": "free", "estado": "en_desarrollo", "route": "/ground-motion",
+            },
+            {
+                "id": "gm-intensity",
+                "name": "Parámetros de intensidad sísmica (PGA, PGV, PGD, Arias, CAV, D5-95)",
+                "nivel": "free", "estado": "en_desarrollo", "route": "/ground-motion",
+            },
+            {
+                "id": "gm-baseline",
+                "name": "Corrección de línea base (media, lineal, polinómica)",
+                "nivel": "free", "estado": "en_desarrollo", "route": "/ground-motion",
+            },
+            {
+                "id": "gm-filter",
+                "name": "Filtrado digital Butterworth (lowpass, highpass, bandpass)",
+                "nivel": "free", "estado": "en_desarrollo", "route": "/ground-motion",
+            },
+            {
+                "id": "gm-fft",
+                "name": "Análisis en frecuencia: FFT y Power Spectral Density",
+                "nivel": "free", "estado": "en_desarrollo", "route": "/ground-motion",
+            },
+            {
+                "id": "gm-spectrum",
+                "name": "Espectro de respuesta elástico (Sd, Sv, Sa, PSA, PSV) — Newmark-β",
+                "nivel": "pro", "estado": "en_desarrollo", "route": "/ground-motion",
+            },
+            {
+                "id": "gm-multi-xi",
+                "name": "Espectros para múltiples amortiguamientos simultáneos",
+                "nivel": "pro", "estado": "en_desarrollo", "route": "/ground-motion",
+            },
+            {
+                "id": "gm-spectrum-inspector",
+                "name": "Spectrum Inspector: Sa(T), Sd(T), PSV(T) a periodo específico",
+                "nivel": "pro", "estado": "en_desarrollo", "route": "/ground-motion",
+            },
+            {
+                "id": "gm-nonlinear",
+                "name": "Espectros de respuesta inelástica (SDOF bilineal, ductilidad objetivo)",
+                "nivel": "premium", "estado": "idea", "route": None,
+            },
+            {
+                "id": "gm-scaling",
+                "name": "Escalamiento de registros (por PGA, Sa(T) o factor manual)",
+                "nivel": "pro", "estado": "idea", "route": None,
+            },
+            {
+                "id": "gm-comparison",
+                "name": "Comparación de registros (espectros, IMs, estadísticas)",
+                "nivel": "pro", "estado": "idea", "route": None,
+            },
+            {
+                "id": "gm-opensees-link",
+                "name": "Envío directo a análisis dinámico no lineal OpenSeesPy",
+                "nivel": "premium", "estado": "idea", "route": None,
+            },
         ],
     },
     {

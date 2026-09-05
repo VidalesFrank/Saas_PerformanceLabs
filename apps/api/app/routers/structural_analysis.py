@@ -148,6 +148,18 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
                 detail="Ejecuta el análisis espectral RSA antes del diseño.",
             )
 
+    elif payload.analysis_type == StructuralAnalysisType.wall_demands:
+        if not project.canonical_model_path:
+            raise HTTPException(
+                status_code=400,
+                detail="El modelo debe estar importado antes de calcular demandas de muros.",
+            )
+        if not project.parameters_json:
+            raise HTTPException(
+                status_code=400,
+                detail="Configura los parámetros sísmicos NSR-10 antes del análisis de muros.",
+            )
+
     # Crear el registro del job
     job = StructuralJob(
         analysis_type=payload.analysis_type,
@@ -176,6 +188,7 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
             StructuralAnalysisType.spectral:        "app.tasks.structural_spectral_task.run_spectral",
             StructuralAnalysisType.design_columns:  "app.tasks.structural_design_task.run_design_columns",
             StructuralAnalysisType.design_beams:    "app.tasks.structural_beam_task.run_design_beams",
+            StructuralAnalysisType.wall_demands:    "app.tasks.structural_wall_demands_task.run_wall_demands",
         }
 
         kwargs: dict = {
@@ -242,6 +255,26 @@ def download_job_result(job_id: str, user: CurrentUser, db: DB):
         filename=os.path.basename(job.result_path),
         media_type="application/octet-stream",
     )
+
+
+@router.get("/{project_id}/wall-demands")
+def get_wall_demands(project_id: str, user: CurrentUser, db: DB):
+    """
+    Retorna el resultado más reciente de wall_demands para el proyecto.
+    Lee directamente wall_demands.json si existe, sin necesitar el job_id.
+    """
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir   = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    result_path = os.path.join(work_dir, "results", "wall_demands.json")
+
+    if not os.path.exists(result_path):
+        raise HTTPException(status_code=404, detail="No hay resultados de demandas de muros aún")
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 @router.delete("/jobs/{job_id}/cancel", status_code=200)

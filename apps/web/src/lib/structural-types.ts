@@ -1,6 +1,6 @@
 // ── Tipos para el Módulo 1 — Constructor de Modelos Estructurales ─────────────
 
-export type StructuralAnalysisType = "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams";
+export type StructuralAnalysisType = "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands";
 export type StructuralJobStatus    = "pending" | "running" | "success" | "failed" | "cancelled";
 export type ValidationStatus       = "not_run" | "has_errors" | "has_warnings" | "ok";
 
@@ -151,11 +151,14 @@ export interface StoryMass {
 export interface ModelGeometry {
   joints: Record<string, JointGeometry>;
   frames: Record<string, FrameGeometry>;
+  shells: Record<string, ShellSummary>;
   stories: Record<string, StoryInfo>;
   masses: Record<string, StoryMass>;
   load_patterns: string[];
+  shell_loads?: Record<string, Record<string, number>>;
   n_joints: number;
   n_frames: number;
+  n_shells: number;
   n_stories: number;
 }
 
@@ -659,13 +662,14 @@ export interface FrameSummary {
   object_label?: string;
 }
 
-/** Shell resumido para el editor. */
+/** Shell resumido para el editor y el visor. */
 export interface ShellSummary {
   joints: string[];
   section: string;
   element_type: "wall" | "slab";
   story: string;
   thickness_m: number;
+  pier?: string;
 }
 
 /** Modelo canónico completo retornado por /model-data (sin analysis_results). */
@@ -799,4 +803,40 @@ export interface ViewerTypeFilter {
   beams: boolean;
   walls: boolean;
   slabs: boolean;
+}
+
+// ── Tipos para demandas de muros (FHE NSR-10 + MVLEM_3D) ────────────────────
+
+export interface WallFHEParams {
+  hn_m:  number;
+  T_s:   number;
+  Cs:    number;
+  W_kN:  number;
+  Vb_kN: number;
+}
+
+export interface WallPierDemand {
+  pier:       string;
+  story:      string;
+  combo:      string;
+  Pu_kN:      number;
+  Vu_x_kN:   number;
+  Vu_y_kN:   number;
+  Mu_x_kNm:  number;
+  Mu_y_kNm:  number;
+  lw_m:       number;
+  tw_m:       number;
+  hw_m:       number;
+}
+
+export interface WallDemandsResult {
+  status:       string;
+  job_id:       string;
+  project_id:   string;
+  fhe_params:   WallFHEParams;
+  story_forces: { X: Record<string, number>; Y: Record<string, number> };
+  gravity_axials: Record<string, number>;
+  pier_demands: WallPierDemand[];
+  pier_count:   number;
+  story_count:  number;
 }

@@ -26,6 +26,7 @@ _K_RESTRAINTS = 'TABLE:  "JOINT ASSIGNMENTS - RESTRAINTS"'
 _K_FR_SECS    = 'TABLE:  "FRAME SECTIONS"'
 _K_FR_ASSIGN  = 'TABLE:  "FRAME ASSIGNMENTS - SECTIONS"'
 _K_SH_ASSIGN  = 'TABLE:  "SHELL ASSIGNMENTS - SECTIONS"'
+_K_SH_PIER    = 'TABLE:  "SHELL ASSIGNMENTS - PIER SPANDR"'
 _K_SH_SLAB    = 'TABLE:  "SHELL SECTIONS - SLAB"'
 _K_SH_WALL    = 'TABLE:  "SHELL SECTIONS - WALL"'
 _K_SH_LOADS   = 'TABLE:  "SHELL LOADS - UNIFORM"'
@@ -72,9 +73,14 @@ class CanonicalModelBuilder:
         materials = self._build_materials()
         sections  = self._build_sections(materials)
         frames    = self._build_frames(sections, joints)
-        shells    = self._build_shells()
+        shells    = self._build_shells(joints)
         masses    = self._build_masses(joints)
+        # Self-weight is already included in the ETABS mass summary (slab SW via
+        # INCLUDELATERALMASS; vertical elements excluded per INCLUDEVERTICALMASS="No").
+        # Do NOT add extra self-weight here — it would double-count slabs and
+        # incorrectly include wall/column mass that ETABS explicitly excludes.
         load_patterns = self._extract_load_patterns()
+        shell_loads   = self._build_shell_loads()
 
         total_h = 0.0
         if stories:
@@ -101,6 +107,7 @@ class CanonicalModelBuilder:
             "sections":   sections,
             "frames":     frames,
             "shells":     shells,
+            "shell_loads": shell_loads,
             "masses":     masses,
             "analysis_results": {
                 "modal":    None,
@@ -276,6 +283,7 @@ class CanonicalModelBuilder:
         # E23 adaptado usa "Label" (obj label como "B525") que coincide con frames "Object Label".
         # "Unique Name" en E23 adaptado es un ID interno diferente al Element Label.
         sec_map: dict[str, str] = {}
+        release_map: dict[str, str] = {}
         if isinstance(assign_df, pd.DataFrame) and len(assign_df) > 0:
             if "Element Label" in assign_df.columns:
                 lc = "Element Label"
@@ -289,6 +297,9 @@ class CanonicalModelBuilder:
                 sec = _safe_str(r.get("Section") or r.get("Analysis Section") or "")
                 if lbl and sec:
                     sec_map[lbl] = sec
+                rel = _safe_str(r.get("Release", ""))
+                if lbl and rel:
+                    release_map[lbl] = rel
 
         jcoords = joints or {}
 
@@ -302,6 +313,11 @@ class CanonicalModelBuilder:
             story     = _safe_str(row.get("Story", ""))
             ji        = _safe_str(row.get("Joint I", ""))
             jj        = _safe_str(row.get("Joint J", ""))
+            # Saltar frames nulos (joint "0" = marcador ETABS) o con joints no en la tabla
+            if not ji or not jj or ji == "0" or jj == "0":
+                continue
+            if jcoords and (ji not in jcoords or jj not in jcoords):
+                continue
             obj_label = _safe_str(row.get("Object Label", label))
 
             # Clasificación: ETABS E23 usa "Frame" para todo.
@@ -322,8 +338,9 @@ class CanonicalModelBuilder:
                 )
                 element_type = "column" if dz > dxy else "beam"
 
-            # Sección (busca por label del elemento primero, luego por object label)
+            # Sección y release (busca por label del elemento primero, luego por object label)
             section = sec_map.get(label) or sec_map.get(obj_label) or ""
+            release = release_map.get(label) or release_map.get(obj_label) or ""
 
             frames[label] = {
                 "joint_i":      ji,
@@ -332,20 +349,33 @@ class CanonicalModelBuilder:
                 "element_type": element_type,
                 "story":        story,
                 "object_label": obj_label,
+                "release":      release,
             }
 
         return frames
 
     # ── Elementos shell ───────────────────────────────────────────────────────
 
-    def _build_shells(self) -> dict[str, dict]:
+    def _build_shells(self, joints: dict | None = None) -> dict[str, dict]:
         shells_df = self._rd.get(_K_SHELLS)
         assign_df = self._rd.get(_K_SH_ASSIGN)
+        pier_df   = self._rd.get(_K_SH_PIER)
         slab_df   = self._rd.get(_K_SH_SLAB)
         wall_df   = self._rd.get(_K_SH_WALL)
 
         if not isinstance(shells_df, pd.DataFrame) or len(shells_df) == 0:
             return {}
+
+        valid_joint_set: set[str] | None = set(joints.keys()) if joints else None
+
+        # Mapa pier: element_label → pier_name
+        pier_map: dict[str, str] = {}
+        if isinstance(pier_df, pd.DataFrame) and len(pier_df) > 0:
+            for _, r in pier_df.iterrows():
+                lbl  = _safe_str(r.get("Unique Name", ""))
+                pier = _safe_str(r.get("Pier", ""))
+                if lbl and pier:
+                    pier_map[lbl] = pier
 
         # Mapa de asignaciones: element_label → section
         sec_map: dict[str, str] = {}
@@ -375,22 +405,28 @@ class CanonicalModelBuilder:
             story    = _safe_str(row.get("Story", ""))
             area_label = _safe_str(row.get("Area Label", label))
 
-            joints = [
+            corner_joints = [
                 _safe_str(row.get(c, ""))
                 for c in ("Joint 1", "Joint 2", "Joint 3", "Joint 4")
             ]
-            joints = [j for j in joints if j]
+            # Filtrar vacíos y marcadores nulos: "0" (int) o "0.0" (float de Excel)
+            corner_joints = [j for j in corner_joints if j and j not in ("0", "0.0")]
+
+            # Saltar shells con joints fuera de la tabla de joints (huérfanos reales)
+            if valid_joint_set and any(j not in valid_joint_set for j in corner_joints):
+                continue
 
             section = sec_map.get(label) or sec_map.get(area_label) or ""
             element_type = "slab" if area_type.lower() == "floor" else "wall"
 
             shells[label] = {
-                "joints":        joints,
+                "joints":        corner_joints,
                 "section":       section,
                 "element_type":  element_type,
                 "story":         story,
                 "area_label":    area_label,
                 "thickness_m":   thickness_map.get(section, 0.0),
+                "pier":          pier_map.get(label) or pier_map.get(area_label) or "",
             }
 
         return shells
@@ -405,6 +441,8 @@ class CanonicalModelBuilder:
         masses: dict[str, dict] = {}
         for _, row in df.iterrows():
             story   = _safe_str(row.get("Story", ""))
+            if not story:
+                continue   # skip units header row (NaN → empty story)
             mass_x  = _to_float(row.get("Mass X"))
             mass_y  = _to_float(row.get("Mass Y"))
             mass_rz = _to_float(row.get("Mass Moment of Inertia"))
@@ -421,14 +459,130 @@ class CanonicalModelBuilder:
             key = f"mass_{story}"
             masses[key] = {
                 "story":        story,
-                "mass_x_t":     round(mass_x / 1000.0, 6),   # kg → ton (kN·s²/m)
-                "mass_y_t":     round(mass_y / 1000.0, 6),   # kg → ton
-                "mass_rz_tm2":  round(mass_rz, 4),            # ton·m² (ya en unidades correctas)
+                "mass_x_t":     round(mass_x, 4),    # tonnes (kN·s²/m) — ETABS exports in ton
+                "mass_y_t":     round(mass_y, 4),
+                "mass_rz_tm2":  round(mass_rz, 4),
                 "x_cm_m":       round(xc, 4),
                 "y_cm_m":       round(yc, 4),
                 "z_m":          round(zc, 4),
             }
 
+        return masses
+
+    # ── Peso propio sobre masas ───────────────────────────────────────────────
+
+    def _add_selfweight_to_masses(
+        self,
+        masses: dict,
+        shells: dict,
+        frames: dict,
+        sections: dict,
+        joints: dict,
+    ) -> dict:
+        """
+        Suma el peso propio de muros, losas y marcos a las masas por piso.
+
+        La tabla ETABS "MASS SUMMARY BY DIAPHRAGM" suele incluir solo las cargas
+        definidas en la fuente de masa (típicamente la carga viva o impuesta).
+        Este método agrega la masa de los elementos estructurales calculada desde
+        su geometría × densidad del concreto.
+
+        Regla de asignación: toda la masa de un elemento se asigna al piso cuya
+        elevación coincide con la cota más alta del elemento (±10 cm de tolerancia).
+        Para muros del primer piso (base→piso1) esto conserva el 100 % en el piso 1.
+        """
+        if not masses:
+            return masses
+
+        rho = 2.549  # t/m³  (25 kN/m³ / 9.81 m/s²)
+
+        # Mapa z_m → key del piso (con tolerancia para match)
+        z_key_list: list[tuple[float, str]] = sorted(
+            (round(float(md.get("z_m", 0.0)), 3), key)
+            for key, md in masses.items()
+        )
+
+        def find_story_key(z_val: float) -> str | None:
+            z_val = round(float(z_val), 3)
+            best_key, best_dz = None, float("inf")
+            for zk, k in z_key_list:
+                dz = abs(zk - z_val)
+                if dz < 0.10 and dz < best_dz:
+                    best_dz, best_key = dz, k
+            if best_key is None:
+                above = [(zk, k) for zk, k in z_key_list if zk >= z_val - 0.1]
+                if above:
+                    best_key = min(above, key=lambda x: x[0])[1]
+            return best_key
+
+        def tri_area(p1, p2, p3):
+            v1 = (p2[0]-p1[0], p2[1]-p1[1], p2[2]-p1[2])
+            v2 = (p3[0]-p1[0], p3[1]-p1[1], p3[2]-p1[2])
+            cx = v1[1]*v2[2] - v1[2]*v2[1]
+            cy = v1[2]*v2[0] - v1[0]*v2[2]
+            cz = v1[0]*v2[1] - v1[1]*v2[0]
+            return 0.5 * math.sqrt(cx**2 + cy**2 + cz**2)
+
+        # Acumular masa añadida por piso antes de aplicar
+        added: dict[str, float] = {k: 0.0 for k in masses}
+
+        # Shells (muros + losas)
+        for sd in shells.values():
+            jlabels = sd.get("joints", [])
+            if len(jlabels) < 3:
+                continue
+            t = float(sd.get("thickness_m") or 0.0)
+            if t <= 0:
+                t = 0.15
+            pts = []
+            for lb in jlabels:
+                jd = joints.get(lb, {})
+                pts.append((float(jd.get("x", 0)), float(jd.get("y", 0)), float(jd.get("z", 0))))
+            if len(pts) < 3:
+                continue
+            area = tri_area(pts[0], pts[1], pts[2])
+            if len(pts) >= 4:
+                area += tri_area(pts[0], pts[2], pts[3])
+            sw = rho * t * area
+            z_max = max(p[2] for p in pts)
+            key = find_story_key(z_max)
+            if key and key in added:
+                added[key] += sw
+
+        # Marcos con sección válida
+        for fd in frames.values():
+            sec = sections.get(fd.get("section", ""))
+            if not sec:
+                continue
+            A = float(sec.get("A_m2", 0))
+            if A <= 0:
+                continue
+            ji = joints.get(fd.get("joint_i", ""), {})
+            jj = joints.get(fd.get("joint_j", ""), {})
+            pi = (float(ji.get("x", 0)), float(ji.get("y", 0)), float(ji.get("z", 0)))
+            pj = (float(jj.get("x", 0)), float(jj.get("y", 0)), float(jj.get("z", 0)))
+            L = math.sqrt(sum((pj[i] - pi[i]) ** 2 for i in range(3)))
+            if L <= 0:
+                continue
+            sw = rho * A * L
+            key = find_story_key(max(pi[2], pj[2]))
+            if key and key in added:
+                added[key] += sw
+
+        # Aplicar masa añadida y escalar Jz proporcionalmente
+        for key, sw in added.items():
+            if sw <= 0:
+                continue
+            md = masses[key]
+            m_old = float(md.get("mass_x_t", 0.0))
+            m_new = m_old + sw
+            md["mass_x_t"] = round(m_new, 4)
+            md["mass_y_t"] = round(float(md.get("mass_y_t", 0.0)) + sw, 4)
+            if m_old > 1e-9:
+                md["mass_rz_tm2"] = round(float(md.get("mass_rz_tm2", 0.0)) * m_new / m_old, 4)
+
+        print(f"[model_builder] Peso propio sumado: {sum(added.values()):.1f} t total "
+              f"({sum(added.values())/max(len(added),1):.1f} t/piso promedio)")
         return masses
 
     # ── Patrones de carga ────────────────────────────────────────────────────
@@ -438,3 +592,30 @@ class CanonicalModelBuilder:
         if not isinstance(df, pd.DataFrame) or "Load Pattern" not in df.columns:
             return []
         return sorted(df["Load Pattern"].dropna().astype(str).unique().tolist())
+
+    def _build_shell_loads(self) -> dict[str, dict[str, float]]:
+        """
+        Cargas uniformes por shell: {shell_label: {load_pattern: load_kN_m2}}.
+        Incluye solo dirección Gravity (cargas verticales sobre losas).
+        """
+        df = self._rd.get(_K_SH_LOADS)
+        if not isinstance(df, pd.DataFrame) or len(df) == 0:
+            return {}
+
+        result: dict[str, dict[str, float]] = {}
+        dir_col = "Dir" if "Dir" in df.columns else "Direction"
+        for _, row in df.iterrows():
+            label = _safe_str(row.get("Label", ""))
+            lc    = _safe_str(row.get("Load Pattern", ""))
+            direc = _safe_str(row.get(dir_col, "")).lower()
+            load  = _to_float(row.get("Load", 0.0))
+
+            if not label or not lc:
+                continue
+            # Solo cargas gravitacionales (hacia abajo sobre la losa)
+            if direc and direc not in ("gravity", "grav", "z", "-z"):
+                continue
+
+            result.setdefault(label, {})[lc] = round(abs(load), 4)
+
+        return result

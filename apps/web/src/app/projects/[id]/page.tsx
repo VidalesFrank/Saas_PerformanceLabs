@@ -19,6 +19,7 @@ import FrameNavigator from "@/components/linear/FrameNavigator";
 import ColumnDetailPanel from "@/components/linear/ColumnDetailPanel";
 import BeamDetailPanel from "@/components/linear/BeamDetailPanel";
 import WallsPanel from "@/components/linear/WallsPanel";
+import WallDemandsPanel from "@/components/linear/WallDemandsPanel";
 import ModelMaterialsPanel from "@/components/linear/ModelMaterialsPanel";
 import ModelSectionsPanel from "@/components/linear/ModelSectionsPanel";
 import { NonlinearSpecPanel } from "@/components/linear/NonlinearSpecPanel";
@@ -41,6 +42,7 @@ import type {
   ColumnDesignDetail,
   BeamDesignDetail,
   FullModelData,
+  WallDemandsResult,
 } from "@/lib/structural-types";
 import { useRequireAuth } from "@/lib/use-require-auth";
 
@@ -53,6 +55,7 @@ type SectionId =
   | "secciones"
   | "muros"
   | "sismico"
+  | "wall-demands"
   | "diseno"
   | "no-lineal";
 
@@ -94,6 +97,7 @@ function buildNav(hasSpectral: boolean, isValidated: boolean): NavGroup[] {
       groupLabel: "Análisis",
       items: [
         { id: "sismico", label: "Sísmico + Modal + Espectral", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "wall-demands", label: "Demandas Muros (FHE)", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
       ],
     },
     {
@@ -210,6 +214,9 @@ export default function StructuralProjectPage() {
   const [frameDetailData,    setFrameDetailData]   = useState<ColumnDesignDetail | BeamDesignDetail | null>(null);
   const [loadingFrameDetail, setLoadingFrameDetail] = useState(false);
 
+  // Resultado demandas de muros FHE
+  const [wallDemandsResult, setWallDemandsResult] = useState<WallDemandsResult | null>(null);
+
   // Modelo completo para el panel de Muros (carga lazy al entrar al tab)
   const [fullModelData, setFullModelData] = useState<FullModelData | null>(null);
 
@@ -311,6 +318,16 @@ export default function StructuralProjectPage() {
     } catch { /* silencioso */ }
   }, []);
 
+  // Cargar resultado de demandas de muros FHE cuando hay un job exitoso
+  const loadWallDemandsResult = useCallback(async (jobList: StructuralJob[]) => {
+    const wallJob = jobList.find((j) => j.analysis_type === "wall_demands" && j.status === "success");
+    if (!wallJob) return;
+    try {
+      const result = await structuralAnalysisApi.result<WallDemandsResult>(wallJob.id);
+      setWallDemandsResult(result);
+    } catch { /* silencioso */ }
+  }, []);
+
   // Cargar lista de frames para el navigator
   const loadFrameList = useCallback(async () => {
     try {
@@ -344,6 +361,7 @@ export default function StructuralProjectPage() {
       if (!spectralResult)      loadSpectralResult(jobs);
       if (!columnDesignResult)  loadColumnDesignResult(jobs);
       if (!beamDesignResult)    loadBeamDesignResult(jobs);
+      if (!wallDemandsResult)   loadWallDemandsResult(jobs);
       if (!frameListData && hasAnyDesign) loadFrameList();
       return;
     }
@@ -360,6 +378,7 @@ export default function StructuralProjectPage() {
         if (!spectralResult)      loadSpectralResult(jobList);
         if (!columnDesignResult)  loadColumnDesignResult(jobList);
         if (!beamDesignResult)    loadBeamDesignResult(jobList);
+        if (!wallDemandsResult)   loadWallDemandsResult(jobList);
         if (!modelGeometry && proj.canonical_model_path) loadModelGeometry(proj);
         // Recargar frame list cuando un job de diseño acaba de completarse
         const nowHasDesign = jobList.some(
@@ -372,8 +391,9 @@ export default function StructuralProjectPage() {
     }, 3000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [jobs, params.id, validationResult, modalResult, spectralResult, columnDesignResult,
-      beamDesignResult, frameListData, modelGeometry, loadValidationResult, loadModalResult,
-      loadSpectralResult, loadColumnDesignResult, loadBeamDesignResult, loadFrameList, loadModelGeometry]);
+      beamDesignResult, wallDemandsResult, frameListData, modelGeometry, loadValidationResult,
+      loadModalResult, loadSpectralResult, loadColumnDesignResult, loadBeamDesignResult,
+      loadWallDemandsResult, loadFrameList, loadModelGeometry]);
 
   // ── Acciones ───────────────────────────────────────────────────────────────
 
@@ -427,7 +447,7 @@ export default function StructuralProjectPage() {
     setProject(updated);
   }
 
-  async function handleLaunch(analysisType: "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams") {
+  async function handleLaunch(analysisType: "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands") {
     if (!project) return;
     setLaunching(analysisType);
     if (analysisType === "design_columns" || analysisType === "design_beams") {
@@ -508,6 +528,7 @@ export default function StructuralProjectPage() {
   const hasSpectral    = jobs.some((j) => j.analysis_type === "spectral" && j.status === "success");
   const hasDesign      = jobs.some((j) => j.analysis_type === "design_columns" && j.status === "success");
   const hasBeamDesign  = jobs.some((j) => j.analysis_type === "design_beams"   && j.status === "success");
+  const hasWallDemands = jobs.some((j) => j.analysis_type === "wall_demands"   && j.status === "success");
   const activeJobTypes = new Set(
     jobs.filter((j) => j.status === "pending" || j.status === "running").map((j) => j.analysis_type)
   );
@@ -975,7 +996,8 @@ export default function StructuralProjectPage() {
                               spectral:        "Análisis Espectral",
                               design_columns:  "Verificación P-M Columnas",
                               design_beams:    "Diseño de Vigas",
-                            }[j.analysis_type]}
+                              wall_demands:    "Demandas Muros FHE",
+                            }[j.analysis_type as string]}
                           </span>
                         </div>
                         <div className="flex items-center gap-3">
@@ -1064,12 +1086,24 @@ export default function StructuralProjectPage() {
                             Períodos, modos de vibración y participación de masas
                           </p>
                         </div>
-                        <Button
-                          onClick={() => handleLaunch("modal")}
-                          disabled={!isValidated || activeJobTypes.has("modal") || !!launching}
-                        >
-                          {activeJobTypes.has("modal") ? "Calculando..." : hasModal ? "Recalcular" : "Ejecutar modal"}
-                        </Button>
+                        <div className="flex items-center gap-2">
+                          <Button
+                            onClick={() => handleLaunch("modal")}
+                            disabled={!isValidated || activeJobTypes.has("modal") || !!launching}
+                          >
+                            {activeJobTypes.has("modal") ? "Calculando..." : hasModal ? "Recalcular" : "Ejecutar modal"}
+                          </Button>
+                          {activeJobTypes.has("modal") && (() => {
+                            const activeJob = jobs.find(j =>
+                              j.analysis_type === "modal" && (j.status === "pending" || j.status === "running")
+                            );
+                            return activeJob ? (
+                              <Button variant="secondary" onClick={() => handleCancel(activeJob.id)}>
+                                Cancelar
+                              </Button>
+                            ) : null;
+                          })()}
+                        </div>
                       </div>
                     </CardHeader>
                     <CardBody>
@@ -1446,6 +1480,59 @@ export default function StructuralProjectPage() {
                 <div className="flex items-center justify-center flex-1">
                   <p className="text-sm text-[var(--text-muted)] animate-pulse">Cargando modelo...</p>
                 </div>
+              )}
+            </div>
+          )}
+
+          {/* ── Demandas Muros FHE ───────────────────────────────────────────── */}
+          {activeSection === "wall-demands" && (
+            <div className="mx-auto max-w-5xl px-6 py-8 flex flex-col gap-6">
+              <div>
+                <h1 className="text-xl font-semibold text-[var(--text)]">Demandas de Muros — FHE NSR-10</h1>
+                <p className="text-sm text-[var(--text-muted)] mt-1">
+                  Modelo MVLEM_3D elástico · FHE NSR-10 A.4.2 · Combinaciones C.9.2.1
+                </p>
+              </div>
+
+              {/* Launch card */}
+              <Card>
+                <CardBody className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium text-[var(--text)]">Análisis FHE + combinaciones NSR-10</p>
+                    <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                      Construye el modelo MVLEM_3D, aplica fuerzas horizontales equivalentes por piso
+                      y genera la envolvente de diseño (Pu, Vu, Mu) por pier por historia.
+                    </p>
+                  </div>
+                  <Button
+                    disabled={activeJobTypes.has("wall_demands") || !project?.parameters_json}
+                    onClick={() => handleLaunch("wall_demands")}
+                    title={!project?.parameters_json ? "Configura los parámetros sísmicos NSR-10 primero" : undefined}
+                  >
+                    {activeJobTypes.has("wall_demands") ? "Calculando..." : hasWallDemands ? "Recalcular" : "Calcular"}
+                  </Button>
+                </CardBody>
+              </Card>
+
+              {/* Results */}
+              {hasWallDemands && wallDemandsResult && (
+                <WallDemandsPanel result={wallDemandsResult} />
+              )}
+
+              {/* Running indicator */}
+              {activeJobTypes.has("wall_demands") && !hasWallDemands && (
+                <Card>
+                  <CardBody>
+                    <p className="text-sm text-[var(--text-muted)] animate-pulse">
+                      Construyendo modelo y calculando demandas...
+                    </p>
+                  </CardBody>
+                </Card>
+              )}
+
+              {/* Last job status */}
+              {lastJobByType("wall_demands") && (
+                <JobStatusBadge status={lastJobByType("wall_demands")!.status} />
               )}
             </div>
           )}

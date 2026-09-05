@@ -7,15 +7,18 @@ import { api } from "@/lib/api";
 import type { CatalogModule, CatalogProduct, User } from "@/lib/types";
 import { useRequireAuth } from "@/lib/use-require-auth";
 
-// ── Identidad visual por módulo ───────────────────────────────────────────────
-const MODULE_CFG = [
-  { color: "#0e7fa8", desc: "Interoperabilidad con software comercial y construcción del modelo OpenSees" },
-  { color: "#087f5b", desc: "Análisis de secciones de concreto reforzado con modelos de confinamiento" },
-  { color: "#7c3aed", desc: "Análisis no lineal: modal, pushover, dinámico e IDA sobre edificios reales" },
-  { color: "#d97706", desc: "Evaluación del desempeño sísmico y curvas de fragilidad estructural" },
-  { color: "#dc2626", desc: "Probabilidad de colapso, vulnerabilidad y pérdidas económicas esperadas" },
-  { color: "#0f766e", desc: "Reportes automáticos de desempeño y recomendaciones de intervención" },
-];
+// ── Identidad visual por módulo (indexada por id del catálogo) ───────────────
+const MODULE_CFG: Record<string, { color: string; desc: string }> = {
+  "constructor-modelos":   { color: "#0e7fa8", desc: "Importación desde ETABS/SAP2000 y construcción automática del modelo OpenSees" },
+  "modelado":              { color: "#0369a1", desc: "Análisis estructural preliminar: respuesta modal y espectral NSR-10" },
+  "secciones":             { color: "#087f5b", desc: "Ingeniería de secciones RC: diagramas P-M, M-φ, PMM biaxial y verificación NSR-10" },
+  "analisis-no-lineal-3d": { color: "#7c3aed", desc: "Análisis no lineal 3D de edificios: modal, pushover, dinámico e IDA" },
+  "muros-rc-3d":           { color: "#b45309", desc: "Análisis no lineal de muros RC 3D con modelos E-SFI-MVLEM-3D y MVLEM_3D" },
+  "desempeno":             { color: "#d97706", desc: "Evaluación del desempeño sísmico según ATC-40 / NSR-10 mediante CSM y ADRS" },
+  "riesgo":                { color: "#dc2626", desc: "Probabilidad de colapso, curvas de fragilidad y pérdidas económicas esperadas" },
+  "ground-motion":         { color: "#0891b2", desc: "Procesamiento y análisis de registros de aceleración sísmica: FFT, espectros, intensidad" },
+  "decisiones":            { color: "#6d28d9", desc: "Reportes automáticos de desempeño sísmico y recomendaciones de intervención" },
+};
 
 const PLAN_CFG: Record<string, { label: string; color: string; bg: string }> = {
   free:    { label: "Free",    color: "#0e7fa8", bg: "#0e7fa812" },
@@ -43,20 +46,26 @@ const ICON_D: Record<string, string> = {
 };
 
 function iconTypeFor(id: string): string {
-  if (/import|conv/.test(id))                       return "import";
-  if (/espectro/.test(id))                           return "wave";
-  if (/interaccion|diagrama/.test(id))               return "section";
-  if (/curvatura|fibra/.test(id))                    return "curve";
-  if (/edificio/.test(id))                           return "building";
-  if (/registro|ciclico/.test(id))                   return "seismograph";
-  if (/desempeno|calculo-r|param|r-dif/.test(id))    return "gauge";
-  if (/fragilidad|vulnerabilidad|colapso/.test(id))  return "fragility";
-  if (/perdida|recuperacion|riesgo/.test(id))        return "risk";
-  if (/reporte/.test(id))                            return "report";
-  if (/gestion|editor/.test(id))                     return "settings";
-  if (/axial|confinamiento/.test(id))                return "column";
-  if (/conexion|acero|biblioteca/.test(id))          return "tool";
-  if (/calculadora/.test(id))                        return "calc";
+  if (/import|conv/.test(id))                              return "import";
+  if (/^gm-spectrum|^gm-fft|^gm-multi/.test(id))          return "wave";
+  if (/^gm-timeseries/.test(id))                           return "seismograph";
+  if (/^gm-intensity/.test(id))                            return "gauge";
+  if (/^gm-nonlinear/.test(id))                            return "curve";
+  if (/^gm-/.test(id))                                     return "seismograph";
+  if (/espectro/.test(id))                                  return "wave";
+  if (/interaccion|diagrama/.test(id))                      return "section";
+  if (/curvatura|fibra/.test(id))                           return "curve";
+  if (/edificio/.test(id))                                  return "building";
+  if (/muros|muro|wall/.test(id))                           return "column";
+  if (/registro|ciclico/.test(id))                          return "seismograph";
+  if (/desempeno|calculo-r|param|r-dif/.test(id))           return "gauge";
+  if (/fragilidad|vulnerabilidad|colapso/.test(id))         return "fragility";
+  if (/perdida|recuperacion|riesgo/.test(id))               return "risk";
+  if (/reporte/.test(id))                                   return "report";
+  if (/gestion|editor/.test(id))                            return "settings";
+  if (/axial|confinamiento/.test(id))                       return "column";
+  if (/conexion|acero|biblioteca/.test(id))                 return "tool";
+  if (/calculadora/.test(id))                               return "calc";
   return "default";
 }
 
@@ -246,8 +255,10 @@ function ProductCard({ product, color, delay }: { product: CatalogProduct; color
 }
 
 // ── Sección de módulo ─────────────────────────────────────────────────────────
+const FALLBACK_COLORS = ["#0e7fa8","#087f5b","#7c3aed","#b45309","#d97706","#dc2626","#0891b2","#6d28d9"];
+
 function ModuleSection({ mod, index }: { mod: CatalogModule; index: number }) {
-  const cfg      = MODULE_CFG[index] ?? MODULE_CFG[0];
+  const cfg = MODULE_CFG[mod.id] ?? { color: FALLBACK_COLORS[index % FALLBACK_COLORS.length], desc: "" };
   const available = mod.products.filter(p => p.route).length;
   const total     = mod.products.length;
   const pct       = Math.round((available / total) * 100);

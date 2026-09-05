@@ -69,26 +69,36 @@ def run_modal(
                 pass
 
         n_stories = len(model.get("stories", {}))
-        max_modes = max(3, 3 * n_stories)
+        # ARPACK requires n_modes < n_DOF strictly.
+        # With rigid diaphragms: n_DOF ≈ 3 × n_stories (Ux, Uy, Rz per floor).
+        # Keep at least 2 fewer modes than estimated DOF to avoid SIGABRT.
+        n_dof_estimate = max(3, 3 * n_stories)
+        max_modes = max(2, n_dof_estimate - 2)
         n_modes   = min(n_modes, max_modes)
-        print(f"[modal] n_stories={n_stories}, n_modes={n_modes}")
+        print(f"[modal] n_stories={n_stories}, n_dof_est={n_dof_estimate}, n_modes={n_modes}")
 
         # ── 3. Construir modelo OpenSees ──────────────────────────────────────
         print("[modal] Construyendo modelo OpenSees…")
+        import openseespy.opensees as ops
         builder = LinearOPSBuilder(model)
         builder.build()
         print("[modal] Modelo construido")
 
-        # ── 4. Eigen con fallback de solvers ──────────────────────────────────
-        import openseespy.opensees as ops
-        eigenvalues = _run_eigen(ops, n_modes)
+        # ── 4-11. Eigen + extracción de resultados en proceso aislado ─────────
+        # os.fork() aísla los SIGABRT de ARPACK/LAPACK para que no maten el worker.
+        modal_raw = _run_eigen_forked(ops, n_modes)
+        ops.wipe()
+
+        eigenvalues   = modal_raw["eigenvalues"]
+        node_coords   = modal_raw["node_coords"]
+        mode_shapes   = modal_raw["mode_shapes"]
+        elements_conn = modal_raw["elements"]
+        pmx           = modal_raw.get("pmx",  [0.0] * len(eigenvalues))
+        pmy           = modal_raw.get("pmy",  [0.0] * len(eigenvalues))
+        pmrz          = modal_raw.get("pmrz", [0.0] * len(eigenvalues))
         print(f"[modal] {len(eigenvalues)} eigenvalores calculados")
 
-        # ── 5. Nodos y coordenadas ────────────────────────────────────────────
-        node_tags   = ops.getNodeTags()
-        node_coords = {tag: [float(c) for c in ops.nodeCoord(tag)] for tag in node_tags}
-
-        # ── 6. Períodos ───────────────────────────────────────────────────────
+        # ── 9. Períodos ───────────────────────────────────────────────────────
         periods = []
         for lam in eigenvalues:
             if lam > 0:
@@ -97,29 +107,7 @@ def run_modal(
             else:
                 periods.append(0.0)
 
-        # ── 7. Masas participativas ───────────────────────────────────────────
-        try:
-            mp   = ops.modalProperties("-return")
-            pmx  = [float(v) for v in mp.get("partiMassRatiosMX",  [])]
-            pmy  = [float(v) for v in mp.get("partiMassRatiosMY",  [])]
-            pmrz = [float(v) for v in mp.get("partiMassRatiosRMZ", [])]
-        except Exception as e:
-            print(f"[modal] modalProperties falló: {e}")
-            pmx = pmy = pmrz = [0.0] * len(periods)
-
-        # ── 8. Formas modales ─────────────────────────────────────────────────
-        mode_shapes: dict[int, dict] = {}
-        for mode in range(1, len(eigenvalues) + 1):
-            shape: dict[int, list] = {}
-            for tag in node_tags:
-                try:
-                    ev = ops.nodeEigenvector(tag, mode)
-                    shape[tag] = [float(v) for v in ev]
-                except Exception:
-                    shape[tag] = [0.0] * 6
-            mode_shapes[mode] = shape
-
-        # ── 9. Tabla de modos ─────────────────────────────────────────────────
+        # ── 10. Tabla de modos ────────────────────────────────────────────────
         modes_table = []
         cum_ux = cum_uy = cum_rz = 0.0
         for i, T in enumerate(periods):
@@ -138,17 +126,14 @@ def run_modal(
                 "Rz_cum":  round(min(cum_rz, 100.0), 2),
             })
 
-        # ── 10. Períodos dominantes ───────────────────────────────────────────
+        # ── 11. Períodos dominantes + viewer ──────────────────────────────────
         T1   = periods[0] if periods else 0.0
         T1_x = _dominant_period(modes_table, "Ux_pct", periods)
         T1_y = _dominant_period(modes_table, "Uy_pct", periods)
 
-        # ── 11. Conectividad para viewer ──────────────────────────────────────
-        elements_conn = _get_elements_connectivity(ops)
-
-        # Formas modales solo con primeros 3 DOF (Ux, Uy, Uz)
+        # mode_shapes del hijo ya son str(tag) → ev[:3] (solo CM nodes)
         shapes_viewer = {
-            str(m): {str(tag): ev[:3] for tag, ev in mode_shapes[m].items()}
+            str(m): mode_shapes.get(str(m), {})
             for m in range(1, len(eigenvalues) + 1)
         }
 
@@ -184,8 +169,6 @@ def run_modal(
         with open(canonical_path, "w", encoding="utf-8") as f:
             json.dump(model, f, ensure_ascii=False, indent=2)
 
-        ops.wipe()
-
         summary = {
             "T1": round(T1, 4), "T1_x": round(T1_x, 4), "T1_y": round(T1_y, 4),
             "num_modes": len(eigenvalues), "n_stories": n_stories,
@@ -202,6 +185,127 @@ def run_modal(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+_CM_TAG_OFFSET = 10_000_000  # nodos CM virtuales (ver ops_builder.py)
+
+
+def _run_eigen_forked(ops, n_modes: int) -> dict:
+    """
+    Tries each eigen solver in its own forked child process (fork from the parent each time).
+    If a solver SIGABRT's the child, the parent's OpenSees state is untouched and the
+    next solver is attempted. Celery worker never dies from a solver crash.
+    """
+    import os
+    import signal as _signal
+    import tempfile
+    import time
+    import json as _json
+
+    solvers = [
+        ((n_modes,),                     "ARPACK"),
+        (("-symmBandLapack", n_modes),   "symmBandLapack"),
+        (("-fullGenLapack",  n_modes),   "fullGenLapack"),
+    ]
+
+    for solver_args, solver_name in solvers:
+        tmp = tempfile.mktemp(suffix=f"_modal_{solver_name}.json")
+
+        pid = os.fork()
+
+        if pid == 0:
+            # ── Child: try ONE solver, write everything, exit ──────────────────
+            for sig in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP):
+                try:
+                    _signal.signal(sig, _signal.SIG_DFL)
+                except Exception:
+                    pass
+            try:
+                lam = ops.eigen(*solver_args)
+                if not lam:
+                    os._exit(1)
+
+                all_tags    = ops.getNodeTags()
+                cm_tags     = [t for t in all_tags if t >= _CM_TAG_OFFSET]
+                viewer_tags = cm_tags if cm_tags else all_tags
+
+                node_coords = {str(t): [float(c) for c in ops.nodeCoord(t)] for t in all_tags}
+
+                mode_shapes: dict[str, dict] = {}
+                for mode in range(1, len(lam) + 1):
+                    shape: dict[str, list] = {}
+                    for tag in viewer_tags:
+                        try:
+                            ev = ops.nodeEigenvector(tag, mode)
+                            shape[str(tag)] = [float(v) for v in ev[:3]]
+                        except Exception:
+                            shape[str(tag)] = [0.0, 0.0, 0.0]
+                    mode_shapes[str(mode)] = shape
+
+                try:
+                    mp   = ops.modalProperties("-return")
+                    pmx  = [float(v) for v in mp.get("partiMassRatiosMX",  [])]
+                    pmy  = [float(v) for v in mp.get("partiMassRatiosMY",  [])]
+                    pmrz = [float(v) for v in mp.get("partiMassRatiosRMZ", [])]
+                except Exception:
+                    n = len(lam)
+                    pmx = pmy = pmrz = [0.0] * n
+
+                elements = _get_elements_connectivity(ops)
+
+                payload = {
+                    "eigenvalues": [float(l) for l in lam],
+                    "node_coords": node_coords,
+                    "mode_shapes": mode_shapes,
+                    "elements":    elements,
+                    "pmx": pmx, "pmy": pmy, "pmrz": pmrz,
+                }
+                with open(tmp, "w") as f:
+                    _json.dump(payload, f)
+                os._exit(0)
+            except Exception:
+                os._exit(1)
+
+        # ── Parent: wait for this child, read result or try next solver ────────
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            finished, status = os.waitpid(pid, os.WNOHANG)
+            if finished != 0:
+                break
+            time.sleep(0.5)
+        else:
+            try:
+                os.kill(pid, _signal.SIGTERM); time.sleep(2)
+                os.kill(pid, _signal.SIGKILL); os.waitpid(pid, 0)
+            except ProcessLookupError:
+                pass
+            print(f"[modal] Solver {solver_name}: timeout — intentando siguiente")
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            continue
+
+        exit_ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        exit_info = os.WEXITSTATUS(status) if os.WIFEXITED(status) else "SIGNAL"
+        print(f"[modal] Solver {solver_name}: exit={exit_info}")
+
+        if exit_ok and os.path.exists(tmp):
+            try:
+                with open(tmp) as f:
+                    data = _json.load(f)
+                os.unlink(tmp)
+                return data
+            except Exception:
+                pass
+
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+    raise RuntimeError(
+        "Todos los solvers eigen fallaron (ARPACK, symmBandLapack, fullGenLapack). "
+        "El modelo tiene problemas numéricos severos. "
+        "Revisa: (1) juntas sin restricción, (2) secciones con A=0 o E=0, "
+        "(3) elementos de longitud cero, (4) advertencias del import_validate."
+    )
+
 
 def _run_eigen(ops, n_modes: int) -> list:
     """Ejecuta ops.eigen() con fallback de solvers.

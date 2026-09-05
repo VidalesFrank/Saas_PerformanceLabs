@@ -296,12 +296,13 @@ class DataValidator:
             valid_joints = set(pd.to_numeric(joints_df["Element Label"], errors="coerce").dropna().astype(int))
             for col in ("Joint I", "Joint J"):
                 refs = pd.to_numeric(frames_df[col], errors="coerce").dropna().astype(int)
+                refs = refs[refs > 0]  # joint 0 = marcador nulo de ETABS, no es huérfano real
                 orphans = refs[~refs.isin(valid_joints)].unique()
                 if len(orphans):
                     issues.append(ValidationIssue(
                         code="ORPHAN_FRAME",
-                        severity="critical",
-                        message=f"{len(orphans)} elemento(s) frame referencian el nodo {col} inexistente.",
+                        severity="warning",
+                        message=f"Nodo(s) {col} no encontrado(s) en la tabla de joints. Los frames huérfanos serán ignorados en el análisis.",
                         location="Objects and Elements - Frames",
                         details={"missing_joints": [int(j) for j in orphans[:10]]},
                     ))
@@ -347,19 +348,26 @@ class DataValidator:
         joint_cols = ["Joint 1", "Joint 2", "Joint 3", "Joint 4"]
         available = [c for c in joint_cols if c in shells_df.columns]
 
-        orphan_count = 0
-        for col in available:
-            refs = pd.to_numeric(shells_df[col], errors="coerce").dropna().astype(int)
-            orphans = refs[~refs.isin(valid_joints)]
-            orphan_count += len(orphans)
+        orphan_shells = 0
+        for _, row in shells_df.iterrows():
+            for col in available:
+                val = pd.to_numeric(row.get(col), errors="coerce")
+                if isinstance(val, float) and math.isnan(val):
+                    continue  # joint vacío
+                ival = int(val)
+                if ival <= 0:
+                    continue  # joint 0 = 4° nodo de shell triangular en ETABS, marcador nulo
+                if ival not in valid_joints:
+                    orphan_shells += 1
+                    break  # basta con 1 joint huérfano real para descartar el shell
 
-        if orphan_count:
+        if orphan_shells:
             issues.append(ValidationIssue(
                 code="ORPHAN_SHELL",
-                severity="critical",
-                message=f"{orphan_count} referencia(s) a nodos inexistentes en elementos shell.",
+                severity="warning",
+                message=f"{orphan_shells} elemento(s) shell con nodo(s) inexistentes. Serán ignorados en el análisis.",
                 location="Objects and Elements - Shells",
-                details={"count": orphan_count},
+                details={"count": orphan_shells},
             ))
 
         # Shells degenerados (nodos repetidos)
