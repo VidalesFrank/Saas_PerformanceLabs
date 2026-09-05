@@ -1,11 +1,12 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { clearToken } from "@/lib/auth";
 
+/** Barra superior de cada herramienta. El logo ya vive en el Sidebar persistente
+ * (ver src/components/sidebar.tsx) — aquí solo va el breadcrumb y las acciones. */
 export function AppHeader({ crumb }: { crumb?: string }) {
   const router = useRouter();
 
@@ -16,18 +17,8 @@ export function AppHeader({ crumb }: { crumb?: string }) {
 
   return (
     <header className="border-b border-border">
-      <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
-        <div className="flex items-center gap-3 font-mono text-sm">
-          <Link href="/dashboard" className="font-semibold tracking-widest text-accent">
-            PERFORMANCE<span className="text-text">LABS</span>
-          </Link>
-          {crumb && (
-            <>
-              <span className="text-text-muted">/</span>
-              <span className="text-text-muted">{crumb}</span>
-            </>
-          )}
-        </div>
+      <div className="flex items-center justify-between px-6 py-4">
+        <div className="font-mono text-sm text-text-muted">{crumb}</div>
         <div className="flex items-center gap-3">
           <ThemeToggle />
           <Button variant="ghost" onClick={logout}>
