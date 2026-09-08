@@ -1,0 +1,6 @@
+# ── Fuerza LF en scripts que corren dentro de contenedores Linux ──────────────
+# En Windows, git puede convertir estos a CRLF al hacer checkout (core.autocrlf),
+# lo que rompe el shebang (#!/bin/bash\r) y produce "exec /entrypoint.sh: no such
+# file or directory" al arrancar el contenedor. Ver docker-compose.prod.yml (api/worker).
+*.sh text eol=lf
+Dockerfile* text eol=lf

@@ -1,0 +1,27 @@
+# ── Evita enviar artefactos locales pesados al build context de Docker ────────
+.git
+.gitignore
+
+# Python
+.venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+
+# Node / Next.js
+apps/web/node_modules
+apps/web/.next
+
+# Datos locales / DB de dev (se montan como volumen, no se copian a la imagen)
+apps/api/data
+**/*.db
+**/*.db-journal
+
+# Claude Code / editor
+.claude
+.vscode
+.idea
+
+# Docs pesados que no hacen falta en la imagen
+*.docx

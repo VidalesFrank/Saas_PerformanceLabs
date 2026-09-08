@@ -18,7 +18,21 @@ from app.routers import wall_projects as wall_projects_router
 
 
 def _create_tables() -> None:
-    Base.metadata.create_all(bind=engine)
+    """
+    En dev (SQLite) es la única forma de crear el esquema. En producción
+    (Postgres) alembic ya corrió las migraciones antes de arrancar uvicorn
+    (ver entrypoint.sh), así que esto normalmente es un no-op — pero con
+    --workers > 1 cada worker ejecuta el lifespan por separado, y dos
+    procesos pueden pasar el checkfirst() de un tipo ENUM casi al mismo
+    tiempo y chocar al crearlo (UniqueViolation). Se ignora esa carrera:
+    el esquema ya quedó creado por la migración o por el worker que ganó.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        Base.metadata.create_all(bind=engine)
+    except SQLAlchemyError as e:
+        print(f"[startup] create_all() omitido (probable carrera entre workers o esquema ya existente): {e}")
 
 
 def _cleanup_orphaned_jobs() -> None:
