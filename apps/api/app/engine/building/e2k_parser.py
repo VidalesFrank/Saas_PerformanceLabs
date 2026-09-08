@@ -90,6 +90,7 @@ class E2KParser:
         self._joint_label: dict = {}           # (pt, story) → int
         self._frame_elem_label: dict = {}      # (line, story) → int
         self._shell_elem_label: dict = {}      # (area, story) → int
+        self._next_label: int = 1              # para labels extra (ver _mint_label)
 
     # ── public ────────────────────────────────────────────────────────────────
 
@@ -129,7 +130,7 @@ class E2KParser:
         df_sh_sec_wall = self._build_shell_sections_wall()
         df_sh_asgn    = self._build_shell_assignments(df_shells)
         df_fr_loads   = self._build_frame_loads_df()
-        df_sh_loads   = self._build_shell_loads_df()
+        df_sh_loads   = self._build_shell_loads_df(df_shells)
         df_col_rebar  = self._build_column_rebar_data()
         df_pier_reinf = self._build_pier_reinforcement_data()
 
@@ -675,6 +676,15 @@ class E2KParser:
         for key in sorted(self.area_assigns.keys()):
             self._shell_elem_label[key] = counter
             counter += 1
+        # Labels adicionales para losas con >4 vértices (ver _mint_label /
+        # _build_oe_shells): cada triángulo extra del abanico necesita su
+        # propio Element Label, distinto de todos los ya asignados arriba.
+        self._next_label = counter
+
+    def _mint_label(self) -> int:
+        label = self._next_label
+        self._next_label += 1
+        return label
 
     def _story_below(self, story: str):
         idx = self.story_order.index(story)
@@ -737,6 +747,8 @@ class E2KParser:
             if raw_atype != 'FLOOR':
                 # Muro (PANEL/WALL): corners 1&2 en story_below (pie del muro),
                 # corners 3&4 en el story actual (cabeza del muro) — igual que columnas.
+                # Los paneles de muro en ETABS siempre son de 4 puntos, no
+                # necesitan triangulación.
                 s_below = self._story_below(story)
                 if s_below is None:
                     js = [self._joint_label.get((p, story), 0) for p in pts[:4]]
@@ -751,22 +763,45 @@ class E2KParser:
                         self._joint_label.get((p2, story),   0),
                         self._joint_label.get((p3, story),   0),
                     ]
+                js_groups = [js]
             else:
-                # Losa: todos los corners en el mismo story
-                js = [self._joint_label.get((p, story), 0) for p in pts[:4]]
-            while len(js) < 4:
-                js.append(js[-1] if js else 0)
+                # Losa: todos los corners en el mismo story.
+                # Polígonos de más de 4 vértices (formas en L, aberturas de
+                # escalera/ascensor) se triangulan en abanico desde pts[0]
+                # para no perder vértices — antes se truncaba a pts[:4] y los
+                # vértices descartados quedaban sin ningún elemento conectado
+                # ni membresía de diafragma: 6 GDL libres y rigidez nula, lo
+                # que vuelve singular la matriz de rigidez global del modal.
+                if len(pts) <= 4:
+                    js_groups = [[self._joint_label.get((p, story), 0) for p in pts[:4]]]
+                else:
+                    js_groups = [
+                        [self._joint_label.get((p, story), 0) for p in (pts[0], pts[i], pts[i + 1])]
+                        for i in range(1, len(pts) - 1)
+                    ]
 
-            rows.append({
-                'Story': story,
-                'Element Label': label,
-                'Area Type': atype,
-                'Area Label': ar,
-                'Joint 1': js[0],
-                'Joint 2': js[1],
-                'Joint 3': js[2],
-                'Joint 4': js[3],
-            })
+            for gi, js in enumerate(js_groups):
+                # Relleno con 0, no repitiendo el último corner: 0 es el
+                # marcador nulo que el resto del pipeline (validator,
+                # CanonicalModelBuilder) ya reconoce como "4° nodo ausente,
+                # shell triangular" — repetir un joint real aquí lo marcaría
+                # como shell degenerado en la validación.
+                while len(js) < 4:
+                    js.append(0)
+                # Cada triángulo extra del abanico necesita su propio Element
+                # Label — solo el primer grupo reutiliza el ya asignado en
+                # _assign_element_labels.
+                row_label = label if gi == 0 else self._mint_label()
+                rows.append({
+                    'Story': story,
+                    'Element Label': row_label,
+                    'Area Type': atype,
+                    'Area Label': ar,
+                    'Joint 1': js[0],
+                    'Joint 2': js[1],
+                    'Joint 3': js[2],
+                    'Joint 4': js[3],
+                })
         return pd.DataFrame(rows)
 
     def _build_floor_connectivity(self, df_shells: pd.DataFrame,
@@ -820,8 +855,13 @@ class E2KParser:
             for _, row in df_joints.iterrows()
         }
 
-        shell_area: dict  = {}
-        shell_centroid: dict = {}
+        # Una losa con >4 vértices ahora puede generar varias filas en
+        # df_shells (triángulos del abanico en _build_oe_shells) que comparten
+        # el mismo Area Label + Story — se guardan todas en una lista en vez
+        # de un dict por (area_label, story) para que no se sobrescriban
+        # entre sí (perdiendo área/masa de los triángulos que no sean el
+        # último procesado).
+        shell_pieces: list[dict] = []
         for _, row in df_shells.iterrows():
             if str(row.get('Area Type', '')).lower() != 'floor':
                 continue
@@ -844,18 +884,21 @@ class E2KParser:
             if area > 1e-9:
                 cx = abs(cx) / (6 * area)
                 cy = abs(cy) / (6 * area)
-            key = (row['Area Label'], row['Story'])
-            shell_area[key]     = area
-            shell_centroid[key] = (cx, cy)
+            shell_pieces.append({
+                'area_label': row['Area Label'], 'story': row['Story'],
+                'area': area, 'cx': cx, 'cy': cy,
+            })
 
         mass_lc_names = {e['lc'] for e in self.mass_source_loads}
 
         rows = []
         for i, story in enumerate(self.story_order[1:], start=1):
             total_mass = cx_sum = cy_sum = mmi = 0.0
-            for (area_label, ar_story), area in shell_area.items():
-                if ar_story != story:
+            for piece in shell_pieces:
+                if piece['story'] != story:
                     continue
+                area_label = piece['area_label']
+                area       = piece['area']
                 asgn = self.area_assigns.get((area_label, story), {})
                 sec  = asgn.get('section', '')
                 sp   = self.slab_props.get(sec, {})
@@ -871,7 +914,7 @@ class E2KParser:
                         m_imp += abs(sl['load']) * area * factor / GRAVITY
 
                 m_shell = m_sw + m_imp
-                cx, cy  = shell_centroid.get((area_label, story), (0.0, 0.0))
+                cx, cy  = piece['cx'], piece['cy']
                 cx_sum  += cx * m_shell
                 cy_sum  += cy * m_shell
                 total_mass += m_shell
@@ -989,17 +1032,29 @@ class E2KParser:
             })
         return pd.DataFrame(rows)
 
-    def _build_shell_loads_df(self) -> pd.DataFrame:
+    def _build_shell_loads_df(self, df_shells: pd.DataFrame) -> pd.DataFrame:
+        # Un AREALOAD de ETABS aplica a toda el área (Area Label). Si esa área
+        # quedó representada por varios elementos (losa >4 vértices,
+        # triangulada en _build_oe_shells), la carga se replica a cada uno de
+        # esos elementos — si no, solo el primer triángulo la recibiría y el
+        # resto quedaría sin carga gravitacional/sísmica de piso.
+        labels_by_area_story: dict[tuple, list[int]] = {}
+        for _, row in df_shells.iterrows():
+            key = (row['Area Label'], row['Story'])
+            labels_by_area_story.setdefault(key, []).append(row['Element Label'])
+
         rows = []
         for sl in self.shell_loads:
             ar    = sl['area']
             story = sl['story']
-            label = self._shell_elem_label.get((ar, story), 0)
-            rows.append({
-                'Story': story, 'Label': ar, 'Unique Name': label,
-                'Load Pattern': sl['lc'], 'Direction': sl['direction'],
-                'Load': sl['load'],
-            })
+            labels = labels_by_area_story.get((ar, story)) \
+                or [self._shell_elem_label.get((ar, story), 0)]
+            for label in labels:
+                rows.append({
+                    'Story': story, 'Label': ar, 'Unique Name': label,
+                    'Load Pattern': sl['lc'], 'Direction': sl['direction'],
+                    'Load': sl['load'],
+                })
         return pd.DataFrame(rows)
 
     def _build_column_rebar_data(self):
