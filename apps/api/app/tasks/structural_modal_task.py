@@ -77,6 +77,27 @@ def run_modal(
         n_modes   = min(n_modes, max_modes)
         print(f"[modal] n_stories={n_stories}, n_dof_est={n_dof_estimate}, n_modes={n_modes}")
 
+        # ── 2b. Chequeo rápido de nodos aislados ────────────────────────────────
+        # Un joint sin ningún frame/shell conectado y sin restricción de apoyo
+        # queda con 6 GDL totalmente libres y rigidez nula: la matriz de rigidez
+        # global es singular y los 3 solvers eigen (ARPACK/symmBandLapack/
+        # fullGenLapack) van a fallar de todas formas — pero solo después de ~8
+        # min combinados. Se detecta aquí en <1s con el grafo del modelo, sin
+        # necesidad de construir OpenSees ni invocar ningún solver.
+        isolated = _find_isolated_joints(model)
+        if isolated:
+            detail = "; ".join(
+                f"{j['label']} (piso {j['story']}, x={j['x']:.2f} y={j['y']:.2f})"
+                for j in isolated[:20]
+            )
+            raise RuntimeError(
+                f"{len(isolated)} nodo(s) del modelo no tienen ningún frame ni shell "
+                f"conectado y no están restringidos (posibles columnas/elementos "
+                f"faltantes en el ETABS original). Con 6 GDL libres y rigidez nula, "
+                f"el análisis eigen fallará. Revisa en ETABS: {detail}"
+                + (" …" if len(isolated) > 20 else "")
+            )
+
         # ── 3. Construir modelo OpenSees ──────────────────────────────────────
         print("[modal] Construyendo modelo OpenSees…")
         import openseespy.opensees as ops
@@ -187,6 +208,41 @@ def run_modal(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 _CM_TAG_OFFSET = 10_000_000  # nodos CM virtuales (ver ops_builder.py)
+
+
+def _find_isolated_joints(model: dict) -> list[dict]:
+    """
+    Devuelve los joints del modelo canónico que no están tocados por ningún
+    frame ni shell y tampoco están restringidos (is_restrained). Puramente
+    sobre el JSON — no requiere OpenSees ni ejecutar ningún solver.
+    """
+    joints = model.get("joints", {})
+    frames = model.get("frames", {})
+    shells = model.get("shells", {})
+
+    touched: set[str] = set()
+    for fd in frames.values():
+        for j in (fd.get("joint_i"), fd.get("joint_j")):
+            if j:
+                touched.add(str(j))
+    for sd in shells.values():
+        for j in sd.get("joints", []):
+            if j:
+                touched.add(str(j))
+
+    isolated = []
+    for label, jd in joints.items():
+        if label in touched:
+            continue
+        if jd.get("is_restrained"):
+            continue
+        isolated.append({
+            "label": label,
+            "story": jd.get("story", "?"),
+            "x": float(jd.get("x", 0.0)),
+            "y": float(jd.get("y", 0.0)),
+        })
+    return isolated
 
 
 def _run_eigen_forked(ops, n_modes: int) -> dict:
