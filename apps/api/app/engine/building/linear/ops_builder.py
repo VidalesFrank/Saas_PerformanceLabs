@@ -112,6 +112,12 @@ class LinearOPSBuilder:
         self._apply_restraints(ops)
         self._create_frame_elements(ops)
         self._create_shell_elements(ops)
+        # Sin esto, el DOF de drilling de los nodos de muro en la base tiene
+        # K≈0 (penalización ShellMITC4) y M=0 → modo espurio de cuerpo
+        # rígido casi-cero que rompe la factorización de Arnoldi de ARPACK
+        # (ver docstring de _add_tiny_mass_to_wall_nodes). Estaba definida
+        # pero nunca se llamaba.
+        self._add_tiny_mass_to_wall_nodes(ops)
         cm_nodes = self._create_cm_nodes_and_masses(ops)
         self._apply_diaphragms(ops, cm_nodes)
 
@@ -134,6 +140,23 @@ class LinearOPSBuilder:
             if sd.get("element_type") == "wall":
                 self._wall_joints.update(sd.get("joints", []))
         used |= self._wall_joints
+
+        # Corners de losa (floor) sin frame ni muro propio: las losas no se
+        # modelan como shell de rigidez (solo los muros — ver
+        # _create_shell_elements), así que estos joints no aportan rigidez
+        # individual. Pero si son corner real de una losa y no se crean como
+        # nodo, quedan totalmente ausentes del dominio OpenSees — invisibles
+        # en el visor 3D y sin desplazamiento propio, aunque su masa sí
+        # llegue al CM del piso (vía "masses", independiente de esto).
+        # Se agregan igual que cualquier nodo "flotante": _apply_diaphragms
+        # ya fija Uz/Rx/Ry en todo joint sin frame ni muro válido conectado
+        # y ata Ux/Uy/Rz al diafragma rígido — no agregan GDL libres nuevos
+        # ni riesgo de singularidad.
+        floor_joints: set[str] = set()
+        for sd in shells.values():
+            if sd.get("element_type") != "wall":
+                floor_joints.update(sd.get("joints", []))
+        used |= floor_joints
 
         self._created_joints = used  # usado en _apply_diaphragms
         self._valid_frame_joints: set[str] = set()  # llenado en _create_frame_elements

@@ -665,9 +665,63 @@ class E2KParser:
 
     # ── element label assignment ──────────────────────────────────────────────
 
+    def _needed_joint_keys(self) -> set:
+        """
+        (punto, story) que necesitan joint label — no solo los que tienen un
+        POINTASSIGN explícito. ETABS no siempre emite POINTASSIGN para un
+        punto que solo actúa como esquina de un AREA/LINE (ej. corner de una
+        losa sin restricción/diafragma propio que declarar): ese punto tiene
+        POINT COORDINATES pero cero líneas POINTASSIGN en todo el archivo.
+        Sin esto, self._joint_label.get((p, story)) devuelve 0 cada vez que
+        se referencia — el corner queda huérfano (filtrado como "0" río
+        abajo) en cada piso donde la losa/línea existe, aunque el punto sí
+        tenga coordenadas válidas.
+        """
+        needed: set = set(self.point_assigns.keys())
+
+        for (ln, story) in self.line_assigns.keys():
+            conn  = self.line_conns.get(ln, {})
+            ltype = conn.get('type', 'BEAM')
+            pt_i  = conn.get('pt_i', '')
+            pt_j  = conn.get('pt_j', '')
+            if ltype == 'COLUMN':
+                # Columna: mismo punto en planta, story actual y el inferior
+                # (ver _build_oe_frames).
+                if pt_i:
+                    needed.add((pt_i, story))
+                    s_below = self._story_below(story)
+                    if s_below is not None:
+                        needed.add((pt_i, s_below))
+            else:
+                if pt_i:
+                    needed.add((pt_i, story))
+                if pt_j:
+                    needed.add((pt_j, story))
+
+        for (ar, story) in self.area_assigns.keys():
+            conn      = self.area_conns.get(ar, {})
+            pts       = conn.get('pts', [])
+            raw_atype = conn.get('type', 'FLOOR').upper()
+            if raw_atype != 'FLOOR':
+                # Muro: corners 1&2 en el story inferior, 3&4 en el actual
+                # (ver _build_oe_shells).
+                s_below = self._story_below(story)
+                for p in pts[:4]:
+                    if not p:
+                        continue
+                    needed.add((p, story))
+                    if s_below is not None:
+                        needed.add((p, s_below))
+            else:
+                for p in pts:
+                    if p:
+                        needed.add((p, story))
+
+        return needed
+
     def _assign_element_labels(self) -> None:
         counter = 1
-        for key in sorted(self.point_assigns.keys()):
+        for key in sorted(self._needed_joint_keys()):
             self._joint_label[key] = counter
             counter += 1
         for key in sorted(self.line_assigns.keys()):
