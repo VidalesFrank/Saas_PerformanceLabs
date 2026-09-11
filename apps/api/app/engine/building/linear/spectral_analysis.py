@@ -172,11 +172,7 @@ class SpectralAnalyzer:
         M_total = M_slab + M_walls
         W_total = M_total * G_m_s2  # kN
 
-        print(
-            f"[spectral] M_slab={M_slab:.2f}t  M_walls={M_walls:.2f}t  "
-            f"M_total={M_total:.2f}t  W_total={W_total:.1f}kN  "
-            f"n_stories={n_stories}  ordered={ordered_stories}"
-        )
+        print(f"[spectral] M_slab={M_slab:.2f}t  M_walls={M_walls:.2f}t  W_total={W_total:.1f}kN")
 
         # ── 4. Formas modales en nodos CM ──────────────────────────────────────
         # shape_x[j, i] = componente X de la forma modal del modo i en el piso j
@@ -192,50 +188,62 @@ class SpectralAnalyzer:
                 shape_x[j, i] = float(ev[0]) if len(ev) > 0 else 0.0
                 shape_y[j, i] = float(ev[1]) if len(ev) > 1 else 0.0
 
-        # ── 5. Cortante modal por dirección ────────────────────────────────────
+        # ── 5. Cortantes modales — dos espectros separados ────────────────────
+        # NSR-10 A.6.2: fuerzas de diseño (reducidas por R) y derivas (elásticas) son
+        # cálculos distintos. Las derivas se verifican con la fuerza sísmica completa
+        # (espectro elástico, sin reducir por R) sin factor Cd adicional (A.6.2.1).
         periods = [row["T"] for row in modes_table]
 
-        Vb_modal_x = np.zeros(n_modes_avail)
-        Vb_modal_y = np.zeros(n_modes_avail)
+        Vb_modal_x        = np.zeros(n_modes_avail)   # diseño: Sa × I/R
+        Vb_modal_y        = np.zeros(n_modes_avail)
+        Vb_modal_x_elastic = np.zeros(n_modes_avail)  # deriva: Sa elástico completo
+        Vb_modal_y_elastic = np.zeros(n_modes_avail)
 
         for i, row in enumerate(modes_table):
             Ti = periods[i]
-            Sa_elastic = _sa_at_period(Ti, puntos)
-            Sa_design  = Sa_elastic * I / R   # espectro de diseño
+            Sa_el = _sa_at_period(Ti, puntos)          # espectro elástico [g]
+            Sa_ds = Sa_el * I / R                       # espectro de diseño
 
             ux_pct = row.get("Ux_pct", 0.0) / 100.0
             uy_pct = row.get("Uy_pct", 0.0) / 100.0
 
-            # Vb = Meff × Sa × g = (pct × W) × Sa [kN]
-            Vb_modal_x[i] = ux_pct * W_total * Sa_design
-            Vb_modal_y[i] = uy_pct * W_total * Sa_design
+            Vb_modal_x[i]         = ux_pct * W_total * Sa_ds
+            Vb_modal_y[i]         = uy_pct * W_total * Sa_ds
+            Vb_modal_x_elastic[i] = ux_pct * W_total * Sa_el
+            Vb_modal_y_elastic[i] = uy_pct * W_total * Sa_el
 
-        print(f"[spectral] T1x={periods[0]:.4f}s  Ux1={modes_table[0].get('Ux_pct',0):.1f}%  Vb1x={Vb_modal_x[0]:.1f}kN")
+        print(f"[spectral] T1x={periods[0]:.4f}s  Ux1={modes_table[0].get('Ux_pct',0):.1f}%  "
+              f"Vb1x_diseno={Vb_modal_x[0]:.1f}kN  Vb1x_deriva={Vb_modal_x_elastic[0]:.1f}kN")
 
         # ── 6. Fuerzas por piso y modo ─────────────────────────────────────────
-        force_x = np.zeros((n_stories, n_modes_avail))
-        force_y = np.zeros((n_stories, n_modes_avail))
-
         masses_x = np.array([story_masses[s]["mass_x"] for s in ordered_stories])
         masses_y = np.array([story_masses[s]["mass_y"] for s in ordered_stories])
 
+        # Fuerza de diseño (para dimensionamiento de secciones y cortantes NSR-10)
+        force_x = np.zeros((n_stories, n_modes_avail))
+        force_y = np.zeros((n_stories, n_modes_avail))
+
+        # Fuerza elástica (para cálculo de derivas NSR-10 A.6.2.1)
+        force_x_el = np.zeros((n_stories, n_modes_avail))
+        force_y_el = np.zeros((n_stories, n_modes_avail))
+
         for i in range(n_modes_avail):
-            # Participación proporcional: F_ji = Vb_i × (m_j × φ_ji) / Σ(m_k × φ_ki)
             wx = masses_x * shape_x[:, i]
             wy = masses_y * shape_y[:, i]
             Lx = np.sum(wx)
             Ly = np.sum(wy)
             if abs(Lx) > 1e-9:
-                force_x[:, i] = Vb_modal_x[i] * wx / Lx
+                force_x[:, i]    = Vb_modal_x[i]         * wx / Lx
+                force_x_el[:, i] = Vb_modal_x_elastic[i] * wx / Lx
             if abs(Ly) > 1e-9:
-                force_y[:, i] = Vb_modal_y[i] * wy / Ly
+                force_y[:, i]    = Vb_modal_y[i]         * wy / Ly
+                force_y_el[:, i] = Vb_modal_y_elastic[i] * wy / Ly
 
         # ── 7. Combinación modal ───────────────────────────────────────────────
         if method == "CQC":
             fx_combined = _cqc_combine(force_x, periods, xi)
             fy_combined = _cqc_combine(force_y, periods, xi)
 
-            # Cortante modal total CQC
             Vb_cqc_x = math.sqrt(sum(
                 _rho_cqc(periods[i], periods[k], xi) * Vb_modal_x[i] * Vb_modal_x[k]
                 for i in range(n_modes_avail) for k in range(n_modes_avail)
@@ -251,10 +259,6 @@ class SpectralAnalyzer:
             Vb_cqc_y = float(np.sqrt(np.sum(Vb_modal_y**2)))
 
         # ── 8. Cortantes de piso (acumulados de techo a base) ─────────────────
-        # Ordenados de techo (top) hacia base: reversed
-        shear_x = np.zeros(n_stories)
-        shear_y = np.zeros(n_stories)
-        # story shear[j] = sum of forces from story j to roof
         shear_x_modal = np.zeros((n_stories, n_modes_avail))
         shear_y_modal = np.zeros((n_stories, n_modes_avail))
         for j in range(n_stories - 1, -1, -1):
@@ -272,10 +276,11 @@ class SpectralAnalyzer:
             shear_x = _srss_combine(shear_x_modal)
             shear_y = _srss_combine(shear_y_modal)
 
-        # ── 9. Desplazamientos y derivas ──────────────────────────────────────
-        # u_ji = F_ji × T_i² / (4π² × m_j)  [m]
-        disp_x_modal = np.zeros((n_stories, n_modes_avail))
-        disp_y_modal = np.zeros((n_stories, n_modes_avail))
+        # ── 9. Desplazamientos elásticos para derivas (NSR-10 A.6.2.1) ────────
+        # δ_e = F_elástica × T²/(4π² × m)  [m]
+        # Derivas = Δδ_e / h  (sin factor Cd; se usa el espectro elástico completo)
+        disp_x_el_modal = np.zeros((n_stories, n_modes_avail))
+        disp_y_el_modal = np.zeros((n_stories, n_modes_avail))
 
         for i in range(n_modes_avail):
             Ti = periods[i]
@@ -284,30 +289,27 @@ class SpectralAnalyzer:
                 mx = story_masses[ordered_stories[j]]["mass_x"]
                 my = story_masses[ordered_stories[j]]["mass_y"]
                 if mx > 1e-9:
-                    disp_x_modal[j, i] = force_x[j, i] * Ti2_4pi2 / mx
+                    disp_x_el_modal[j, i] = force_x_el[j, i] * Ti2_4pi2 / mx
                 if my > 1e-9:
-                    disp_y_modal[j, i] = force_y[j, i] * Ti2_4pi2 / my
+                    disp_y_el_modal[j, i] = force_y_el[j, i] * Ti2_4pi2 / my
 
         if method == "CQC":
-            disp_x = _cqc_combine(disp_x_modal, periods, xi)
-            disp_y = _cqc_combine(disp_y_modal, periods, xi)
+            disp_x = _cqc_combine(disp_x_el_modal, periods, xi)
+            disp_y = _cqc_combine(disp_y_el_modal, periods, xi)
         else:
-            disp_x = _srss_combine(disp_x_modal)
-            disp_y = _srss_combine(disp_y_modal)
+            disp_x = _srss_combine(disp_x_el_modal)
+            disp_y = _srss_combine(disp_y_el_modal)
 
-        print(f"[spectral] disp_x_roof={float(disp_x[-1]):.5f}m  disp_y_roof={float(disp_y[-1]):.5f}m")
-
-        # Factor de amplificación inelástica NSR-10 A.6.2: Cd ≈ R
-        Cd = R
-
-        # Derivas inelásticas (NSR-10 A.6.2.1)
+        # ── 10. Derivas de entrepiso NSR-10 A.6.2.1 ───────────────────────────
+        # Δ_i = (δ_e_i - δ_e_{i-1}) / h_i  [adimensional]
+        # Límite NSR-10 Tabla A.6.4-1: 1% para muros RC, 2% para pórticos
         story_drifts = []
         for j, sname in enumerate(ordered_stories):
-            h_j = float(stories_dict[sname].get("height_m", 0.0))
-            u_j_x = float(disp_x[j]) * Cd
-            u_j_y = float(disp_y[j]) * Cd
-            u_prev_x = float(disp_x[j - 1]) * Cd if j > 0 else 0.0
-            u_prev_y = float(disp_y[j - 1]) * Cd if j > 0 else 0.0
+            h_j    = float(stories_dict[sname].get("height_m", 0.0))
+            u_j_x  = float(disp_x[j])
+            u_j_y  = float(disp_y[j])
+            u_prev_x = float(disp_x[j - 1]) if j > 0 else 0.0
+            u_prev_y = float(disp_y[j - 1]) if j > 0 else 0.0
             delta_x = (u_j_x - u_prev_x) / h_j if h_j > 1e-6 else 0.0
             delta_y = (u_j_y - u_prev_y) / h_j if h_j > 1e-6 else 0.0
             story_drifts.append({
