@@ -73,7 +73,7 @@ class CanonicalModelBuilder:
         materials = self._build_materials()
         sections  = self._build_sections(materials)
         frames    = self._build_frames(sections, joints)
-        shells    = self._build_shells(joints)
+        shells    = self._build_shells(joints, materials)
         masses    = self._build_masses(joints)
         # Self-weight is already included in the ETABS mass summary (slab SW via
         # INCLUDELATERALMASS; vertical elements excluded per INCLUDEVERTICALMASS="No").
@@ -356,7 +356,7 @@ class CanonicalModelBuilder:
 
     # ── Elementos shell ───────────────────────────────────────────────────────
 
-    def _build_shells(self, joints: dict | None = None) -> dict[str, dict]:
+    def _build_shells(self, joints: dict | None = None, materials: dict | None = None) -> dict[str, dict]:
         shells_df = self._rd.get(_K_SHELLS)
         assign_df = self._rd.get(_K_SH_ASSIGN)
         pier_df   = self._rd.get(_K_SH_PIER)
@@ -366,6 +366,8 @@ class CanonicalModelBuilder:
         if not isinstance(shells_df, pd.DataFrame) or len(shells_df) == 0:
             return {}
 
+        if materials is None:
+            materials = {}
         valid_joint_set: set[str] | None = set(joints.keys()) if joints else None
 
         # Mapa pier: element_label → pier_name
@@ -387,16 +389,24 @@ class CanonicalModelBuilder:
                 if lbl and sec:
                     sec_map[lbl] = sec
 
-        # Espesores por sección
+        # Espesores y material por sección
         thickness_map: dict[str, float] = {}
+        section_material_map: dict[str, str] = {}   # section_name → material_name
         for df in (slab_df, wall_df):
-            if isinstance(df, pd.DataFrame) and "Name" in df.columns:
-                thk_col = next((c for c in df.columns if "Thick" in c), None)
+            if not isinstance(df, pd.DataFrame) or "Name" not in df.columns:
+                continue
+            thk_col = next((c for c in df.columns if "Thick" in c), None)
+            mat_col = next((c for c in df.columns if c.lower() in ("material", "mat")), None)
+            for _, r in df.iterrows():
+                n = _safe_str(r.get("Name", ""))
+                if not n:
+                    continue
                 if thk_col:
-                    for _, r in df.iterrows():
-                        n = _safe_str(r.get("Name", ""))
-                        if n:
-                            thickness_map[n] = _to_float(r.get(thk_col))
+                    thickness_map[n] = _to_float(r.get(thk_col))
+                if mat_col:
+                    m = _safe_str(r.get(mat_col, ""))
+                    if m:
+                        section_material_map[n] = m
 
         shells: dict[str, dict] = {}
         for _, row in shells_df.iterrows():
@@ -419,6 +429,10 @@ class CanonicalModelBuilder:
             section = sec_map.get(label) or sec_map.get(area_label) or ""
             element_type = "slab" if area_type.lower() == "floor" else "wall"
 
+            # E_mpa: desde el material asociado a la sección del shell
+            mat_name = section_material_map.get(section, "")
+            E_mpa    = _to_float(materials.get(mat_name, {}).get("E_mpa", 0.0))
+
             shells[label] = {
                 "joints":        corner_joints,
                 "section":       section,
@@ -426,6 +440,7 @@ class CanonicalModelBuilder:
                 "story":         story,
                 "area_label":    area_label,
                 "thickness_m":   thickness_map.get(section, 0.0),
+                "E_mpa":         E_mpa,
                 "pier":          pier_map.get(label) or pier_map.get(area_label) or "",
             }
 

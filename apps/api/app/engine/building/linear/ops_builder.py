@@ -297,9 +297,13 @@ class LinearOPSBuilder:
             h = sd.get("thickness_m", 0.0)
             if h <= 0:
                 h = 0.2
-            # NSR-10 C.10.11.1 / ACI 318-14 Table 6.6.3.1: Ie/Ig = 0.35 para muros fisurados
-            WALL_STIFFNESS_MODIFIER = 0.35
-            E_kPa = (float(sd.get("E_mpa", 0)) * 1000.0 or default_E_kPa) * WALL_STIFFNESS_MODIFIER
+            # E_mpa viene del material de la sección (cargado por model_builder).
+            # stiffness_modifier: leído del E2K si ETABS lo define; default 1.0 (rigidez bruta).
+            # Para análisis NSR-10 con secciones fisuradas, pasar modifier=0.35 en los params
+            # del análisis — NO aplicarlo aquí sin verificar si el ETABS lo tiene.
+            raw_E_kPa = float(sd.get("E_mpa", 0)) * 1000.0 or default_E_kPa
+            modifier  = float(sd.get("stiffness_modifier", 1.0))
+            E_kPa     = raw_E_kPa * modifier
 
             sec_key = (round(E_kPa, 0), nu, round(h, 4))
             if sec_key not in sec_key_to_tag:
