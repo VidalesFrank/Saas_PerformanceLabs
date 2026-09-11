@@ -20,6 +20,8 @@ import ColumnDetailPanel from "@/components/linear/ColumnDetailPanel";
 import BeamDetailPanel from "@/components/linear/BeamDetailPanel";
 import WallsPanel from "@/components/linear/WallsPanel";
 import WallDemandsPanel from "@/components/linear/WallDemandsPanel";
+import WallDesignPanel    from "@/components/linear/WallDesignPanel";
+import NLPushoverPanel   from "@/components/linear/NLPushoverPanel";
 import ModelMaterialsPanel from "@/components/linear/ModelMaterialsPanel";
 import ModelSectionsPanel from "@/components/linear/ModelSectionsPanel";
 import { NonlinearSpecPanel } from "@/components/linear/NonlinearSpecPanel";
@@ -43,6 +45,8 @@ import type {
   BeamDesignDetail,
   FullModelData,
   WallDemandsResult,
+  WallDesignResult,
+  NLPushoverResult,
 } from "@/lib/structural-types";
 import { useRequireAuth } from "@/lib/use-require-auth";
 
@@ -56,6 +60,8 @@ type SectionId =
   | "muros"
   | "sismico"
   | "wall-demands"
+  | "wall-design"
+  | "nl-pushover"
   | "diseno"
   | "no-lineal";
 
@@ -97,7 +103,9 @@ function buildNav(hasSpectral: boolean, isValidated: boolean): NavGroup[] {
       groupLabel: "Análisis",
       items: [
         { id: "sismico", label: "Sísmico + Modal + Espectral", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
-        { id: "wall-demands", label: "Demandas Muros (FHE)", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "wall-demands",  label: "Demandas Muros",          locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "wall-design",   label: "Diseño Muros RC",          locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "nl-pushover",   label: "Pushover No Lineal",       locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
       ],
     },
     {
@@ -217,6 +225,12 @@ export default function StructuralProjectPage() {
   // Resultado demandas de muros FHE
   const [wallDemandsResult, setWallDemandsResult] = useState<WallDemandsResult | null>(null);
 
+  // Resultado diseño de muros RC
+  const [wallDesignResult, setWallDesignResult] = useState<WallDesignResult | null>(null);
+
+  // Resultado pushover no lineal
+  const [nlPushoverResult, setNlPushoverResult] = useState<NLPushoverResult | null>(null);
+
   // Modelo completo para el panel de Muros (carga lazy al entrar al tab)
   const [fullModelData, setFullModelData] = useState<FullModelData | null>(null);
 
@@ -328,6 +342,26 @@ export default function StructuralProjectPage() {
     } catch { /* silencioso */ }
   }, []);
 
+  // Cargar resultado de diseño de muros RC cuando hay un job exitoso
+  const loadWallDesignResult = useCallback(async (jobList: StructuralJob[]) => {
+    const designJob = jobList.find((j) => j.analysis_type === "wall_design" && j.status === "success");
+    if (!designJob) return;
+    try {
+      const result = await structuralAnalysisApi.result<WallDesignResult>(designJob.id);
+      setWallDesignResult(result);
+    } catch { /* silencioso */ }
+  }, []);
+
+  // Cargar resultado de pushover no lineal cuando hay un job exitoso
+  const loadNLPushoverResult = useCallback(async (jobList: StructuralJob[]) => {
+    const pushJob = jobList.find((j) => j.analysis_type === "nl_pushover" && j.status === "success");
+    if (!pushJob) return;
+    try {
+      const result = await structuralAnalysisApi.result<NLPushoverResult>(pushJob.id);
+      setNlPushoverResult(result);
+    } catch { /* silencioso */ }
+  }, []);
+
   // Cargar lista de frames para el navigator
   const loadFrameList = useCallback(async () => {
     try {
@@ -362,6 +396,8 @@ export default function StructuralProjectPage() {
       if (!columnDesignResult)  loadColumnDesignResult(jobs);
       if (!beamDesignResult)    loadBeamDesignResult(jobs);
       if (!wallDemandsResult)   loadWallDemandsResult(jobs);
+      if (!wallDesignResult)    loadWallDesignResult(jobs);
+      if (!nlPushoverResult)    loadNLPushoverResult(jobs);
       if (!frameListData && hasAnyDesign) loadFrameList();
       return;
     }
@@ -379,6 +415,8 @@ export default function StructuralProjectPage() {
         if (!columnDesignResult)  loadColumnDesignResult(jobList);
         if (!beamDesignResult)    loadBeamDesignResult(jobList);
         if (!wallDemandsResult)   loadWallDemandsResult(jobList);
+        if (!wallDesignResult)    loadWallDesignResult(jobList);
+        if (!nlPushoverResult)    loadNLPushoverResult(jobList);
         if (!modelGeometry && proj.canonical_model_path) loadModelGeometry(proj);
         // Recargar frame list cuando un job de diseño acaba de completarse
         const nowHasDesign = jobList.some(
@@ -391,9 +429,10 @@ export default function StructuralProjectPage() {
     }, 3000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [jobs, params.id, validationResult, modalResult, spectralResult, columnDesignResult,
-      beamDesignResult, wallDemandsResult, frameListData, modelGeometry, loadValidationResult,
-      loadModalResult, loadSpectralResult, loadColumnDesignResult, loadBeamDesignResult,
-      loadWallDemandsResult, loadFrameList, loadModelGeometry]);
+      beamDesignResult, wallDemandsResult, wallDesignResult, nlPushoverResult, frameListData,
+      modelGeometry, loadValidationResult, loadModalResult, loadSpectralResult,
+      loadColumnDesignResult, loadBeamDesignResult, loadWallDemandsResult, loadWallDesignResult,
+      loadNLPushoverResult, loadFrameList, loadModelGeometry]);
 
   // ── Acciones ───────────────────────────────────────────────────────────────
 
@@ -447,7 +486,7 @@ export default function StructuralProjectPage() {
     setProject(updated);
   }
 
-  async function handleLaunch(analysisType: "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands") {
+  async function handleLaunch(analysisType: "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands" | "wall_design" | "nl_pushover") {
     if (!project) return;
     setLaunching(analysisType);
     if (analysisType === "design_columns" || analysisType === "design_beams") {
@@ -528,7 +567,9 @@ export default function StructuralProjectPage() {
   const hasSpectral    = jobs.some((j) => j.analysis_type === "spectral" && j.status === "success");
   const hasDesign      = jobs.some((j) => j.analysis_type === "design_columns" && j.status === "success");
   const hasBeamDesign  = jobs.some((j) => j.analysis_type === "design_beams"   && j.status === "success");
-  const hasWallDemands = jobs.some((j) => j.analysis_type === "wall_demands"   && j.status === "success");
+  const hasWallDemands = jobs.some((j) => j.analysis_type === "wall_demands" && j.status === "success");
+  const hasWallDesign  = jobs.some((j) => j.analysis_type === "wall_design"  && j.status === "success");
+  const hasNLPushover  = jobs.some((j) => j.analysis_type === "nl_pushover"  && j.status === "success");
   const activeJobTypes = new Set(
     jobs.filter((j) => j.status === "pending" || j.status === "running").map((j) => j.analysis_type)
   );
@@ -1533,6 +1574,109 @@ export default function StructuralProjectPage() {
               {/* Last job status */}
               {lastJobByType("wall_demands") && (
                 <JobStatusBadge status={lastJobByType("wall_demands")!.status} />
+              )}
+            </div>
+          )}
+
+          {/* ── Diseño Muros RC ──────────────────────────────────────────────── */}
+          {activeSection === "wall-design" && (
+            <div className="mx-auto max-w-6xl px-6 py-8 flex flex-col gap-6">
+              <div>
+                <h1 className="text-xl font-semibold text-[var(--text)]">Diseño de Muros RC — NSR-10 C.21</h1>
+                <p className="text-sm text-[var(--text-muted)] mt-1">
+                  Auto-diseño por pier · P-M interacción · EBE · Cortante ACI 318-25 · 9 verificaciones NSR-10
+                </p>
+              </div>
+
+              <Card>
+                <CardBody className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium text-[var(--text)]">Diseño completo por pier/piso</p>
+                    <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                      Requiere demandas de muros calculadas. Usa fuerzas RSA del espectral si están disponibles.
+                      Produce refuerzo ρ_l, ρ_t, EBE y confinamiento por cada pier de cada piso.
+                    </p>
+                  </div>
+                  <Button
+                    disabled={activeJobTypes.has("wall_design") || !hasWallDemands}
+                    onClick={() => handleLaunch("wall_design")}
+                    title={!hasWallDemands ? "Ejecuta primero el análisis de demandas de muros" : undefined}
+                  >
+                    {activeJobTypes.has("wall_design") ? "Diseñando..." : hasWallDesign ? "Recalcular" : "Diseñar"}
+                  </Button>
+                </CardBody>
+              </Card>
+
+              {hasWallDesign && wallDesignResult && (
+                <WallDesignPanel result={wallDesignResult} />
+              )}
+
+              {activeJobTypes.has("wall_design") && !hasWallDesign && (
+                <Card>
+                  <CardBody>
+                    <p className="text-sm text-[var(--text-muted)] animate-pulse">
+                      Calculando diseño de muros por pier...
+                    </p>
+                  </CardBody>
+                </Card>
+              )}
+
+              {lastJobByType("wall_design") && (
+                <JobStatusBadge status={lastJobByType("wall_design")!.status} />
+              )}
+            </div>
+          )}
+
+          {/* ── Pushover No Lineal ───────────────────────────────────────────── */}
+          {activeSection === "nl-pushover" && (
+            <div className="mx-auto max-w-6xl px-6 py-8 flex flex-col gap-6">
+              <div>
+                <h1 className="text-xl font-semibold text-[var(--text)]">Pushover No Lineal — Edificio de Muros</h1>
+                <p className="text-sm text-[var(--text-muted)] mt-1">
+                  MVLEM_3D con fibras Concrete02 + Steel02 · carga triangular · DisplacementControl · X e Y
+                </p>
+              </div>
+
+              <Card>
+                <CardBody className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium text-[var(--text)]">Pushover X + Y del edificio completo</p>
+                    <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                      Construye modelo no lineal desde el diseño RC por pier. Aplica cargas gravitacionales
+                      y ejecuta pushover triangular hasta {"{target_drift}%"} de deriva de techo.
+                    </p>
+                  </div>
+                  <Button
+                    disabled={activeJobTypes.has("nl_pushover") || !hasWallDesign}
+                    onClick={() => handleLaunch("nl_pushover")}
+                    title={!hasWallDesign ? "Ejecuta primero el diseño de muros RC" : undefined}
+                  >
+                    {activeJobTypes.has("nl_pushover") ? "Calculando..." : hasNLPushover ? "Recalcular" : "Ejecutar"}
+                  </Button>
+                </CardBody>
+              </Card>
+
+              {hasNLPushover && nlPushoverResult && (
+                <NLPushoverPanel result={nlPushoverResult} />
+              )}
+
+              {activeJobTypes.has("nl_pushover") && !hasNLPushover && (
+                <Card>
+                  <CardBody>
+                    <p className="text-sm text-[var(--text-muted)] animate-pulse">
+                      Construyendo modelo no lineal y ejecutando pushover... (puede tardar varios minutos)
+                    </p>
+                  </CardBody>
+                </Card>
+              )}
+
+              {lastJobByType("nl_pushover")?.status === "failed" && (
+                <Card>
+                  <CardBody>
+                    <p className="text-sm text-red-600 font-medium">Error en el pushover no lineal</p>
+                    <p className="text-xs text-[var(--text-muted)] mt-1">{lastJobByType("nl_pushover")?.error_message}</p>
+                  </CardBody>
+                </Card>
               )}
             </div>
           )}

@@ -30,20 +30,24 @@ class WallDemandAnalyzer:
     """
     Parámetros
     ----------
-    build_info     : dict retornado por WallModelBuilder.build()
-    model          : modelo canónico JSON
-    seismic_params : dict con llaves Aa, Av, Fa, Fv, R, importance_factor
-                     (mismo formato que el resto de la plataforma)
+    build_info          : dict retornado por WallModelBuilder.build()
+    model               : modelo canónico JSON
+    seismic_params      : dict con llaves Aa, Av, Fa, Fv, R, importance_factor
+    gravity_overrides   : {"Pier|Story": {"dead_kN": float, "live_kN": float}}
+                          Del GravityOPSBuilder (ShellMITC4 + método 45°)
+    story_forces_rsa    : {"X": {story: Fx_kN}, "Y": {story: Fy_kN}}
+                          Fuerzas por piso del análisis espectral RSA (CQC, ya escaladas
+                          por FHEChecker). Si se proveen, reemplazan el FHE interno.
     """
 
     def __init__(self, build_info: dict, model: dict, seismic_params: dict,
-                 gravity_overrides: dict | None = None):
+                 gravity_overrides: dict | None = None,
+                 story_forces_rsa: dict | None = None):
         self._bi  = build_info
         self._m   = model
         self._sp  = seismic_params
-        # gravity_overrides: {"Pier|Story": {"dead_kN": float, "live_kN": float}}
-        # Del GravityOPSBuilder (ShellMITC4 + método 45°)
         self._gov = gravity_overrides or {}
+        self._rsa = story_forces_rsa   # None → usa FHE interno
 
     # ── API pública ───────────────────────────────────────────────────────────
 
@@ -51,8 +55,8 @@ class WallDemandAnalyzer:
         """
         Retorna:
         {
-            "story_forces":   {X: [...], Y: [...]},       # FHE por piso (kN)
-            "fhe_params":     {T, Cs, W_kN, Vb_kN},
+            "story_forces":   {X: {...}, Y: {...}},        # fuerzas por piso (kN)
+            "fhe_params":     {source, W_kN, Vb_kN, ...},
             "pier_demands":   [{pier, story, combo, Pu, Vu_x, Vu_y, Mu_x, Mu_y}],
             "gravity_axials": {pier|story → P_D_kN},
         }
@@ -65,19 +69,42 @@ class WallDemandAnalyzer:
         stories    = self._bi["stories_order"]
         node_map   = self._bi["node_map"]
 
-        # ── 1. FHE params ─────────────────────────────────────────────────────
+        # ── 1. Peso total (siempre del modelo canónico) ───────────────────────
         masses     = self._m.get("masses", {})
         story_mass = {md["story"]: md["mass_x_t"]
                       for md in masses.values() if "story" in md}
         W_kN       = sum(story_mass.values()) * GRAVITY
-
         hn         = max(self._bi["stories_z"].values())
-        T          = 0.0488 * (hn ** 0.75)      # NSR-10 A.4.2.1 muros
-        Cs, Vb_kN = self._base_shear(W_kN, T)
 
-        story_forces_x, story_forces_y = self._distribute_fhe(
-            Vb_kN, story_mass, stories, T
-        )
+        # ── 2. Fuerzas laterales por piso: RSA o FHE ─────────────────────────
+        if self._rsa:
+            story_forces_x = {s: float(v) for s, v in self._rsa.get("X", {}).items()}
+            story_forces_y = {s: float(v) for s, v in self._rsa.get("Y", {}).items()}
+            Vb_kN  = sum(story_forces_x.values())
+            source = "RSA"
+            print(f"[wall_demands] Fuerzas RSA: Vb_x={Vb_kN:.1f} kN  pisos={len(story_forces_x)}")
+            demand_params = {
+                "hn_m":   round(hn, 2),
+                "source": source,
+                "W_kN":   round(W_kN, 1),
+                "Vb_kN":  round(Vb_kN, 1),
+            }
+        else:
+            T          = 0.0488 * (hn ** 0.75)      # NSR-10 A.4.2.1 muros
+            Cs, Vb_kN = self._base_shear(W_kN, T)
+            story_forces_x, story_forces_y = self._distribute_fhe(
+                Vb_kN, story_mass, stories, T
+            )
+            source = "FHE"
+            print(f"[wall_demands] Fuerzas FHE: T={T:.3f}s  Vb={Vb_kN:.1f} kN")
+            demand_params = {
+                "hn_m":   round(hn, 2),
+                "T_s":    round(T, 3),
+                "Cs":     round(Cs, 5),
+                "source": source,
+                "W_kN":   round(W_kN, 1),
+                "Vb_kN":  round(Vb_kN, 1),
+            }
 
         # ── 2. Fuerzas gravitacionales por pier ──────────────────────────────
         # Si vienen overrides del GravityOPSBuilder (ShellMITC4 + 45°) los usamos.
@@ -106,13 +133,7 @@ class WallDemandAnalyzer:
         combos = self._combine(pier_geom, P_D, P_L, V_x, V_y, M_x, M_y)
 
         return {
-            "fhe_params": {
-                "hn_m":  round(hn, 2),
-                "T_s":   round(T, 3),
-                "Cs":    round(Cs, 5),
-                "W_kN":  round(W_kN, 1),
-                "Vb_kN": round(Vb_kN, 1),
-            },
+            "fhe_params": demand_params,
             "story_forces": {
                 "X": {s: round(story_forces_x.get(s, 0.0), 2) for s in stories},
                 "Y": {s: round(story_forces_y.get(s, 0.0), 2) for s in stories},

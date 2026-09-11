@@ -206,6 +206,8 @@ class StructuralAnalysisType(str, enum.Enum):
     design_columns  = "design_columns"   # Verificación PM de columnas (NSR-10 B.3.4)
     design_beams    = "design_beams"     # Diseño flexión + cortante de vigas (NSR-10)
     wall_demands    = "wall_demands"     # FHE NSR-10 + combinaciones por pier (MVLEM_3D)
+    wall_design     = "wall_design"      # Diseño RC de pieres (NSR-10 C.21): ρ, EBE, estribos
+    nl_pushover     = "nl_pushover"      # Pushover no lineal de edificio de muros (MVLEM_3D)
 
 
 class StructuralJobStatus(str, enum.Enum):

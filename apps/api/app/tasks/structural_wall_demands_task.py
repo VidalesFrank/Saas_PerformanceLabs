@@ -65,6 +65,24 @@ def run_wall_demands(
         # ── 2. Cargar raw_data desde XLSX ─────────────────────────────────────
         raw_data = _load_wall_raw_data(xlsx_path)
 
+        # ── 2b. Fuerzas RSA del análisis espectral (si existe) ────────────────
+        rsa_forces = None
+        spectral_path = os.path.join(work_dir, "results", "spectral_results.json")
+        if os.path.exists(spectral_path):
+            with open(spectral_path, encoding="utf-8") as f:
+                sp_res = json.load(f)
+            rsa_x = sp_res.get("story_forces_x", {})
+            rsa_y = sp_res.get("story_forces_y", {})
+            if rsa_x:
+                rsa_forces = {"X": rsa_x, "Y": rsa_y}
+                vb_x = sum(rsa_x.values())
+                print(f"[wall_demands] spectral_results.json encontrado — "
+                      f"Vb_RSA_x={vb_x:.1f} kN ({len(rsa_x)} pisos)")
+            else:
+                print("[wall_demands] spectral_results.json vacío — usando FHE interno")
+        else:
+            print("[wall_demands] spectral_results.json no encontrado — usando FHE interno")
+
         # ── 3. Parámetros sísmicos ─────────────────────────────────────────────
         seismic = parameters_dict or {}
         if extra_params:
@@ -104,7 +122,8 @@ def run_wall_demands(
         # Inyectar fuerzas gravitacionales del análisis ShellMITC4
         # en el analizador (reemplaza la distribución por área de sección)
         analyzer = WallDemandAnalyzer(binfo, model, seismic,
-                                      gravity_overrides=gravity_result['pier_gravity'])
+                                      gravity_overrides=gravity_result['pier_gravity'],
+                                      story_forces_rsa=rsa_forces)
         result   = analyzer.run()
 
         # ── 7. Guardar resultado ───────────────────────────────────────────────
@@ -133,7 +152,8 @@ def run_wall_demands(
             "story_count":   payload["story_count"],
             "W_kN":          result["fhe_params"]["W_kN"],
             "Vb_kN":         result["fhe_params"]["Vb_kN"],
-            "T_s":           result["fhe_params"]["T_s"],
+            "T_s":           result["fhe_params"].get("T_s"),
+            "source":        result["fhe_params"].get("source", "FHE"),
             "demands_count": len(result["pier_demands"]),
         }
 

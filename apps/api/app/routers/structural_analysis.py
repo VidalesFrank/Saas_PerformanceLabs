@@ -160,6 +160,32 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
                 detail="Configura los parámetros sísmicos NSR-10 antes del análisis de muros.",
             )
 
+    elif payload.analysis_type == StructuralAnalysisType.wall_design:
+        if not project.canonical_model_path:
+            raise HTTPException(
+                status_code=400,
+                detail="El modelo debe estar importado antes del diseño de muros.",
+            )
+        work_dir_wd = os.path.dirname(os.path.dirname(project.canonical_model_path))
+        if not os.path.exists(os.path.join(work_dir_wd, "results", "wall_demands.json")):
+            raise HTTPException(
+                status_code=400,
+                detail="Ejecuta el análisis de demandas de muros antes del diseño.",
+            )
+
+    elif payload.analysis_type == StructuralAnalysisType.nl_pushover:
+        if not project.canonical_model_path:
+            raise HTTPException(
+                status_code=400,
+                detail="El modelo debe estar importado antes del pushover no lineal.",
+            )
+        work_dir_nl = os.path.dirname(os.path.dirname(project.canonical_model_path))
+        if not os.path.exists(os.path.join(work_dir_nl, "results", "wall_design_results.json")):
+            raise HTTPException(
+                status_code=400,
+                detail="Ejecuta el diseño de muros RC antes del pushover no lineal.",
+            )
+
     # Crear el registro del job
     job = StructuralJob(
         analysis_type=payload.analysis_type,
@@ -189,6 +215,8 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
             StructuralAnalysisType.design_columns:  "app.tasks.structural_design_task.run_design_columns",
             StructuralAnalysisType.design_beams:    "app.tasks.structural_beam_task.run_design_beams",
             StructuralAnalysisType.wall_demands:    "app.tasks.structural_wall_demands_task.run_wall_demands",
+            StructuralAnalysisType.wall_design:     "app.tasks.structural_wall_design_task.run_wall_design",
+            StructuralAnalysisType.nl_pushover:     "app.tasks.structural_nl_pushover_task.run_nl_pushover",
         }
 
         kwargs: dict = {
@@ -272,6 +300,40 @@ def get_wall_demands(project_id: str, user: CurrentUser, db: DB):
 
     if not os.path.exists(result_path):
         raise HTTPException(status_code=404, detail="No hay resultados de demandas de muros aún")
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.get("/{project_id}/wall-design")
+def get_wall_design(project_id: str, user: CurrentUser, db: DB):
+    """Retorna el resultado más reciente de wall_design para el proyecto."""
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir    = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    result_path = os.path.join(work_dir, "results", "wall_design_results.json")
+
+    if not os.path.exists(result_path):
+        raise HTTPException(status_code=404, detail="No hay resultados de diseño de muros aún")
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.get("/{project_id}/nl-pushover")
+def get_nl_pushover(project_id: str, user: CurrentUser, db: DB):
+    """Retorna los resultados del pushover no lineal del edificio de muros."""
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir    = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    result_path = os.path.join(work_dir, "results", "nl_pushover_results.json")
+
+    if not os.path.exists(result_path):
+        raise HTTPException(status_code=404, detail="No hay resultados de pushover no lineal aún")
 
     with open(result_path, "r", encoding="utf-8") as f:
         return json.load(f)

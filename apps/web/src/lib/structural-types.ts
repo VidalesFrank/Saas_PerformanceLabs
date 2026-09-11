@@ -1,6 +1,6 @@
 // ── Tipos para el Módulo 1 — Constructor de Modelos Estructurales ─────────────
 
-export type StructuralAnalysisType = "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands";
+export type StructuralAnalysisType = "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands" | "wall_design" | "nl_pushover";
 export type StructuralJobStatus    = "pending" | "running" | "success" | "failed" | "cancelled";
 export type ValidationStatus       = "not_run" | "has_errors" | "has_warnings" | "ok";
 
@@ -839,4 +839,88 @@ export interface WallDemandsResult {
   pier_demands: WallPierDemand[];
   pier_count:   number;
   story_count:  number;
+}
+
+// ── Tipos para diseño de muros (NSR-10 C.21) ──────────────────────────────────
+
+export interface WallDesignRow {
+  pier:            string;
+  story:           string;
+  lw_m:            number;
+  tw_m:            number;
+  hw_m:            number;
+  ok:              boolean;
+  n_failed:        number;
+  max_dcr:         number;
+  ebe_required:    boolean;
+  ebe_method:      string;      // "stress" | "displacement"
+  lc_m:            number;
+  c_m:             number;
+  phi_Mn_kNm:      number;
+  phi_Vn_kN:       number;
+  Vu_kN:           number;
+  governing_combo: string;
+  web_horiz_db_mm: number;
+  web_horiz_sp_mm: number;
+  web_vert_db_mm:  number;
+  web_vert_sp_mm:  number;
+  rho_h_pct:       number;
+  rho_v_pct:       number;
+  be_n_bars:       number;
+  be_db_mm:        number;
+  be_lc_m:         number;
+  error?:          string;
+}
+
+export interface WallDesignResult {
+  status:      string;
+  job_id:      string;
+  project_id:  string;
+  fc_mpa:      number;
+  fy_mpa:      number;
+  ductility:   string;
+  pier_count:  number;
+  n_ok:        number;
+  n_ng:        number;
+  n_ebe:       number;
+  max_dcr:     number;
+  ebe_method:  string;
+  designs:     WallDesignRow[];
+}
+
+// ── Pushover no lineal (Módulo 1 — muros) ────────────────────────────────────
+
+export interface NLPushoverStep {
+  step:           number;
+  displacement_m: number;
+  drift_pct:      number;
+  base_shear_kN:  number;
+}
+
+export interface NLPushoverDirResult {
+  status:           string;
+  direction:        string;
+  converged_steps:  number;
+  total_steps:      number;
+  target_drift_pct: number;
+  steps:            NLPushoverStep[];
+  summary: {
+    max_drift_pct:       number;
+    max_base_shear_kN:   number;
+    last_displacement_m: number;
+  };
+}
+
+export interface NLPushoverResult {
+  status:            string;
+  job_id:            string;
+  project_id:        string;
+  fc_mpa:            number;
+  fy_mpa:            number;
+  target_drift_pct:  number;
+  n_fibers:          number;
+  summary:           Record<string, { status: string; max_drift_pct: number; max_base_shear_kN: number; converged_steps: number; total_steps: number }>;
+  pushover_X?:       NLPushoverDirResult;
+  pushover_Y?:       NLPushoverDirResult;
+  computed_at:       string;
 }
