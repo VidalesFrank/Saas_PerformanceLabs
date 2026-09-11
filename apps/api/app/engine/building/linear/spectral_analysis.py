@@ -138,8 +138,45 @@ class SpectralAnalyzer:
             raise ValueError("No se encontraron pisos con masa asignada en el modelo.")
 
         n_stories = len(ordered_stories)
-        M_total   = sum(story_masses[s]["mass_x"] for s in ordered_stories)   # tonnes
-        W_total   = M_total * 9.81  # kN
+        M_slab    = sum(story_masses[s]["mass_x"] for s in ordered_stories)   # tonnes (solo losas)
+
+        # Masa de muros: auto-peso muros (γ=24 kN/m³) que OpenSees incluye en nodos CM
+        # pero que e2k_parser NO incluye en la tabla MASS SUMMARY (solo losas/floor).
+        # Se calcula igual que LinearOPSBuilder._wall_mass_per_cm_story().
+        GAMMA_kN_m3 = 24.0
+        G_m_s2      = 9.81
+        shells_dict = self._model.get("shells", {})
+        joints_dict = self._model.get("joints", {})
+        M_walls = 0.0
+        for sd_w in shells_dict.values():
+            if sd_w.get("element_type") != "wall":
+                continue
+            jl = sd_w.get("joints", [])
+            if len(jl) != 4:
+                continue
+            t   = float(sd_w.get("thickness_m", 0.0))
+            zb  = float(joints_dict.get(jl[0], {}).get("z", 0.0))
+            zt  = float(joints_dict.get(jl[3], {}).get("z", 0.0))
+            hwall = abs(zt - zb)
+            if hwall < 1e-6:
+                continue
+            xb0 = float(joints_dict.get(jl[0], {}).get("x", 0.0))
+            yb0 = float(joints_dict.get(jl[0], {}).get("y", 0.0))
+            xb1 = float(joints_dict.get(jl[1], {}).get("x", 0.0))
+            yb1 = float(joints_dict.get(jl[1], {}).get("y", 0.0))
+            width = math.sqrt((xb1 - xb0)**2 + (yb1 - yb0)**2)
+            if width < 1e-6:
+                continue
+            M_walls += t * width * hwall * GAMMA_kN_m3 / G_m_s2   # tonnes
+
+        M_total = M_slab + M_walls
+        W_total = M_total * G_m_s2  # kN
+
+        print(
+            f"[spectral] M_slab={M_slab:.2f}t  M_walls={M_walls:.2f}t  "
+            f"M_total={M_total:.2f}t  W_total={W_total:.1f}kN  "
+            f"n_stories={n_stories}  ordered={ordered_stories}"
+        )
 
         # ── 4. Formas modales en nodos CM ──────────────────────────────────────
         # shape_x[j, i] = componente X de la forma modal del modo i en el piso j
@@ -172,6 +209,8 @@ class SpectralAnalyzer:
             # Vb = Meff × Sa × g = (pct × W) × Sa [kN]
             Vb_modal_x[i] = ux_pct * W_total * Sa_design
             Vb_modal_y[i] = uy_pct * W_total * Sa_design
+
+        print(f"[spectral] T1x={periods[0]:.4f}s  Ux1={modes_table[0].get('Ux_pct',0):.1f}%  Vb1x={Vb_modal_x[0]:.1f}kN")
 
         # ── 6. Fuerzas por piso y modo ─────────────────────────────────────────
         force_x = np.zeros((n_stories, n_modes_avail))
@@ -255,6 +294,8 @@ class SpectralAnalyzer:
         else:
             disp_x = _srss_combine(disp_x_modal)
             disp_y = _srss_combine(disp_y_modal)
+
+        print(f"[spectral] disp_x_roof={float(disp_x[-1]):.5f}m  disp_y_roof={float(disp_y[-1]):.5f}m")
 
         # Factor de amplificación inelástica NSR-10 A.6.2: Cd ≈ R
         Cd = R

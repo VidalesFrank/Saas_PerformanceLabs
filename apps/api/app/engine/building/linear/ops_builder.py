@@ -297,7 +297,9 @@ class LinearOPSBuilder:
             h = sd.get("thickness_m", 0.0)
             if h <= 0:
                 h = 0.2
-            E_kPa = float(sd.get("E_mpa", 0)) * 1000.0 or default_E_kPa
+            # NSR-10 C.10.11.1 / ACI 318-14 Table 6.6.3.1: Ie/Ig = 0.35 para muros fisurados
+            WALL_STIFFNESS_MODIFIER = 0.35
+            E_kPa = (float(sd.get("E_mpa", 0)) * 1000.0 or default_E_kPa) * WALL_STIFFNESS_MODIFIER
 
             sec_key = (round(E_kPa, 0), nu, round(h, 4))
             if sec_key not in sec_key_to_tag:
