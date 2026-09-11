@@ -32,3 +32,11 @@ Thumbs.db
 
 # Alembic
 apps/api/alembic/versions/__pycache__/
+
+# Archivos de prueba locales (datos ETABS/Excel, scripts ad-hoc)
+*.e2k
+*.xlsx
+/debug*.py
+/test_*.py
+gm01_test.txt
+apps/api/data/
