@@ -78,23 +78,19 @@ def run_modal(
         print(f"[modal] n_stories={n_stories}, n_dof_est={n_dof_estimate}, n_modes={n_modes}")
 
         # ── 2b. Chequeo rápido de nodos aislados ────────────────────────────────
-        # Un joint sin ningún frame/shell conectado y sin restricción de apoyo
-        # queda con 6 GDL totalmente libres y rigidez nula: la matriz de rigidez
-        # global es singular y los 3 solvers eigen (ARPACK/symmBandLapack/
-        # fullGenLapack) van a fallar de todas formas — pero solo después de ~8
-        # min combinados. Se detecta aquí en <1s con el grafo del modelo, sin
-        # necesidad de construir OpenSees ni invocar ningún solver.
+        # Joints sin frame/shell ni restricción son excluidos automáticamente
+        # por LinearOPSBuilder._create_nodes (filtered via "used" set), así que
+        # NO causan singularidad. Se reportan como advertencia para trazabilidad
+        # pero no bloquean el análisis.
         isolated = _find_isolated_joints(model)
         if isolated:
             detail = "; ".join(
                 f"{j['label']} (piso {j['story']}, x={j['x']:.2f} y={j['y']:.2f})"
                 for j in isolated[:20]
             )
-            raise RuntimeError(
-                f"{len(isolated)} nodo(s) del modelo no tienen ningún frame ni shell "
-                f"conectado y no están restringidos (posibles columnas/elementos "
-                f"faltantes en el ETABS original). Con 6 GDL libres y rigidez nula, "
-                f"el análisis eigen fallará. Revisa en ETABS: {detail}"
+            print(
+                f"[modal] WARN: {len(isolated)} joint(s) aislados (sin frame/shell/apoyo) "
+                f"— excluidos del modelo OpenSees automáticamente: {detail}"
                 + (" …" if len(isolated) > 20 else "")
             )
 
