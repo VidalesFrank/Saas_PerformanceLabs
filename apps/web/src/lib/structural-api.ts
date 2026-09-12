@@ -144,6 +144,12 @@ export const structuralAnalysisApi = {
 
   downloadUrl: (jobId: string) =>
     `${BASE}/analysis/jobs/${jobId}/download`,
+
+  /** Historia comprimida del pushover no lineal para animación de deformada. */
+  nlPushoverHistory: (projectId: string, direction: string, maxFrames = 60) =>
+    req<import("./structural-types").NLPushoverHistory>(
+      `/analysis/${projectId}/nl-pushover/${direction}/history?max_frames=${maxFrames}`,
+    ),
 };
 
 // ── Editor del modelo estructural ────────────────────────────────────────────

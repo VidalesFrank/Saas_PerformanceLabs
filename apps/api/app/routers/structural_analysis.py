@@ -339,6 +339,134 @@ def get_nl_pushover(project_id: str, user: CurrentUser, db: DB):
         return json.load(f)
 
 
+@router.get("/{project_id}/nl-pushover/{direction}/history")
+def get_nl_pushover_history(
+    project_id: str,
+    direction:  str,
+    user:       CurrentUser,
+    db:         DB,
+    max_frames: int = 60,
+):
+    """
+    Retorna la historia comprimida (NPZ) de la deformada del pushover para una
+    dirección, submuestreada a ~max_frames keyframes.
+
+    Response:
+      - direction, total_height_m, drift_cap
+      - frames: [{step, drift_pct, base_shear_kN, disp: {tag: [ux,uy,uz]}}]
+      - pier_lines: array con coords_ref + node_tags de cada pier
+      - pier_damage: [{pier, story, di_effective, damage_level}]
+      - metadata (total pasos, frames capturados, stride)
+    """
+    import numpy as np
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    npz_path = os.path.join(work_dir, "results", f"nl_pushover_{direction.replace('-', 'm')}_history.npz")
+    res_path = os.path.join(work_dir, "results", "nl_pushover_results.json")
+
+    if not os.path.exists(npz_path):
+        raise HTTPException(status_code=404, detail=f"No hay historia NPZ para dirección {direction}")
+    if not os.path.exists(res_path):
+        raise HTTPException(status_code=404, detail="No hay resultados de pushover")
+
+    with open(res_path, "r", encoding="utf-8") as f:
+        results = json.load(f)
+
+    dir_result = results.get(f"pushover_{direction.upper().lstrip('-')}") or (
+        results.get("pushover_X") if direction.upper() in ("X", "-X")
+        else results.get("pushover_Y")
+    )
+    if not dir_result:
+        raise HTTPException(status_code=404, detail=f"Dirección {direction} no encontrada en resultados")
+
+    # ── Carga NPZ ─────────────────────────────────────────────────────────────
+    data = np.load(npz_path, allow_pickle=False)
+    disp_cm  = data["disp_cm"]       # (n_frames, n_cm, 3)
+    disp_top = data["disp_top"]      # (n_frames, n_top, 3)
+    cm_tags  = data["cm_tags"].tolist()
+    top_tags = data["top_tags"].tolist()
+
+    n_captured = int(disp_cm.shape[0])
+    if n_captured == 0:
+        raise HTTPException(status_code=404, detail="Historia vacía")
+
+    # ── Submuestreo uniforme a max_frames ─────────────────────────────────────
+    if n_captured > max_frames:
+        idx = np.linspace(0, n_captured - 1, max_frames, dtype=int)
+    else:
+        idx = np.arange(n_captured)
+
+    # Mapa paso → step_data del pushover (steps del result JSON)
+    steps_pushover = dir_result.get("steps", [])
+    # Como history_stride puede ser >1, el índice del frame no equivale al step
+    # directo. Usamos la relación: frame_i corresponde al step (i+1)*stride (aprox).
+    hist_meta   = dir_result.get("history", {})
+    stride      = int(hist_meta.get("stride", 1))
+
+    frames_out = []
+    for fi in idx:
+        # Aproximación al step del pushover
+        step_num = int((fi + 1) * stride)
+        if step_num <= 0 or step_num > len(steps_pushover):
+            step_num = min(len(steps_pushover), step_num)
+        s = steps_pushover[step_num - 1] if 0 < step_num <= len(steps_pushover) else {}
+
+        disp_map: dict[str, list[float]] = {}
+        for j, tag in enumerate(cm_tags):
+            u = disp_cm[fi, j]
+            disp_map[str(int(tag))] = [float(u[0]), float(u[1]), float(u[2])]
+        for j, tag in enumerate(top_tags):
+            u = disp_top[fi, j]
+            disp_map[str(int(tag))] = [float(u[0]), float(u[1]), float(u[2])]
+
+        frames_out.append({
+            "frame":         int(fi),
+            "step":          step_num,
+            "drift_pct":     s.get("drift_pct", 0.0),
+            "base_shear_kN": s.get("base_shear_kN", 0.0),
+            "disp":          disp_map,
+        })
+
+    # ── Damage index por pier (rank global) ───────────────────────────────────
+    damage = dir_result.get("damage", {})
+    pier_damage = damage.get("pier_damage", [])
+    damage_by_pier_story = {
+        (r["pier"], r["story"]): {
+            "di":     r["di_effective"],
+            "di_base": r["di_base"],
+            "level":  r["damage_level"],
+            "drift_pct": r["drift_pct"],
+        }
+        for r in pier_damage
+    }
+
+    # ── Enriquece pier_lines con daño para el frontend ────────────────────────
+    pier_lines_out = []
+    for pl in dir_result.get("pier_lines", []):
+        key = (pl["pier"], pl["story"])
+        d = damage_by_pier_story.get(key, {"di": 0.0, "level": "none", "drift_pct": 0.0})
+        pier_lines_out.append({**pl, "damage": d})
+
+    return {
+        "direction":      direction,
+        "total_height_m": dir_result.get("total_height", 0.0),
+        "target_drift_pct": dir_result.get("target_drift_pct", 2.0),
+        "drift_cap":      damage.get("drift_cap", 0.015),
+        "n_frames":       len(frames_out),
+        "n_captured":     n_captured,
+        "n_total_steps":  dir_result.get("total_steps", 0),
+        "stride":         stride,
+        "frames":         frames_out,
+        "pier_lines":     pier_lines_out,
+        "story_drifts":   damage.get("story_drifts", []),
+        "summary":        dir_result.get("summary", {}),
+    }
+
+
 @router.delete("/jobs/{job_id}/cancel", status_code=200)
 def cancel_job(job_id: str, user: CurrentUser, db: DB):
     """Cancela un job activo (pending o running)."""

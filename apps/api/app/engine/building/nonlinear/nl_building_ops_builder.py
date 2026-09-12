@@ -130,6 +130,32 @@ class NLBuildingOPSBuilder:
         roof      = self._stories_order[-1] if self._stories_order else ""
         ctrl_node = self._cm_map.get(roof, {}).get("tag")
 
+        # Metadata para reconstruir cada pier deformable en el frontend:
+        # asocia tag de nodo (ni,nj,nk,nl) → coords de referencia y (pier,story).
+        pier_lines: list[dict] = []
+        for (pier, story), g in self._pier_geom.items():
+            idx = g["story_idx"]
+            pier_lines.append({
+                "pier":       pier,
+                "story":      story,
+                "story_idx":  idx,
+                "coords_ref": {
+                    "base_left":  [g["x1"], g["y1"], g["z_base"]],
+                    "base_right": [g["x2"], g["y2"], g["z_base"]],
+                    "top_right":  [g["x2"], g["y2"], g["z_top"]],
+                    "top_left":   [g["x1"], g["y1"], g["z_top"]],
+                },
+                "node_tags": {
+                    "base_left":  self._node_map[(pier, idx - 1, 0)],
+                    "base_right": self._node_map[(pier, idx - 1, 1)],
+                    "top_right":  self._node_map[(pier, idx,     1)],
+                    "top_left":   self._node_map[(pier, idx,     0)],
+                },
+                "lw_m": g["lw"],
+                "tw_m": g["tw"],
+                "hw_m": g["hw"],
+            })
+
         return {
             "cm_nodes":      self._cm_map,
             "base_nodes":    self._base_nodes,
@@ -138,6 +164,7 @@ class NLBuildingOPSBuilder:
             "stories_z":     self._stories_z,
             "total_height":  total_h,
             "pier_elements": self._ele_map,
+            "pier_lines":    pier_lines,
         }
 
     def run_gravity(

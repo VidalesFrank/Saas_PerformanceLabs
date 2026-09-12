@@ -1657,7 +1657,7 @@ export default function StructuralProjectPage() {
               </Card>
 
               {hasNLPushover && nlPushoverResult && (
-                <NLPushoverPanel result={nlPushoverResult} />
+                <NLPushoverPanel result={nlPushoverResult} projectId={project.id} />
               )}
 
               {activeJobTypes.has("nl_pushover") && !hasNLPushover && (

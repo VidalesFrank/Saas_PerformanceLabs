@@ -1,14 +1,20 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { NLPushoverResult, NLPushoverDirResult } from "@/lib/structural-types";
+import DeformedShape3D    from "./DeformedShape3D";
+import CriticalPiersPanel from "./CriticalPiersPanel";
 
 interface Props {
-  result: NLPushoverResult;
+  result:    NLPushoverResult;
+  projectId: string;
 }
 
-export default function NLPushoverPanel({ result }: Props) {
+export default function NLPushoverPanel({ result, projectId }: Props) {
   const { pushover_X, pushover_Y, summary, fc_mpa, fy_mpa, target_drift_pct } = result;
+  const [defDir, setDefDir] = useState<"X" | "Y">(
+    pushover_X?.status === "success" || pushover_X?.status === "partial" ? "X" : "Y"
+  );
 
   return (
     <div className="flex flex-col gap-5">
@@ -68,6 +74,47 @@ export default function NLPushoverPanel({ result }: Props) {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         {pushover_X && <PushoverChart dir="X" data={pushover_X} color="#3b82f6" />}
         {pushover_Y && <PushoverChart dir="Y" data={pushover_Y} color="#22c55e" />}
+      </div>
+
+      {/* ── Deformada 3D animada ─────────────────────────────────────────────── */}
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center gap-3">
+          <h3 className="text-sm font-semibold text-[var(--text)] uppercase tracking-wider">
+            Deformada 3D con Coloreo por Daño
+          </h3>
+          <div className="flex items-center gap-1">
+            {(["X", "Y"] as const).map((d) => {
+              const dirResult = d === "X" ? pushover_X : pushover_Y;
+              const enabled = dirResult?.status === "success" || dirResult?.status === "partial";
+              return (
+                <button
+                  key={d}
+                  onClick={() => enabled && setDefDir(d)}
+                  disabled={!enabled}
+                  className={[
+                    "px-2.5 py-1 rounded text-[11px] font-medium transition-colors",
+                    defDir === d
+                      ? "bg-[var(--accent)] text-white"
+                      : enabled
+                      ? "bg-[var(--surface-2)] text-[var(--text-muted)] hover:text-[var(--text)]"
+                      : "bg-[var(--surface-2)] text-[var(--text-muted)] opacity-40 cursor-not-allowed",
+                  ].join(" ")}
+                >
+                  Dir {d}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <DeformedShape3D projectId={projectId} direction={defDir} height={520} />
+      </div>
+
+      {/* ── Ranking de pieres críticos ───────────────────────────────────────── */}
+      <div className="flex flex-col gap-2">
+        <h3 className="text-sm font-semibold text-[var(--text)] uppercase tracking-wider">
+          Elementos Críticos
+        </h3>
+        <CriticalPiersPanel result={result} />
       </div>
 
     </div>

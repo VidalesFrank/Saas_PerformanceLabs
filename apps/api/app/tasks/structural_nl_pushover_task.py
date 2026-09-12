@@ -151,6 +151,10 @@ def run_nl_pushover(
                     history_path     = hist_path,
                     history_stride   = int(params.get("history_stride", 1)),
                 )
+                # Se persiste pier_lines para reconstruir la deformada en frontend
+                push_result["pier_lines"]   = info["pier_lines"]
+                push_result["stories_z"]    = info["stories_z"]
+                push_result["total_height"] = info["total_height"]
                 print(
                     f"[nl_pushover] Pushover {direction}: {push_result['status']} "
                     f"| {push_result['converged_steps']}/{push_result['total_steps']} pasos "

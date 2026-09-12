@@ -921,8 +921,72 @@ export interface NLPushoverResult {
   fy_mpa:            number;
   target_drift_pct:  number;
   n_fibers:          number;
-  summary:           Record<string, { status: string; max_drift_pct: number; max_base_shear_kN: number; converged_steps: number; total_steps: number }>;
+  summary:           Record<string, { status: string; max_drift_pct: number; max_base_shear_kN: number; converged_steps: number; total_steps: number; n_critical_piers?: number; max_di?: number }>;
   pushover_X?:       NLPushoverDirResult;
   pushover_Y?:       NLPushoverDirResult;
   computed_at:       string;
+}
+
+// ── Historia de deformada para animación 3D ──────────────────────────────────
+
+export type DamageLevel = "none" | "minor" | "moderate" | "severe" | "collapse";
+
+export interface PierLineDeformable {
+  pier:       string;
+  story:      string;
+  story_idx:  number;
+  coords_ref: {
+    base_left:  [number, number, number];
+    base_right: [number, number, number];
+    top_right:  [number, number, number];
+    top_left:   [number, number, number];
+  };
+  node_tags: {
+    base_left:  number;
+    base_right: number;
+    top_right:  number;
+    top_left:   number;
+  };
+  lw_m: number;
+  tw_m: number;
+  hw_m: number;
+  damage: {
+    di:          number;
+    di_base:     number;
+    level:       DamageLevel;
+    drift_pct:   number;
+  };
+}
+
+export interface NLPushoverFrame {
+  frame:          number;
+  step:           number;
+  drift_pct:      number;
+  base_shear_kN:  number;
+  disp:           Record<string, [number, number, number]>;
+}
+
+export interface StoryDrift {
+  story:         string;
+  z_m:           number;
+  max_drift_pct: number;
+}
+
+export interface NLPushoverHistory {
+  direction:        string;
+  total_height_m:   number;
+  target_drift_pct: number;
+  drift_cap:        number;
+  n_frames:         number;
+  n_captured:       number;
+  n_total_steps:    number;
+  stride:           number;
+  frames:           NLPushoverFrame[];
+  pier_lines:       PierLineDeformable[];
+  story_drifts:     StoryDrift[];
+  summary?: {
+    max_drift_pct:       number;
+    max_base_shear_kN:   number;
+    last_displacement_m: number;
+  };
 }
