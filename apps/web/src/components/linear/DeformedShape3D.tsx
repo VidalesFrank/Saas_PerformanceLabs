@@ -19,9 +19,11 @@ import type {
 } from "@/lib/structural-types";
 
 interface Props {
-  projectId: string;
-  direction: string; // "X" | "Y" | "-X" | "-Y"
-  height?:   number; // px, default 520
+  projectId:      string;
+  direction:      string; // "X" | "Y" | "-X" | "-Y"
+  height?:        number; // px, default 520
+  onSelectPier?:  (pier: string, story: string) => void;
+  selectedPier?:  { pier: string; story: string } | null;
 }
 
 // ── Colores por nivel de daño (verde→amarillo→rojo) ──────────────────────────
@@ -122,7 +124,7 @@ function buildDamageTrace(
 
 // ═════════════════════════════════════════════════════════════════════════════
 
-export default function DeformedShape3D({ projectId, direction, height = 520 }: Props) {
+export default function DeformedShape3D({ projectId, direction, height = 520, onSelectPier, selectedPier }: Props) {
   const plotlyReady = usePlotly();
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -179,8 +181,41 @@ export default function DeformedShape3D({ projectId, direction, height = 520 }: 
       out.push(buildDamageTrace(piers, disp, amp, DAMAGE_COLOR[lvl], `${DAMAGE_LABEL[lvl]} (${piers.length})`));
     });
 
+    // Overlay de picking: markers casi invisibles en el centroide de cada pier
+    // deformado (mesh3d no soporta plotly_click). Este overlay sí es clickable.
+    if (onSelectPier && history.pier_lines.length > 0) {
+      const xs:number[]=[], ys:number[]=[], zs:number[]=[];
+      const cd: {pier:string; story:string; level:DamageLevel; di:number}[] = [];
+      for (const pl of history.pier_lines) {
+        const v = pierVertices(pl, disp, amp);
+        xs.push((v.x[0]+v.x[1]+v.x[2]+v.x[3])/4);
+        ys.push((v.y[0]+v.y[1]+v.y[2]+v.y[3])/4);
+        zs.push((v.z[0]+v.z[1]+v.z[2]+v.z[3])/4);
+        cd.push({ pier: pl.pier, story: pl.story, level: pl.damage.level, di: pl.damage.di });
+      }
+      out.push({
+        type: "scatter3d", mode: "markers", x: xs, y: ys, z: zs, customdata: cd,
+        marker: { size: 12, color: "rgba(0,0,0,0)", opacity: 0.02 },
+        hoverinfo: "skip", showlegend: false, name: "__pier_picker",
+      });
+    }
+
+    // Highlight del pier seleccionado (contorno amarillo)
+    if (selectedPier) {
+      const pl = history.pier_lines.find((p) => p.pier === selectedPier.pier && p.story === selectedPier.story);
+      if (pl) {
+        const v = pierVertices(pl, disp, amp);
+        out.push({
+          type: "scatter3d", mode: "lines",
+          x: [...v.x, v.x[0]], y: [...v.y, v.y[0]], z: [...v.z, v.z[0]],
+          line: { color: "#f59e0b", width: 6 },
+          hoverinfo: "skip", showlegend: false, name: "__pier_selected",
+        });
+      }
+    }
+
     return out;
-  }, [history, currentFrame, groups, amp, showRef]);
+  }, [history, currentFrame, groups, amp, showRef, onSelectPier, selectedPier]);
 
   // ── Render Plotly ───────────────────────────────────────────────────────────
   const initialized = useRef(false);
@@ -208,6 +243,27 @@ export default function DeformedShape3D({ projectId, direction, height = 520 }: 
       Plotly.react(containerRef.current, traces, layout, { responsive: true, displayModeBar: false });
     }
   }, [plotlyReady, traces]);
+
+  // ── Click handler para selección de pier ──────────────────────────────────
+  const onSelectRef = useRef(onSelectPier);
+  onSelectRef.current = onSelectPier;
+  useEffect(() => {
+    if (!plotlyReady || !containerRef.current || !onSelectPier) return;
+    const el = containerRef.current;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = (data: any) => {
+      const pt = data?.points?.[0];
+      if (!pt?.customdata) return;
+      const info = pt.customdata as { pier?: string; story?: string };
+      if (info.pier && info.story) onSelectRef.current?.(info.pier, info.story);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (el as any).on?.("plotly_click", handler);
+    return () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      try { (el as any).removeListener?.("plotly_click", handler); } catch { /* noop */ }
+    };
+  }, [plotlyReady, onSelectPier]);
 
   // ── Animación play/pause con requestAnimationFrame ─────────────────────────
   useEffect(() => {

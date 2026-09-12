@@ -467,6 +467,191 @@ def get_nl_pushover_history(
     }
 
 
+@router.get("/{project_id}/nl-pushover/{direction}/pier-response")
+def get_nl_pushover_pier_response(
+    project_id: str,
+    direction:  str,
+    user:       CurrentUser,
+    db:         DB,
+    pier:       str,
+    story:      str,
+):
+    """
+    Respuesta local de UN pier específico durante el pushover:
+      - M-φ  (momento-curvatura estimada) en base del muro, plano de flexión
+      - V-δ  (cortante-desplazamiento) proyectado en dirección del muro
+
+    Estimaciones:
+      - M_base : proyección de (Mx,My) en base sobre normal horizontal al muro
+      - V_base : proyección de (Fx,Fy) en base sobre dirección del muro
+      - δ_top  : (u_top - u_bot) · d̂
+      - φ      : drift / lp con lp = 0.5·lw (Priestley 2007, rótula plástica)
+    """
+    import numpy as np
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    npz_path = os.path.join(work_dir, "results", f"nl_pushover_{direction.replace('-', 'm')}_history.npz")
+    res_path = os.path.join(work_dir, "results", "nl_pushover_results.json")
+
+    if not os.path.exists(npz_path) or not os.path.exists(res_path):
+        raise HTTPException(status_code=404, detail="Historia del pushover no disponible")
+
+    with open(res_path, "r", encoding="utf-8") as f:
+        results = json.load(f)
+
+    dir_key    = "pushover_X" if direction.upper().lstrip("-") == "X" else "pushover_Y"
+    dir_result = results.get(dir_key)
+    if not dir_result:
+        raise HTTPException(status_code=404, detail=f"Dirección {direction} no encontrada")
+
+    # ── Localiza el pier en el metadata ───────────────────────────────────────
+    pier_lines: list[dict] = dir_result.get("pier_lines", [])
+    pl = next((p for p in pier_lines if p["pier"] == pier and p["story"] == story), None)
+    if not pl:
+        raise HTTPException(status_code=404, detail=f"Pier {pier}/{story} no encontrado")
+
+    c_ref     = pl["coords_ref"]
+    lw        = float(pl["lw_m"])
+    hw        = float(pl["hw_m"])
+    x1, y1, _ = c_ref["base_left"]
+    x2, y2, _ = c_ref["base_right"]
+    dx, dy    = x2 - x1, y2 - y1
+    d_norm    = (dx*dx + dy*dy) ** 0.5 or 1.0
+    d         = (dx / d_norm, dy / d_norm)             # dirección del muro en planta
+    n         = (-d[1], d[0])                          # normal horizontal al muro
+
+    n_bl = int(pl["node_tags"]["base_left"])
+    n_br = int(pl["node_tags"]["base_right"])
+    n_tl = int(pl["node_tags"]["top_left"])
+    n_tr = int(pl["node_tags"]["top_right"])
+
+    # Buscar el índice del elemento MVLEM_3D asociado a este pier (para eleForce).
+    # Necesitamos leer el mapping pier→element del builder. Como el NPZ solo tiene
+    # ele_tags[], iteramos y buscamos el que tenga estos nodos base.
+    data = np.load(npz_path, allow_pickle=False)
+    ele_tags = data["ele_tags"].tolist()
+    top_tags = data["top_tags"].tolist()
+    cm_tags  = data["cm_tags"].tolist()
+
+    # Índices en top_tags para los top nodes del pier
+    try:
+        i_tl = top_tags.index(n_tl)
+        i_tr = top_tags.index(n_tr)
+    except ValueError:
+        raise HTTPException(status_code=500, detail=f"Nodos top del pier no en NPZ")
+
+    # ── Encuentra el índice del elemento MVLEM_3D del pier ───────────────────
+    # El result JSON tiene "elements" en history con {tag, pier, story}
+    hist_meta = dir_result.get("history", {})
+    ele_meta  = hist_meta.get("elements", [])
+    ele_tag_target = next((e["tag"] for e in ele_meta if e["pier"] == pier and e["story"] == story), None)
+    if ele_tag_target is None or ele_tag_target not in ele_tags:
+        raise HTTPException(status_code=500, detail="Elemento MVLEM_3D del pier no localizado")
+    ele_idx = ele_tags.index(ele_tag_target)
+
+    # ── Extrae historia frame por frame ──────────────────────────────────────
+    disp_top   = data["disp_top"]     # (n_frames, n_top, 3)
+    ele_force  = data["ele_force"]    # (n_frames, n_ele, 24)
+    n_frames   = disp_top.shape[0]
+
+    steps_meta = dir_result.get("steps", [])
+    stride     = int(hist_meta.get("stride", 1))
+
+    lp = 0.5 * lw  # longitud de rótula plástica (Priestley 2007)
+
+    m_phi_curve: list[dict] = []
+    v_delta_curve: list[dict] = []
+
+    for fi in range(n_frames):
+        # Desplazamiento del top (promedio de las 2 esquinas)
+        u_tl = disp_top[fi, i_tl]
+        u_tr = disp_top[fi, i_tr]
+        u_top = ((float(u_tl[0]) + float(u_tr[0])) / 2.0,
+                 (float(u_tl[1]) + float(u_tr[1])) / 2.0,
+                 (float(u_tl[2]) + float(u_tr[2])) / 2.0)
+
+        # Base fija (u_bot ≈ 0). Proyección sobre dirección del muro
+        delta = u_top[0] * d[0] + u_top[1] * d[1]
+        drift = abs(delta) / hw if hw > 0 else 0.0
+        phi   = drift / lp if lp > 0 else 0.0            # 1/m
+
+        # Fuerzas en base: nodos i (base_left) y j (base_right)
+        # Layout eleForce: [F_i_x, F_i_y, F_i_z, M_i_x, M_i_y, M_i_z, F_j_x, ...]
+        ef = ele_force[fi, ele_idx]
+        if len(ef) < 24:
+            continue
+        Fix, Fiy, _, Mix, Miy, _ = float(ef[0]),  float(ef[1]),  float(ef[2]),  float(ef[3]),  float(ef[4]),  float(ef[5])
+        Fjx, Fjy, _, Mjx, Mjy, _ = float(ef[6]),  float(ef[7]),  float(ef[8]),  float(ef[9]),  float(ef[10]), float(ef[11])
+
+        # Cortante base proyectado en la dirección del muro (nótese signo:
+        # eleForce da la fuerza del elemento sobre el nodo; para tener el cortante
+        # base "reacción" tomamos signo positivo)
+        V_base = (Fix + Fjx) * d[0] + (Fiy + Fjy) * d[1]
+
+        # Momento flector en plano proyectado sobre n = (-dy, dx)
+        Mx_tot = Mix + Mjx
+        My_tot = Miy + Mjy
+        M_base = Mx_tot * n[0] + My_tot * n[1]
+
+        step_num = min(len(steps_meta), (fi + 1) * stride)
+        s = steps_meta[step_num - 1] if 0 < step_num <= len(steps_meta) else {}
+
+        m_phi_curve.append({
+            "step":         step_num,
+            "phi_1_per_m":  round(phi, 6),
+            "moment_kNm":   round(abs(M_base), 2),
+            "drift_pct":    s.get("drift_pct", 0.0),
+        })
+        v_delta_curve.append({
+            "step":         step_num,
+            "delta_m":      round(delta, 6),
+            "shear_kN":     round(V_base, 2),
+            "drift_pct":    s.get("drift_pct", 0.0),
+        })
+
+    # ── Estimaciones de fluencia (heurística basada en cambio de pendiente) ──
+    def _detect_yield(curve: list[dict], x_key: str, y_key: str) -> dict | None:
+        if len(curve) < 6:
+            return None
+        # Aproxima punto de fluencia como cuando la pendiente cae al 70% de la
+        # pendiente inicial (secante).
+        xs = [p[x_key] for p in curve]
+        ys = [abs(p[y_key]) for p in curve]
+        y_max = max(ys) or 1.0
+        # Pendiente inicial elástica: primeros 3 puntos
+        if xs[2] - xs[0] == 0:
+            return None
+        k0 = (ys[2] - ys[0]) / (xs[2] - xs[0])
+        for i in range(3, len(curve)):
+            if xs[i] - xs[0] == 0:
+                continue
+            k_i = (ys[i] - ys[0]) / (xs[i] - xs[0])
+            if k_i < 0.7 * k0 and ys[i] > 0.4 * y_max:
+                return {**curve[i], "note": "yield_estimate"}
+        return None
+
+    return {
+        "pier":        pier,
+        "story":       story,
+        "direction":   direction,
+        "lw_m":        lw,
+        "hw_m":        hw,
+        "lp_m":        lp,
+        "damage":      next(
+            (p["damage"] for p in results.get(dir_key, {}).get("pier_lines", []) if p["pier"] == pier and p["story"] == story),
+            None,
+        ) if "damage" in (pier_lines[0] if pier_lines else {}) else None,
+        "M_phi":       m_phi_curve,
+        "V_delta":     v_delta_curve,
+        "yield_M_phi": _detect_yield(m_phi_curve, "phi_1_per_m", "moment_kNm"),
+        "yield_V_delta": _detect_yield(v_delta_curve, "delta_m", "shear_kN"),
+    }
+
+
 @router.delete("/jobs/{job_id}/cancel", status_code=200)
 def cancel_job(job_id: str, user: CurrentUser, db: DB):
     """Cancela un job activo (pending o running)."""

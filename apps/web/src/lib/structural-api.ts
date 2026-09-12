@@ -150,6 +150,13 @@ export const structuralAnalysisApi = {
     req<import("./structural-types").NLPushoverHistory>(
       `/analysis/${projectId}/nl-pushover/${direction}/history?max_frames=${maxFrames}`,
     ),
+
+  /** Curvas M-φ y V-δ locales de un pier específico durante el pushover. */
+  nlPushoverPierResponse: (projectId: string, direction: string, pier: string, story: string) =>
+    req<import("./structural-types").PierResponseData>(
+      `/analysis/${projectId}/nl-pushover/${direction}/pier-response` +
+      `?pier=${encodeURIComponent(pier)}&story=${encodeURIComponent(story)}`,
+    ),
 };
 
 // ── Editor del modelo estructural ────────────────────────────────────────────

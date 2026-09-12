@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import type { NLPushoverResult, NLPushoverDirResult } from "@/lib/structural-types";
 import DeformedShape3D    from "./DeformedShape3D";
 import CriticalPiersPanel from "./CriticalPiersPanel";
+import PierResponseCurves from "./PierResponseCurves";
 
 interface Props {
   result:    NLPushoverResult;
@@ -15,6 +16,17 @@ export default function NLPushoverPanel({ result, projectId }: Props) {
   const [defDir, setDefDir] = useState<"X" | "Y">(
     pushover_X?.status === "success" || pushover_X?.status === "partial" ? "X" : "Y"
   );
+  const [selectedPier, setSelectedPier] = useState<{ pier: string; story: string; direction: "X" | "Y" } | null>(null);
+
+  function handleSelectPier(pier: string, story: string, dir?: "X" | "Y") {
+    const d = dir ?? defDir;
+    setSelectedPier({ pier, story, direction: d });
+    setDefDir(d);
+    // Scroll suave hacia la sección de respuesta local
+    setTimeout(() => {
+      document.getElementById("pier-response-section")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 100);
+  }
 
   return (
     <div className="flex flex-col gap-5">
@@ -106,15 +118,44 @@ export default function NLPushoverPanel({ result, projectId }: Props) {
             })}
           </div>
         </div>
-        <DeformedShape3D projectId={projectId} direction={defDir} height={520} />
+        <DeformedShape3D
+          projectId={projectId}
+          direction={defDir}
+          height={520}
+          onSelectPier={(pier, story) => handleSelectPier(pier, story, defDir)}
+          selectedPier={selectedPier && selectedPier.direction === defDir ? { pier: selectedPier.pier, story: selectedPier.story } : null}
+        />
+        <p className="text-[10px] text-[var(--text-muted)] italic ml-1">
+          Click en cualquier pier del 3D o en la tabla inferior para ver su curva M-φ y V-δ.
+        </p>
       </div>
+
+      {/* ── Respuesta local del pier seleccionado (M-φ y V-δ) ───────────────── */}
+      {selectedPier && (
+        <div id="pier-response-section" className="flex flex-col gap-2 scroll-mt-4">
+          <h3 className="text-sm font-semibold text-[var(--text)] uppercase tracking-wider">
+            Respuesta No Lineal del Pier
+          </h3>
+          <PierResponseCurves
+            projectId={projectId}
+            direction={selectedPier.direction}
+            pier={selectedPier.pier}
+            story={selectedPier.story}
+            onClose={() => setSelectedPier(null)}
+          />
+        </div>
+      )}
 
       {/* ── Ranking de pieres críticos ───────────────────────────────────────── */}
       <div className="flex flex-col gap-2">
         <h3 className="text-sm font-semibold text-[var(--text)] uppercase tracking-wider">
           Elementos Críticos
         </h3>
-        <CriticalPiersPanel result={result} />
+        <CriticalPiersPanel
+          result={result}
+          onSelectPier={handleSelectPier}
+          selectedPier={selectedPier ? { pier: selectedPier.pier, story: selectedPier.story } : null}
+        />
       </div>
 
     </div>

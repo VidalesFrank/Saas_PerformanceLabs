@@ -990,3 +990,38 @@ export interface NLPushoverHistory {
     last_displacement_m: number;
   };
 }
+
+// ── Respuesta local por pier (M-φ y V-δ) ─────────────────────────────────────
+
+export interface MPhiPoint {
+  step:         number;
+  phi_1_per_m:  number;
+  moment_kNm:   number;
+  drift_pct:    number;
+}
+
+export interface VDeltaPoint {
+  step:       number;
+  delta_m:    number;
+  shear_kN:   number;
+  drift_pct:  number;
+}
+
+export interface PierResponseData {
+  pier:            string;
+  story:           string;
+  direction:       string;
+  lw_m:            number;
+  hw_m:            number;
+  lp_m:            number;
+  M_phi:           MPhiPoint[];
+  V_delta:         VDeltaPoint[];
+  yield_M_phi?:    (MPhiPoint & { note: string }) | null;
+  yield_V_delta?:  (VDeltaPoint & { note: string }) | null;
+  damage?: {
+    di:        number;
+    di_base:   number;
+    level:     DamageLevel;
+    drift_pct: number;
+  } | null;
+}

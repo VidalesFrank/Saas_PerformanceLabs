@@ -11,7 +11,9 @@ import { useMemo, useState } from "react";
 import type { NLPushoverResult, DamageLevel } from "@/lib/structural-types";
 
 interface Props {
-  result: NLPushoverResult;
+  result:            NLPushoverResult;
+  onSelectPier?:     (pier: string, story: string, direction: "X" | "Y") => void;
+  selectedPier?:     { pier: string; story: string } | null;
 }
 
 interface PierDamageRow {
@@ -41,7 +43,7 @@ const DAMAGE_LABEL_ES: Record<DamageLevel, string> = {
   collapse: "Colapso",
 };
 
-export default function CriticalPiersPanel({ result }: Props) {
+export default function CriticalPiersPanel({ result, onSelectPier, selectedPier }: Props) {
   const [direction, setDirection] = useState<"X" | "Y" | "max">("max");
   const [levelFilter, setLevelFilter] = useState<DamageLevel | "all">("all");
   const [showN, setShowN] = useState(20);
@@ -153,8 +155,19 @@ export default function CriticalPiersPanel({ result }: Props) {
           <tbody className="divide-y divide-[var(--border)]">
             {displayed.map((r, i) => {
               const color = DAMAGE_COLOR[r.damage_level];
+              const isSelected = selectedPier?.pier === r.pier && selectedPier?.story === r.story;
+              const clickable = !!onSelectPier;
+              const rowDir: "X" | "Y" = direction === "Y" ? "Y" : "X";
               return (
-                <tr key={`${r.pier}-${r.story}-${i}`} className="hover:bg-[var(--surface-2)]">
+                <tr
+                  key={`${r.pier}-${r.story}-${i}`}
+                  onClick={clickable ? () => onSelectPier?.(r.pier, r.story, rowDir) : undefined}
+                  className={[
+                    "hover:bg-[var(--surface-2)] transition-colors",
+                    clickable ? "cursor-pointer" : "",
+                    isSelected ? "bg-[color-mix(in_srgb,var(--accent)_15%,transparent)]" : "",
+                  ].join(" ")}
+                >
                   <td className="px-3 py-1.5 text-xs text-[var(--text-muted)] font-mono">{i + 1}</td>
                   <td className="px-3 py-1.5 font-mono text-xs font-medium text-[var(--text)]">{r.pier}</td>
                   <td className="px-3 py-1.5 text-xs text-[var(--text-muted)]">{r.story}</td>
