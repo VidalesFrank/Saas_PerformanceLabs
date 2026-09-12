@@ -265,6 +265,10 @@ function buildWallPanels(geometry: ModelGeometry, opts: ViewerOptions): object[]
   const { shells, joints } = geometry;
   if (!shells || opts.typeFilter?.walls === false) return [];
   const allPiers = _wallPiersSorted(geometry);
+  // Optimización C: si hay muchos pieres y no hay filtro activo, colapsa todos
+  // los muros en UN solo mesh3d. Se pierde el color-per-pier pero se reducen
+  // decenas de traces a uno solo, con mejora sustancial de FPS en interacción.
+  const collapseAll = !opts.pierFilter && !opts.wallColor && allPiers.length > 12;
   type MBuf = { vx:number[];vy:number[];vz:number[];vi:number[];vj:number[];vk:number[];cd:(ElementClickInfo|null)[];n:number };
   const groups = new Map<string, MBuf>();
   for (const [shellId, sd] of Object.entries(shells)) {
@@ -274,18 +278,21 @@ function buildWallPanels(geometry: ModelGeometry, opts: ViewerOptions): object[]
     if (opts.pierFilter && pier !== opts.pierFilter) continue;
     const corners = sd.joints.map(jl => joints[jl]).filter(Boolean);
     if (corners.length < 3) continue;
-    if (!groups.has(pier)) groups.set(pier, { vx:[],vy:[],vz:[],vi:[],vj:[],vk:[],cd:[],n:0 });
-    const g = groups.get(pier)!;
+    const key = collapseAll ? "__all__" : pier;
+    if (!groups.has(key)) groups.set(key, { vx:[],vy:[],vz:[],vi:[],vj:[],vk:[],cd:[],n:0 });
+    const g = groups.get(key)!;
     const info: ElementClickInfo = { id:shellId, element_type:"wall", story:sd.story||"", section:sd.section||"" };
     for (const c of corners) { g.vx.push(c.x); g.vy.push(c.y); g.vz.push(c.z); g.cd.push(info); }
     for (let i = 1; i < corners.length - 1; i++) { g.vi.push(g.n); g.vj.push(g.n+i); g.vk.push(g.n+i+1); }
     g.n += corners.length;
   }
-  return [...groups.entries()].filter(([,g]) => g.n > 0).map(([pier, g]) => ({
+  return [...groups.entries()].filter(([,g]) => g.n > 0).map(([key, g]) => ({
     type:"mesh3d", x:g.vx,y:g.vy,z:g.vz,i:g.vi,j:g.vj,k:g.vk, customdata:g.cd,
-    color: opts.wallColor ?? _wallPierColor(pier, allPiers),
+    color: opts.wallColor ?? (collapseAll ? "#0f766e" : _wallPierColor(key, allPiers)),
     flatshading:true, lighting:LIGHTING, lightposition:LIGHTPOS, opacity:0.85,
-    hovertemplate:`<b>%{customdata.id}</b><br>Piso: %{customdata.story}<extra></extra>`, showlegend:false,
+    // hoverinfo: skip → el picker overlay universal maneja hover/click y
+    // pintar hover aquí re-renderiza todo el mesh3d cada frame.
+    hoverinfo:"skip", showlegend:false,
   }));
 }
 

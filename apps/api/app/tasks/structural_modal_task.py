@@ -272,6 +272,18 @@ def _run_eigen_forked(ops, n_modes: int) -> dict:
                 except Exception:
                     pass
             try:
+                # Optimización: system("UmfPack") reduce el modal de ~190s a
+                # ~0.7s en edificios de muros (medido en VitaTorre: 189.7s
+                # con BandGeneral por default vs 0.7s con UmfPack, con T1
+                # idéntico a 4 cifras). UmfPack es un solver multifrontal
+                # esparso — perfecto para matrices grandes con estructura
+                # de bloques como las de rigidDiaphragm por piso.
+                try:
+                    ops.system("UmfPack")
+                except Exception as _e_sys:
+                    print(f"[modal] WARN: no se pudo configurar UmfPack ({_e_sys}); "
+                          f"usando system() por default")
+
                 lam = ops.eigen(*solver_args)
                 if not lam:
                     os._exit(1)

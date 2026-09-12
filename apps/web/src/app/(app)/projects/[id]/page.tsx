@@ -9,6 +9,7 @@ import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { ValidationReport } from "@/components/linear/ValidationReport";
 import { LoadPatternSelector } from "@/components/linear/LoadPatternSelector";
 import { LinearModelViewer3D } from "@/components/linear/LinearModelViewer3D";
+import ModelViewSwitcher       from "@/components/linear/ModelViewSwitcher";
 import ModelEditorPanel from "@/components/linear/ModelEditorPanel";
 import { SeismicParamsForm } from "@/components/linear/SeismicParamsForm";
 import { SpectrumPreview } from "@/components/linear/SpectrumPreview";
@@ -1001,14 +1002,14 @@ export default function StructuralProjectPage() {
                   <CardBody>
                     {loadingGeometry ? (
                       <div className="flex items-center justify-center h-48">
-                        <p className="text-sm text-[var(--text-muted)] animate-pulse">Cargando modelo 3D...</p>
+                        <p className="text-sm text-[var(--text-muted)] animate-pulse">Cargando modelo...</p>
                       </div>
                     ) : modelGeometry ? (
-                      <LinearModelViewer3D geometry={modelGeometry} />
+                      <ModelViewSwitcher geometry={modelGeometry} />
                     ) : (
                       <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] flex items-center justify-center h-48">
                         <p className="text-sm text-[var(--text-muted)]">
-                          Modelo 3D no disponible
+                          Modelo no disponible
                         </p>
                       </div>
                     )}
