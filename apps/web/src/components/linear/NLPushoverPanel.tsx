@@ -1,12 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { NLPushoverResult, NLPushoverDirResult } from "@/lib/structural-types";
-import DeformedShape3D    from "./DeformedShape3D";
-import CriticalPiersPanel from "./CriticalPiersPanel";
-import PierResponseCurves from "./PierResponseCurves";
-import VariantManager     from "./VariantManager";
-import VariantEditor      from "./VariantEditor";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type {
+  NLPushoverResult,
+  NLPushoverDirResult,
+  NLPushoverVariantResult,
+} from "@/lib/structural-types";
+import DeformedShape3D         from "./DeformedShape3D";
+import CriticalPiersPanel      from "./CriticalPiersPanel";
+import PierResponseCurves      from "./PierResponseCurves";
+import VariantManager          from "./VariantManager";
+import VariantEditor           from "./VariantEditor";
+import VariantComparisonPanel  from "./VariantComparisonPanel";
 import { structuralAnalysisApi } from "@/lib/structural-api";
 import type { DesignVariant, WallDesignRow } from "@/lib/structural-types";
 
@@ -23,6 +28,10 @@ export default function NLPushoverPanel({ result, projectId, wallDesign }: Props
   );
   const [selectedPier, setSelectedPier] = useState<{ pier: string; story: string; direction: "X" | "Y" } | null>(null);
   const [activeVariant, setActiveVariant] = useState<DesignVariant | null>(null);
+  const [compareVariant, setCompareVariant] = useState<DesignVariant | null>(null);
+  const [compareResult, setCompareResult]   = useState<NLPushoverVariantResult | null>(null);
+  const [compareLoading, setCompareLoading] = useState(false);
+  const [compareErr, setCompareErr]         = useState<string | null>(null);
 
   const baselineForSelected: WallDesignRow | null = useMemo(() => {
     if (!selectedPier || !wallDesign?.designs) return null;
@@ -40,6 +49,31 @@ export default function NLPushoverPanel({ result, projectId, wallDesign }: Props
       document.getElementById("pier-response-section")?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 100);
   }
+
+  const handleShowResult = useCallback(async (v: DesignVariant) => {
+    setCompareVariant(v);
+    setCompareResult(null);
+    setCompareErr(null);
+    setCompareLoading(true);
+    try {
+      const res = await structuralAnalysisApi.getDesignVariantResult(projectId, v.variant_id);
+      setCompareResult(res);
+      setTimeout(() => {
+        document.getElementById("variant-comparison-section")
+          ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 60);
+    } catch (e) {
+      setCompareErr(e instanceof Error ? e.message : "Error cargando el resultado de la variante");
+    } finally {
+      setCompareLoading(false);
+    }
+  }, [projectId]);
+
+  const handleCloseCompare = useCallback(() => {
+    setCompareVariant(null);
+    setCompareResult(null);
+    setCompareErr(null);
+  }, []);
 
   async function handleQuickCreateVariant() {
     try {
@@ -192,8 +226,41 @@ export default function NLPushoverPanel({ result, projectId, wallDesign }: Props
           projectId={projectId}
           activeVariantId={activeVariant?.variant_id ?? null}
           onSelect={setActiveVariant}
+          onShowResult={handleShowResult}
         />
       </div>
+
+      {/* ── Comparativo baseline vs variante (Sprint 6.3) ────────────────────── */}
+      {(compareVariant || compareLoading || compareErr) && (
+        <div id="variant-comparison-section" className="flex flex-col gap-2 scroll-mt-4">
+          {compareLoading && (
+            <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-6 flex items-center justify-center">
+              <p className="text-sm text-[var(--text-muted)] animate-pulse">
+                Cargando resultado de la variante…
+              </p>
+            </div>
+          )}
+          {compareErr && !compareLoading && (
+            <div className="rounded-xl border border-red-300 bg-red-50 p-4 flex items-center gap-3">
+              <p className="text-sm text-red-700 flex-1">{compareErr}</p>
+              <button
+                onClick={handleCloseCompare}
+                className="text-xs text-red-700 hover:text-red-900 underline"
+              >
+                Cerrar
+              </button>
+            </div>
+          )}
+          {compareResult && !compareLoading && (
+            <VariantComparisonPanel
+              baseline={result}
+              variant={compareResult}
+              variantMeta={compareVariant}
+              onClose={handleCloseCompare}
+            />
+          )}
+        </div>
+      )}
 
       {/* ── Ranking de pieres críticos ───────────────────────────────────────── */}
       <div className="flex flex-col gap-2">
