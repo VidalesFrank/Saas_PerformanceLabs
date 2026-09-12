@@ -191,10 +191,19 @@ class NLBuildingOPSBuilder:
         inc_m:            float = 0.001,
         result_path:      Path | None = None,
         cancel_flag:      list[bool] | None = None,
+        history_path:     Path | None = None,
+        history_stride:   int = 1,
     ) -> dict:
         """
         Pushover desplazamiento-controlado con carga triangular en nodos CM.
         Nodo de control: CM de la azotea.
+
+        Si `history_path` está definido, guarda un NPZ comprimido con:
+          - disp_cm    : (n_steps, n_cm, 3)      desplazamientos u,v,w de CM
+          - disp_top   : (n_steps, n_top, 3)     desplazamientos wall_top nodes
+          - ele_force  : (n_steps, n_ele, n_dof) fuerzas de cada MVLEM_3D
+          - metadata   : mapeo de nodos y elementos con story/pier
+        Se usa `history_stride` para submuestrear (1 = cada paso).
         """
         ops = self._ops
         total_h = max(self._stories_z.values(), default=1.0)
@@ -231,7 +240,39 @@ class NLBuildingOPSBuilder:
         steps_out = []
         converged = 0
 
-        for _ in range(n_steps):
+        # ── Captura de historia (deformada + fuerzas por paso) ────────────────
+        capture      = history_path is not None
+        cm_tags      = [info["tag"] for _, info in sorted(
+                            self._cm_map.items(), key=lambda kv: self._stories_z.get(kv[0], 0.0))]
+        top_tags     = sorted({t for tags in self._wall_top_nodes.values() for t in tags})
+        ele_items    = sorted(self._ele_map.items(), key=lambda kv: kv[1])
+        ele_tags     = [tag for _, tag in ele_items]
+
+        hist_disp_cm:   list[list[list[float]]] = []
+        hist_disp_top:  list[list[list[float]]] = []
+        hist_ele_force: list[list[list[float]]] = []
+
+        def _capture_step() -> None:
+            if not capture:
+                return
+            hist_disp_cm.append([
+                [float(ops.nodeDisp(t, 1)), float(ops.nodeDisp(t, 2)), float(ops.nodeDisp(t, 3))]
+                for t in cm_tags
+            ])
+            hist_disp_top.append([
+                [float(ops.nodeDisp(t, 1)), float(ops.nodeDisp(t, 2)), float(ops.nodeDisp(t, 3))]
+                for t in top_tags
+            ])
+            forces_step: list[list[float]] = []
+            for t in ele_tags:
+                try:
+                    f = ops.eleForce(t)
+                except Exception:
+                    f = []
+                forces_step.append([float(v) for v in f])
+            hist_ele_force.append(forces_step)
+
+        for step_idx in range(n_steps):
             if cancel_flag and cancel_flag[0]:
                 break
             if self._try_step() != 0:
@@ -248,9 +289,43 @@ class NLBuildingOPSBuilder:
                 "base_shear_kN":  round(base_shear, 2),
             })
 
+            # Submuestrea historia (stride) para reducir tamaño
+            if capture and (converged % max(1, history_stride) == 0):
+                _capture_step()
+
             if result_path:
                 self._write_partial(result_path, direction, steps_out,
                                     "running", n_steps, converged)
+
+        # ── Serialización de historia ─────────────────────────────────────────
+        history_meta: dict | None = None
+        if capture and hist_disp_cm:
+            import numpy as _np
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            _np.savez_compressed(
+                history_path,
+                disp_cm    = _np.asarray(hist_disp_cm,   dtype=_np.float32),
+                disp_top   = _np.asarray(hist_disp_top,  dtype=_np.float32),
+                ele_force  = _np.asarray(hist_ele_force, dtype=_np.float32),
+                cm_tags    = _np.asarray(cm_tags,        dtype=_np.int64),
+                top_tags   = _np.asarray(top_tags,       dtype=_np.int64),
+                ele_tags   = _np.asarray(ele_tags,       dtype=_np.int64),
+            )
+            history_meta = {
+                "path":           str(history_path),
+                "captured_steps": len(hist_disp_cm),
+                "stride":         history_stride,
+                "cm_nodes": [
+                    {"tag": t, "story": s, "x": info["x"], "y": info["y"], "z": info["z"]}
+                    for s, info in self._cm_map.items()
+                    for t in [info["tag"]] if info["tag"] in cm_tags
+                ],
+                "top_nodes": [{"tag": int(t)} for t in top_tags],
+                "elements": [
+                    {"tag": int(tag), "pier": pier, "story": story}
+                    for (pier, story), tag in ele_items
+                ],
+            }
 
         status = (
             "success" if converged == n_steps
@@ -269,6 +344,8 @@ class NLBuildingOPSBuilder:
                 "last_displacement_m": steps_out[-1]["displacement_m"] if steps_out else 0.0,
             } if steps_out else {},
         }
+        if history_meta:
+            result["history"] = history_meta
         if result_path:
             self._write_partial(result_path, direction, steps_out, status, n_steps, converged)
         return result

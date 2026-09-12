@@ -75,6 +75,7 @@ def run_nl_pushover(
         design_rows = design_data.get("designs", [])
         fc_mpa      = float(design_data.get("fc_mpa",  21.0))
         fy_mpa      = float(design_data.get("fy_mpa", 420.0))
+        ductility   = str(design_data.get("ductility", "DMO")).upper()
 
         # ── Parámetros del pushover ───────────────────────────────────────────
         params        = dict(parameters_dict or {})
@@ -124,6 +125,7 @@ def run_nl_pushover(
         for direction in directions:
             print(f"[nl_pushover] ── Pushover {direction} ──────────────────────")
             part_path = Path(res_dir) / f"nl_pushover_{direction.replace('-', 'm')}_partial.json"
+            hist_path = Path(res_dir) / f"nl_pushover_{direction.replace('-', 'm')}_history.npz"
 
             builder = NLBuildingOPSBuilder(
                 model       = model,
@@ -146,6 +148,8 @@ def run_nl_pushover(
                     target_drift_pct = target_drift,
                     inc_m            = inc_m,
                     result_path      = part_path,
+                    history_path     = hist_path,
+                    history_stride   = int(params.get("history_stride", 1)),
                 )
                 print(
                     f"[nl_pushover] Pushover {direction}: {push_result['status']} "
@@ -153,6 +157,28 @@ def run_nl_pushover(
                     f"| deriva max {push_result['summary'].get('max_drift_pct', 0):.2f}% "
                     f"| Vb max {push_result['summary'].get('max_base_shear_kN', 0):.1f} kN"
                 )
+
+                # Post-proceso: índice de daño Park-Ang por pier
+                if push_result.get("history"):
+                    try:
+                        from app.engine.building.nonlinear.damage_index import (
+                            compute_pier_damage_from_history,
+                        )
+                        damage = compute_pier_damage_from_history(
+                            history_path = hist_path,
+                            steps        = push_result["steps"],
+                            design_rows  = design_rows,
+                            direction    = direction,
+                            ductility    = ductility,
+                        )
+                        push_result["damage"] = damage
+                        print(
+                            f"[nl_pushover] Daño {direction}: {damage['n_critical']} pieres críticos "
+                            f"(DI>0.4), DI máx = {damage['max_di']:.3f}"
+                        )
+                    except Exception as e_dmg:
+                        print(f"[nl_pushover] WARN damage index {direction}: {e_dmg}")
+
                 results_by_dir[direction] = push_result
 
             except Exception as e_dir:
@@ -168,6 +194,8 @@ def run_nl_pushover(
                 "converged_steps": r.get("converged_steps", 0),
                 "total_steps":     r.get("total_steps", 0),
                 **r.get("summary", {}),
+                "n_critical_piers": r.get("damage", {}).get("n_critical", 0),
+                "max_di":           r.get("damage", {}).get("max_di", 0.0),
             }
             for d, r in results_by_dir.items()
         }

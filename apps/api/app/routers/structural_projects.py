@@ -314,12 +314,14 @@ def model_geometry(project_id: str, user: CurrentUser, db: DB):
     shells_full = model.get("shells", {})
     shells_slim = {
         lbl: {
-            "joints":       sd["joints"],
-            "element_type": sd.get("element_type", "slab"),
-            "story":        sd.get("story", ""),
-            "section":      sd.get("section", ""),
-            "thickness_m":  sd.get("thickness_m", 0.0),
-            "pier":         sd.get("pier", ""),
+            "joints":         sd["joints"],
+            "element_type":   sd.get("element_type", "slab"),
+            "story":          sd.get("story", ""),
+            "section":        sd.get("section", ""),
+            "thickness_m":    sd.get("thickness_m", 0.0),
+            "pier":           sd.get("pier", ""),
+            "is_planar":      sd.get("is_planar", True),
+            "out_of_plane_m": sd.get("out_of_plane_m", 0.0),
         }
         for lbl, sd in shells_full.items()
     }

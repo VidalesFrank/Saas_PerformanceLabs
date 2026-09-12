@@ -48,6 +48,79 @@ def _to_int(val, default: int = 0) -> int:
         return default
 
 
+def _orient_shell_corners(
+    corner_joints: list[str],
+    joints_dict: dict[str, dict],
+    planarity_tol_m: float = 0.05,
+) -> tuple[list[str], bool, float]:
+    """
+    Reordena los vértices de un shell en orden CCW visto desde su normal +local,
+    y valida la planitud del polígono.
+
+    ETABS a veces exporta los joints en orden inconsistente (mezcla CW/CCW o
+    diagonal), lo que hace que la triangulación fan del frontend genere caras
+    solapadas → apariencia de "triángulo" en lugar de cuadrilátero.
+
+    Estrategia:
+      1. Obtiene coordenadas (x,y,z) de cada joint.
+      2. Calcula el centroide y la normal del mejor plano de ajuste (SVD).
+      3. Proyecta cada punto al plano y ordena por ángulo polar CCW.
+      4. Devuelve los labels reordenados + flag de planitud + desviación máx.
+
+    Retorna (corner_joints_ordered, is_planar, max_out_of_plane_m).
+    Si hay <3 vértices o falta algún joint, devuelve los originales sin cambio.
+    """
+    if len(corner_joints) < 3:
+        return corner_joints, True, 0.0
+
+    coords: list[tuple[float, float, float]] = []
+    for lbl in corner_joints:
+        jd = joints_dict.get(lbl)
+        if not jd:
+            return corner_joints, True, 0.0
+        coords.append((float(jd["x"]), float(jd["y"]), float(jd["z"])))
+
+    pts = np.array(coords, dtype=float)
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid
+
+    # SVD del centrado → normal = último vector singular (menor varianza)
+    try:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        normal = vh[-1]
+    except np.linalg.LinAlgError:
+        return corner_joints, True, 0.0
+
+    n_norm = float(np.linalg.norm(normal))
+    if n_norm < 1e-12:
+        return corner_joints, True, 0.0
+    normal = normal / n_norm
+
+    # Fuerza normal en el hemisferio +Z para consistencia (losas apuntan arriba)
+    if normal[2] < 0:
+        normal = -normal
+
+    # Desviación máxima al plano ajustado
+    dists = np.abs(centered @ normal)
+    max_dev = float(dists.max())
+    is_planar = max_dev <= planarity_tol_m
+
+    # Construye base ortonormal en el plano: u (proy X global), v (normal × u)
+    ref = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(ref, normal)) > 0.95:
+        ref = np.array([0.0, 1.0, 0.0])
+    u = ref - np.dot(ref, normal) * normal
+    u = u / (np.linalg.norm(u) or 1.0)
+    v = np.cross(normal, u)
+
+    # Proyecta al plano y ordena por atan2 (CCW visto desde +normal)
+    proj_u = centered @ u
+    proj_v = centered @ v
+    order = sorted(range(len(corner_joints)), key=lambda i: math.atan2(proj_v[i], proj_u[i]))
+
+    return [corner_joints[i] for i in order], is_planar, max_dev
+
+
 def _safe_str(val, default: str = "") -> str:
     if val is None or (isinstance(val, float) and math.isnan(val)):
         return default
@@ -433,15 +506,23 @@ class CanonicalModelBuilder:
             mat_name = section_material_map.get(section, "")
             E_mpa    = _to_float(materials.get(mat_name, {}).get("E_mpa", 0.0))
 
+            # Reordena vértices en CCW y valida planitud (evita el "triángulo" visual)
+            is_planar = True
+            max_dev   = 0.0
+            if joints:
+                corner_joints, is_planar, max_dev = _orient_shell_corners(corner_joints, joints)
+
             shells[label] = {
-                "joints":        corner_joints,
-                "section":       section,
-                "element_type":  element_type,
-                "story":         story,
-                "area_label":    area_label,
-                "thickness_m":   thickness_map.get(section, 0.0),
-                "E_mpa":         E_mpa,
-                "pier":          pier_map.get(label) or pier_map.get(area_label) or "",
+                "joints":         corner_joints,
+                "section":        section,
+                "element_type":   element_type,
+                "story":          story,
+                "area_label":     area_label,
+                "thickness_m":    thickness_map.get(section, 0.0),
+                "E_mpa":          E_mpa,
+                "pier":           pier_map.get(label) or pier_map.get(area_label) or "",
+                "is_planar":      is_planar,
+                "out_of_plane_m": round(max_dev, 4),
             }
 
         return shells

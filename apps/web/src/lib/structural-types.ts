@@ -670,6 +670,8 @@ export interface ShellSummary {
   story: string;
   thickness_m: number;
   pier?: string;
+  is_planar?: boolean;
+  out_of_plane_m?: number;
 }
 
 /** Modelo canónico completo retornado por /model-data (sin analysis_results). */

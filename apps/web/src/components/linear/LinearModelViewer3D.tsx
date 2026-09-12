@@ -314,11 +314,108 @@ function buildSlabsLines(geometry: ModelGeometry, opts: ViewerOptions): object[]
   }));
 }
 
-// Slabs siempre como contorno perimetral, en ambos modos (lines y extruido).
-// mesh3d haría visible la triangulación interna de cada elemento shell, generando
-// un aspecto de malla triangular poco informativo.
+// Losas extruidas: prisma con caras top, bottom y laterales.
+// El espesor viene de thickness_m del shell (fallback 0.15 m para visibilidad).
+// Se agrupa por piso para reducir el número de traces mesh3d.
 function buildSlabsPanels(geometry: ModelGeometry, opts: ViewerOptions): object[] {
-  return buildSlabsLines(geometry, opts);
+  const { shells, joints } = geometry;
+  if (!shells || opts.typeFilter?.slabs === false) return [];
+  const slabColor = opts.slabColor ?? "#F59E0B";
+
+  type MBuf = {
+    vx:number[]; vy:number[]; vz:number[];
+    vi:number[]; vj:number[]; vk:number[];
+    cd:(ElementClickInfo|null)[]; n:number;
+  };
+  const groups = new Map<string, MBuf>();
+
+  for (const [shellId, sd] of Object.entries(shells)) {
+    if (sd.element_type !== "slab") continue;
+    if (opts.storyFilter && opts.storyFilter !== "all" && sd.story !== opts.storyFilter) continue;
+    const corners = sd.joints.map(jl => joints[jl]).filter(Boolean);
+    if (corners.length < 3) continue;
+
+    const story = sd.story || "(sin piso)";
+    if (!groups.has(story)) groups.set(story, { vx:[],vy:[],vz:[],vi:[],vj:[],vk:[],cd:[],n:0 });
+    const g = groups.get(story)!;
+    const info: ElementClickInfo = {
+      id:shellId, element_type:"slab", story:sd.story||"", section:sd.section||"",
+    };
+
+    // Espesor: usa thickness_m si viene, con mínimo para visibilidad
+    const t    = Math.max((sd.thickness_m ?? 0.15) || 0.15, 0.05);
+    const half = t / 2;
+    const nC   = corners.length;
+    const base = g.n;
+
+    // Vertices: primero top (z + half), luego bottom (z - half)
+    for (const c of corners) { g.vx.push(c.x); g.vy.push(c.y); g.vz.push(c.z + half); g.cd.push(info); }
+    for (const c of corners) { g.vx.push(c.x); g.vy.push(c.y); g.vz.push(c.z - half); g.cd.push(info); }
+
+    // Cara superior (fan triangulation) — orden CCW ya garantizado por backend
+    for (let i = 1; i < nC - 1; i++) {
+      g.vi.push(base);       g.vj.push(base + i);       g.vk.push(base + i + 1);
+    }
+    // Cara inferior (fan invertido para que la normal apunte hacia abajo)
+    for (let i = 1; i < nC - 1; i++) {
+      g.vi.push(base + nC);  g.vj.push(base + nC + i + 1); g.vk.push(base + nC + i);
+    }
+    // Caras laterales: por cada arista, 2 triángulos (top→bot)
+    for (let i = 0; i < nC; i++) {
+      const i1 = i;
+      const i2 = (i + 1) % nC;
+      g.vi.push(base + i1);       g.vj.push(base + i2);       g.vk.push(base + nC + i1);
+      g.vi.push(base + i2);       g.vj.push(base + nC + i2);  g.vk.push(base + nC + i1);
+    }
+
+    g.n += 2 * nC;
+  }
+
+  return [...groups.entries()].filter(([,g]) => g.n > 0).map(([story, g]) => ({
+    type:"mesh3d", x:g.vx, y:g.vy, z:g.vz, i:g.vi, j:g.vj, k:g.vk, customdata:g.cd,
+    color: slabColor,
+    flatshading:true, lighting:LIGHTING, lightposition:LIGHTPOS, opacity:0.85,
+    name:`Losas ${story}`,
+    hovertemplate:`<b>Losa</b> %{customdata.id}<br>Piso: %{customdata.story}<br>Sección: %{customdata.section}<extra></extra>`,
+    showlegend:false,
+  }));
+}
+
+// Overlay de picking universal: markers casi invisibles en el centroide de cada
+// shell. Necesario porque mesh3d de Plotly NO emite plotly_click. Estos markers
+// scatter3d sí son pickables en cualquier modo y llevan el customdata correcto.
+function buildShellsPickerOverlay(geometry: ModelGeometry, opts: ViewerOptions): object | null {
+  const { shells, joints } = geometry;
+  if (!shells) return null;
+  const xs:number[]=[], ys:number[]=[], zs:number[]=[], cd:ElementClickInfo[]=[];
+
+  for (const [shellId, sd] of Object.entries(shells)) {
+    if (opts.storyFilter && opts.storyFilter !== "all" && sd.story !== opts.storyFilter) continue;
+    if (sd.element_type === "slab" && opts.typeFilter?.slabs === false) continue;
+    if (sd.element_type === "wall" && opts.typeFilter?.walls === false) continue;
+
+    const corners = sd.joints.map(jl => joints[jl]).filter(Boolean);
+    if (corners.length === 0) continue;
+
+    let cx=0, cy=0, cz=0;
+    for (const c of corners) { cx += c.x; cy += c.y; cz += c.z; }
+    cx /= corners.length; cy /= corners.length; cz /= corners.length;
+
+    xs.push(cx); ys.push(cy); zs.push(cz);
+    cd.push({
+      id: shellId,
+      element_type: sd.element_type,
+      story: sd.story || "",
+      section: sd.section || "",
+    });
+  }
+
+  if (xs.length === 0) return null;
+  return {
+    type: "scatter3d", mode: "markers", x: xs, y: ys, z: zs, customdata: cd,
+    marker: { size: 10, color: "rgba(0,0,0,0)", opacity: 0.01 },
+    hoverinfo: "skip", showlegend: false, name: "__shell_pickers",
+  };
 }
 
 function buildSupports3D(geometry: ModelGeometry): object {
@@ -714,9 +811,14 @@ export function LinearModelViewer3D({
     const dataTraces = viewMode === "lines"
       ? [...buildLinesInteractive(geometry, opts), ...wallTraces, ...slabTraces]
       : [...buildExtrudedInteractive(geometry, opts), ...wallTraces, ...slabTraces];
+
+    // En modo extruido, mesh3d no soporta plotly_click → añade overlay picker
+    const pickerOverlay = viewMode === "extruded" ? buildShellsPickerOverlay(geometry, opts) : null;
+
     return [
       ...buildLegendTraces(opts),
       ...dataTraces,
+      ...(pickerOverlay ? [pickerOverlay] : []),
       buildSupports3D(geometry),
       ...(showNodes ? [buildNodes3D(geometry)] : []),
       ...(showLoads ? buildLoadArrows(geometry, totalHeight) : []),
