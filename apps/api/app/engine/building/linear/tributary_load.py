@@ -32,6 +32,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+import numpy as np
+
 
 # ── Clasificación de patrones de carga ────────────────────────────────────────
 
@@ -106,32 +108,55 @@ def _midpoint(p1: tuple, p2: tuple) -> tuple:
     return ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
 
 
-def _quad_edge_perp_span(pts: list[tuple], edge_idx: int) -> float:
-    """
-    Para el borde `edge_idx` (0→{0,1}, 1→{1,2}, 2→{2,3}, 3→{3,0})
-    de un cuadrilátero de 4 puntos, retorna la distancia entre el
-    punto medio de ese borde y el punto medio del borde opuesto.
-    Ese valor representa el span perpendicular que sirve para el
-    método de 45°.
-    """
-    n = 4
-    j = (edge_idx + 1) % n
-    opp_i = (edge_idx + 2) % n
-    opp_j = (edge_idx + 3) % n
-    mid_edge = _midpoint(pts[edge_idx], pts[j])
-    mid_opp  = _midpoint(pts[opp_i], pts[opp_j])
-    return _dist2(mid_edge, mid_opp)
-
-
-def _quad_area(pts: list[tuple]) -> float:
-    """Área de un cuadrilátero por fórmula de Gauss (shoelace)."""
+def _polygon_area(pts: list[tuple]) -> float:
+    """Área de un polígono cualquiera por fórmula de Gauss (shoelace)."""
     n = len(pts)
+    if n < 3:
+        return 0.0
     area = 0.0
     for i in range(n):
         j = (i + 1) % n
         area += pts[i][0] * pts[j][1]
         area -= pts[j][0] * pts[i][1]
     return abs(area) / 2.0
+
+
+# Alias retrocompat
+_quad_area = _polygon_area
+
+
+def _polygon_obb(pts: list[tuple]) -> tuple[float, float, tuple, tuple]:
+    """
+    Oriented Bounding Box del polígono aliniado con su eje principal de
+    inercia (PCA sobre los vértices). Retorna:
+      (a_short, b_long, u_short, u_long)
+    con `a_short ≤ b_long` y `u_short ⟂ u_long` vectores unitarios 2D.
+
+    Para polígonos irregulares (formas en L, T, U) esta aproximación
+    ignora la concavidad y trabaja con el rectángulo circunscrito
+    orientado. El error se compensa escalando las cargas por el ratio
+    de áreas (área real / área OBB) para preservar la carga total.
+    """
+    xy = np.asarray(pts, dtype=float)
+    if len(xy) < 2:
+        return 0.0, 0.0, (1.0, 0.0), (0.0, 1.0)
+    centroid = xy.mean(axis=0)
+    centered = xy - centroid
+    try:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return 0.0, 0.0, (1.0, 0.0), (0.0, 1.0)
+    # vh[0] = dirección de mayor varianza (eje largo)
+    u_long  = tuple(float(v) for v in vh[0])
+    u_short = tuple(float(v) for v in vh[1])
+    proj_long  = centered @ np.asarray(u_long)
+    proj_short = centered @ np.asarray(u_short)
+    b = float(proj_long.max()  - proj_long.min())
+    a = float(proj_short.max() - proj_short.min())
+    if a > b:
+        a, b = b, a
+        u_short, u_long = u_long, u_short
+    return a, b, u_short, u_long
 
 
 # ── Clase principal ───────────────────────────────────────────────────────────
@@ -206,17 +231,24 @@ class TributaryLoadComputer:
             if w_dead == 0.0 and w_live == 0.0:
                 continue  # sin carga → ignorar
 
-            # Coordenadas XY de los joints de la losa
+            # Coordenadas XY de todos los joints del polígono (N vértices)
             pts = []
-            for lbl in joint_labels[:4]:
+            valid_labels = []
+            for lbl in joint_labels:
                 jd = joints.get(lbl, {})
+                if not jd:
+                    continue
                 pts.append((float(jd.get('x', 0.0)), float(jd.get('y', 0.0))))
+                valid_labels.append(lbl)
 
             if len(pts) < 3:
                 continue
 
+            # Reasigna joint_labels a los que tienen coordenadas válidas
+            joint_labels = valid_labels
+
             # Área y geometría de la losa
-            area_m2 = _quad_area(pts)
+            area_m2 = _polygon_area(pts)
             story   = sd.get('story', '')
 
             # Acumular por piso
@@ -330,55 +362,74 @@ class TributaryLoadComputer:
         story:        str,
     ) -> list[dict]:
         """
-        Para un cuadrilátero de 4 puntos, calcula la carga equivalente uniforme
-        por borde usando el método de líneas de 45°.
-        Retorna lista de 4 dicts: [{dead_kNm, live_kNm}, ...]
+        Para un polígono de N ≥ 3 vértices, calcula la carga uniforme
+        equivalente por arista usando el método de líneas de 45° sobre
+        el rectángulo equivalente OBB (Oriented Bounding Box) del polígono.
+
+        Simplificación de ingeniería:
+          1. OBB alineado con eje principal de inercia → dimensiones (a, b).
+          2. Se calcula la carga estándar por unidad de longitud de los
+             lados corto/largo del OBB (fórmulas clásicas 45°).
+          3. Cada arista real se clasifica como "paralela al lado corto"
+             o "paralela al lado largo" según su dirección (|u_edge·u_long|).
+          4. La carga total del polígono (w·A_poly) se conserva escalando
+             las cargas por A_poly / A_obb — compensa la sobreestimación
+             cuando el polígono es cóncavo (formas en L, T, U).
+
+        Retorna lista de N dicts: [{dead_kNm, live_kNm}, ...] alineada a
+        las aristas i→i+1 del polígono.
         """
-        n = min(len(pts), 4)
+        n = len(pts)
+        if n < 3:
+            return []
 
-        # Span perpendicular de cada borde (distancia entre midpoints opuestos)
-        perp_spans = [_quad_edge_perp_span(pts, i) for i in range(n)]
-
-        # Span corto del panel: mínimo span perpendicular de los dos pares de bordes opuestos
-        # Par 0-2 (bordes 0 y 2 son opuestos): perp_spans[0] ≈ perp_spans[2]
-        # Par 1-3 (bordes 1 y 3 son opuestos): perp_spans[1] ≈ perp_spans[3]
-        span_02 = (perp_spans[0] + perp_spans[2]) / 2 if n >= 3 else perp_spans[0]
-        span_13 = (perp_spans[1] + perp_spans[3]) / 2 if n >= 4 else perp_spans[1]
-
-        a = min(span_02, span_13)   # span corto del panel [m]
-        b = max(span_02, span_13)   # span largo del panel [m]
-
-        if a < 0.01:
+        a, b, u_short, u_long = _polygon_obb(pts)
+        if a < 0.01 or b < 0.01:
             return [{'dead_kNm': 0.0, 'live_kNm': 0.0} for _ in range(n)]
 
-        ratio = b / a
-        is_two_way = ratio <= self.TWO_WAY_THRESHOLD
+        area_poly = _polygon_area(pts)
+        area_obb  = a * b
+        scale = (area_poly / area_obb) if area_obb > 1e-9 else 1.0
 
-        edge_loads = []
+        is_two_way = (b / a) <= self.TWO_WAY_THRESHOLD
+
+        # Carga por unidad de longitud según el método clásico de 45°
+        # (referida al rectángulo OBB, se escala luego por A_poly / A_obb).
+        if is_two_way:
+            q_short_dead = w_dead * a / 4.0                    # triangular
+            q_short_live = w_live * a / 4.0
+            q_long_dead  = w_dead * (a / 2) * (1.0 - a / (2 * b))  # trapezoidal
+            q_long_live  = w_live * (a / 2) * (1.0 - a / (2 * b))
+        else:
+            # Losa unidireccional: la carga viaja hacia los lados CORTOS
+            # del rectángulo (los que son paralelos a u_long).
+            q_short_dead = 0.0
+            q_short_live = 0.0
+            q_long_dead  = w_dead * a / 2
+            q_long_live  = w_live * a / 2
+
+        u_long_arr = np.asarray(u_long)
+        edge_loads: list[dict] = []
         for i in range(n):
-            perp = perp_spans[i]
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % n]
+            edge_len = math.hypot(x2 - x1, y2 - y1)
+            if edge_len < 1e-9:
+                edge_loads.append({'dead_kNm': 0.0, 'live_kNm': 0.0})
+                continue
+            u_edge = np.array([(x2 - x1) / edge_len, (y2 - y1) / edge_len])
+            cos_theta = abs(float(u_edge @ u_long_arr))
 
-            if not is_two_way:
-                # ── UNA DIRECCIÓN ──────────────────────────────────────────
-                # Solo bordes con span corto perpendicular (los que reciben carga)
-                if abs(perp - a) < abs(perp - b):
-                    # Este borde tiene span perpendicular ≈ a → recibe la carga
-                    q_dead = w_dead * a / 2
-                    q_live = w_live * a / 2
-                else:
-                    q_dead = q_live = 0.0
-            else:
-                # ── DOS DIRECCIONES: método de 45° ─────────────────────────
-                if abs(perp - a) < abs(perp - b):
-                    # Borde LARGO (perp_span ≈ a → es paralelo al span largo)
-                    # Distribución trapezoidal
-                    q_dead = w_dead * (a / 2) * (1.0 - a / (2.0 * b))
-                    q_live = w_live * (a / 2) * (1.0 - a / (2.0 * b))
-                else:
-                    # Borde CORTO (perp_span ≈ b → es paralelo al span corto)
-                    # Distribución triangular
-                    q_dead = w_dead * a / 4.0
-                    q_live = w_live * a / 4.0
+            # cos_theta ≈ 1 → arista paralela al eje largo → es un lado
+            # LARGO del OBB → recibe la carga trapezoidal q_long.
+            # cos_theta ≈ 0 → arista perpendicular al eje largo → es un
+            # lado CORTO del OBB → recibe la carga triangular q_short.
+            # Interpolación lineal para orientaciones intermedias.
+            w_long_share  = cos_theta          # peso hacia lado largo
+            w_short_share = 1.0 - cos_theta    # peso hacia lado corto
+
+            q_dead = (q_long_dead * w_long_share + q_short_dead * w_short_share) * scale
+            q_live = (q_long_live * w_long_share + q_short_live * w_short_share) * scale
 
             edge_loads.append({'dead_kNm': round(q_dead, 4),
                                 'live_kNm': round(q_live, 4)})

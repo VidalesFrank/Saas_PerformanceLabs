@@ -7,6 +7,7 @@ Sheet row convention expected by the engine:
   Row 3: units row
   Row 4+: data
 """
+import json as _json
 import re
 import math
 from pathlib import Path
@@ -154,8 +155,9 @@ class E2KParser:
         _write_sheet(wb, 'Objects and Elements - Shells',
                      'TABLE:  "OBJECTS AND ELEMENTS - SHELLS"',
                      ['Story', 'Element Label', 'Area Type', 'Area Label',
-                      'Joint 1', 'Joint 2', 'Joint 3', 'Joint 4'],
-                     [None, None, None, None, None, None, None, None],
+                      'Joint 1', 'Joint 2', 'Joint 3', 'Joint 4',
+                      'Joints (JSON)'],
+                     [None, None, None, None, None, None, None, None, None],
                      df_shells)
 
         _write_sheet(wb, 'Floor Connectivity',
@@ -730,9 +732,10 @@ class E2KParser:
         for key in sorted(self.area_assigns.keys()):
             self._shell_elem_label[key] = counter
             counter += 1
-        # Labels adicionales para losas con >4 vértices (ver _mint_label /
-        # _build_oe_shells): cada triángulo extra del abanico necesita su
-        # propio Element Label, distinto de todos los ya asignados arriba.
+        # Contador para labels adicionales acuñados dinámicamente (por si
+        # algún flujo futuro necesita generar shells extra). Losas con >4
+        # vértices ahora se emiten como UNA fila con polígono completo (ver
+        # _build_oe_shells) y ya no consumen labels extras.
         self._next_label = counter
 
     def _mint_label(self) -> int:
@@ -819,29 +822,26 @@ class E2KParser:
                     ]
                 js_groups = [js]
             else:
-                # Losa: todos los corners en el mismo story.
-                # Polígonos de más de 4 vértices (formas en L, aberturas de
-                # escalera/ascensor) se triangulan en abanico desde pts[0]
-                # para no perder vértices — antes se truncaba a pts[:4] y los
-                # vértices descartados quedaban sin ningún elemento conectado
-                # ni membresía de diafragma: 6 GDL libres y rigidez nula, lo
-                # que vuelve singular la matriz de rigidez global del modal.
-                if len(pts) <= 4:
-                    js_groups = [[self._joint_label.get((p, story), 0) for p in pts[:4]]]
-                else:
-                    js_groups = [
-                        [self._joint_label.get((p, story), 0) for p in (pts[0], pts[i], pts[i + 1])]
-                        for i in range(1, len(pts) - 1)
-                    ]
+                # Losa: todos los corners en el mismo story. Se emite UNA sola
+                # fila con TODOS los joints del polígono en la nueva columna
+                # 'Joints (JSON)'. Joint 1..Joint 4 quedan con los primeros 4
+                # solo para retrocompatibilidad con lectores viejos, pero el
+                # polígono completo (N vértices) es la fuente autoritativa.
+                #
+                # Antes: se triangulaban losas de N>4 vértices en abanico desde
+                # pts[0] → N-2 filas por losa, con vértice común artificial.
+                # Ese mesh nunca llegó a OpenSees (LinearOPSBuilder solo
+                # convierte muros a ShellMITC4); solo servía al visor y al
+                # tributary_load como quads triangulares. Ahora se preserva
+                # la geometría original: 1 losa = 1 fila = polígono N-gonal.
+                js_all = [self._joint_label.get((p, story), 0) for p in pts]
+                js_groups = [js_all]
 
             for gi, js in enumerate(js_groups):
-                # Relleno con 0, no repitiendo el último corner: 0 es el
-                # marcador nulo que el resto del pipeline (validator,
-                # CanonicalModelBuilder) ya reconoce como "4° nodo ausente,
-                # shell triangular" — repetir un joint real aquí lo marcaría
-                # como shell degenerado en la validación.
-                while len(js) < 4:
-                    js.append(0)
+                # Para muros: js siempre tiene 4 elementos.
+                # Para losas: js puede tener N ≥ 3 elementos (todo el polígono).
+                # Joint 1..Joint 4 = primeros 4 (compat); el resto va en JSON.
+                js_pad = list(js) + [0] * max(0, 4 - len(js))
                 # Cada triángulo extra del abanico necesita su propio Element
                 # Label — solo el primer grupo reutiliza el ya asignado en
                 # _assign_element_labels.
@@ -851,12 +851,39 @@ class E2KParser:
                     'Element Label': row_label,
                     'Area Type': atype,
                     'Area Label': ar,
-                    'Joint 1': js[0],
-                    'Joint 2': js[1],
-                    'Joint 3': js[2],
-                    'Joint 4': js[3],
+                    'Joint 1': js_pad[0],
+                    'Joint 2': js_pad[1],
+                    'Joint 3': js_pad[2],
+                    'Joint 4': js_pad[3],
+                    # Fuente autoritativa del polígono (N-gonal para losas,
+                    # 4 nodos para muros). Se guarda como string JSON para
+                    # que Excel/pandas la traten como texto plano.
+                    'Joints (JSON)': _json.dumps([int(j) for j in js]),
                 })
         return pd.DataFrame(rows)
+
+    @staticmethod
+    def _joints_of_row(row) -> list:
+        """
+        Extrae la lista de joints de una fila de df_shells.
+        Prefiere la columna 'Joints (JSON)' (autoritativa, N vértices) si
+        está presente; cae a Joint 1..Joint 4 para retrocompatibilidad.
+        Filtra ceros y duplicados preservando el orden.
+        """
+        raw = row.get('Joints (JSON)') if 'Joints (JSON)' in row.index else None
+        joints = []
+        if isinstance(raw, str) and raw.strip():
+            try:
+                joints = [int(j) for j in _json.loads(raw)]
+            except Exception:
+                joints = []
+        if not joints:
+            joints = [row.get(f'Joint {i}', 0) for i in range(1, 5)]
+        seen = []
+        for j in joints:
+            if j and j not in seen:
+                seen.append(j)
+        return seen
 
     def _build_floor_connectivity(self, df_shells: pd.DataFrame,
                                   df_joints: pd.DataFrame) -> pd.DataFrame:
@@ -868,11 +895,7 @@ class E2KParser:
         for _, row in df_shells.iterrows():
             if str(row.get('Area Type', '')).lower() != 'floor':
                 continue
-            seen = []
-            for i in range(1, 5):
-                j = row.get(f'Joint {i}', 0)
-                if j and j not in seen:
-                    seen.append(j)
+            seen = self._joints_of_row(row)
             coords = [jcoords.get(j, (0.0, 0.0)) for j in seen]
             n = len(coords)
             perim = area = 0.0
@@ -909,21 +932,14 @@ class E2KParser:
             for _, row in df_joints.iterrows()
         }
 
-        # Una losa con >4 vértices ahora puede generar varias filas en
-        # df_shells (triángulos del abanico en _build_oe_shells) que comparten
-        # el mismo Area Label + Story — se guardan todas en una lista en vez
-        # de un dict por (area_label, story) para que no se sobrescriban
-        # entre sí (perdiendo área/masa de los triángulos que no sean el
-        # último procesado).
+        # Cada losa emite UNA fila con el polígono completo (Joints (JSON)),
+        # así que (area_label, story) es único. Se acumula en lista por si
+        # algún día se restablece un mesh submuestreado.
         shell_pieces: list[dict] = []
         for _, row in df_shells.iterrows():
             if str(row.get('Area Type', '')).lower() != 'floor':
                 continue
-            seen = []
-            for i in range(1, 5):
-                j = row.get(f'Joint {i}', 0)
-                if j and j not in seen:
-                    seen.append(j)
+            seen = self._joints_of_row(row)
             coords = [jcoords.get(j, (0.0, 0.0)) for j in seen]
             n = len(coords)
             area = cx = cy = 0.0
@@ -1087,11 +1103,10 @@ class E2KParser:
         return pd.DataFrame(rows)
 
     def _build_shell_loads_df(self, df_shells: pd.DataFrame) -> pd.DataFrame:
-        # Un AREALOAD de ETABS aplica a toda el área (Area Label). Si esa área
-        # quedó representada por varios elementos (losa >4 vértices,
-        # triangulada en _build_oe_shells), la carga se replica a cada uno de
-        # esos elementos — si no, solo el primer triángulo la recibiría y el
-        # resto quedaría sin carga gravitacional/sísmica de piso.
+        # Un AREALOAD de ETABS aplica a toda el área (Area Label). Con losas
+        # N-gonales de una sola fila cada (Area Label, Story) tiene un único
+        # Element Label; el fallback por listas se conserva por si en el
+        # futuro se re-introduce un mesh submuestreado.
         labels_by_area_story: dict[tuple, list[int]] = {}
         for _, row in df_shells.iterrows():
             key = (row['Area Label'], row['Story'])

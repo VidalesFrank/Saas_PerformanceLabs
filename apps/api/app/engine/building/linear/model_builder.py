@@ -9,6 +9,7 @@ Unidades de salida: metros (m), kN, MPa.
 """
 from __future__ import annotations
 
+import json
 import math
 from typing import Any
 
@@ -481,6 +482,8 @@ class CanonicalModelBuilder:
                     if m:
                         section_material_map[n] = m
 
+        has_json_col = "Joints (JSON)" in shells_df.columns
+
         shells: dict[str, dict] = {}
         for _, row in shells_df.iterrows():
             label    = _safe_str(row.get("Element Label", ""))
@@ -488,10 +491,27 @@ class CanonicalModelBuilder:
             story    = _safe_str(row.get("Story", ""))
             area_label = _safe_str(row.get("Area Label", label))
 
-            corner_joints = [
-                _safe_str(row.get(c, ""))
-                for c in ("Joint 1", "Joint 2", "Joint 3", "Joint 4")
-            ]
+            # Polígono N-gonal: prefiere la columna JSON (fuente autoritativa
+            # con todos los vértices originales de ETABS). Retrocompat: si la
+            # columna no existe o está vacía, usa Joint 1..Joint 4.
+            #
+            # IMPORTANTE: los joints del canonical se indexan como str(float)
+            # (ej. "2614.0") porque Excel los lee como floats. Al parsear el
+            # JSON los valores son ints puros, así que hay que reformatear a
+            # "<n>.0" para que el lookup en valid_joint_set / joints funcione.
+            corner_joints: list[str] = []
+            if has_json_col:
+                raw = row.get("Joints (JSON)")
+                if isinstance(raw, str) and raw.strip():
+                    try:
+                        corner_joints = [_safe_str(float(j)) for j in json.loads(raw) if j]
+                    except (ValueError, TypeError, json.JSONDecodeError):
+                        corner_joints = []
+            if not corner_joints:
+                corner_joints = [
+                    _safe_str(row.get(c, ""))
+                    for c in ("Joint 1", "Joint 2", "Joint 3", "Joint 4")
+                ]
             # Filtrar vacíos y marcadores nulos: "0" (int) o "0.0" (float de Excel)
             corner_joints = [j for j in corner_joints if j and j not in ("0", "0.0")]
 

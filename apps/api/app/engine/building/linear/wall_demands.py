@@ -4,7 +4,7 @@ WallDemandAnalyzer — Módulo 1 (muros): Análisis FHE y combinaciones NSR-10.
 Corre sobre el dominio OpenSees activo (construido por WallModelBuilder):
   1. Análisis gravitacional  → P_D por pier por historia
   2. FHE en X y en Y        → V_X, V_Y, M_X, M_Y por pier por historia
-  3. Combos NSR-10 C.9.2.1  → envolvente de diseño (Pu, Vu, Mu)
+  3. Combos NSR-10 B.2.4    → envolvente de diseño (Pu, Vu, Mu)
 
 Unidades de salida: kN, kN·m.
 """
@@ -342,7 +342,7 @@ class WallDemandAnalyzer:
         M_x:  dict[tuple, float],
         M_y:  dict[tuple, float],
     ) -> list[dict]:
-        """Genera la envolvente de demandas de diseño NSR-10 C.9.2.1."""
+        """Genera la envolvente de demandas de diseño NSR-10 B.2.4."""
         rows: list[dict] = []
 
         for (pier, story), g in pier_geom.items():

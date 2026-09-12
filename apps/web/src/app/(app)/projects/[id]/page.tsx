@@ -1531,7 +1531,7 @@ export default function StructuralProjectPage() {
               <div>
                 <h1 className="text-xl font-semibold text-[var(--text)]">Demandas de Muros — FHE NSR-10</h1>
                 <p className="text-sm text-[var(--text-muted)] mt-1">
-                  Modelo MVLEM_3D elástico · FHE NSR-10 A.4.2 · Combinaciones C.9.2.1
+                  Modelo MVLEM_3D elástico · FHE NSR-10 A.4.2 · Combinaciones NSR-10 B.2.4
                 </p>
               </div>
 
