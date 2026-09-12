@@ -1,22 +1,35 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { NLPushoverResult, NLPushoverDirResult } from "@/lib/structural-types";
 import DeformedShape3D    from "./DeformedShape3D";
 import CriticalPiersPanel from "./CriticalPiersPanel";
 import PierResponseCurves from "./PierResponseCurves";
+import VariantManager     from "./VariantManager";
+import VariantEditor      from "./VariantEditor";
+import { structuralAnalysisApi } from "@/lib/structural-api";
+import type { DesignVariant, WallDesignRow } from "@/lib/structural-types";
 
 interface Props {
-  result:    NLPushoverResult;
-  projectId: string;
+  result:      NLPushoverResult;
+  projectId:   string;
+  wallDesign?: { designs: WallDesignRow[] } | null;
 }
 
-export default function NLPushoverPanel({ result, projectId }: Props) {
+export default function NLPushoverPanel({ result, projectId, wallDesign }: Props) {
   const { pushover_X, pushover_Y, summary, fc_mpa, fy_mpa, target_drift_pct } = result;
   const [defDir, setDefDir] = useState<"X" | "Y">(
     pushover_X?.status === "success" || pushover_X?.status === "partial" ? "X" : "Y"
   );
   const [selectedPier, setSelectedPier] = useState<{ pier: string; story: string; direction: "X" | "Y" } | null>(null);
+  const [activeVariant, setActiveVariant] = useState<DesignVariant | null>(null);
+
+  const baselineForSelected: WallDesignRow | null = useMemo(() => {
+    if (!selectedPier || !wallDesign?.designs) return null;
+    return wallDesign.designs.find(
+      (d) => d.pier === selectedPier.pier && d.story === selectedPier.story
+    ) ?? null;
+  }, [selectedPier, wallDesign]);
 
   function handleSelectPier(pier: string, story: string, dir?: "X" | "Y") {
     const d = dir ?? defDir;
@@ -26,6 +39,19 @@ export default function NLPushoverPanel({ result, projectId }: Props) {
     setTimeout(() => {
       document.getElementById("pier-response-section")?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 100);
+  }
+
+  async function handleQuickCreateVariant() {
+    try {
+      const v = await structuralAnalysisApi.createDesignVariant(
+        projectId,
+        `Rediseño ${new Date().toLocaleDateString()}`,
+        "Variante creada rápidamente desde el editor",
+      );
+      setActiveVariant(v);
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   return (
@@ -143,8 +169,31 @@ export default function NLPushoverPanel({ result, projectId }: Props) {
             story={selectedPier.story}
             onClose={() => setSelectedPier(null)}
           />
+          {baselineForSelected && (
+            <VariantEditor
+              projectId={projectId}
+              pier={selectedPier.pier}
+              story={selectedPier.story}
+              baseline={baselineForSelected}
+              variant={activeVariant}
+              onVariantUpdated={setActiveVariant}
+              onRequestCreate={handleQuickCreateVariant}
+            />
+          )}
         </div>
       )}
+
+      {/* ── Gestor de variantes de rediseño ─────────────────────────────────── */}
+      <div className="flex flex-col gap-2">
+        <h3 className="text-sm font-semibold text-[var(--text)] uppercase tracking-wider">
+          Variantes de Rediseño (Fase 6.1)
+        </h3>
+        <VariantManager
+          projectId={projectId}
+          activeVariantId={activeVariant?.variant_id ?? null}
+          onSelect={setActiveVariant}
+        />
+      </div>
 
       {/* ── Ranking de pieres críticos ───────────────────────────────────────── */}
       <div className="flex flex-col gap-2">

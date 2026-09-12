@@ -157,6 +157,34 @@ export const structuralAnalysisApi = {
       `/analysis/${projectId}/nl-pushover/${direction}/pier-response` +
       `?pier=${encodeURIComponent(pier)}&story=${encodeURIComponent(story)}`,
     ),
+
+  // ── Variantes de diseño (Fase 6) ─────────────────────────────────────────
+  listDesignVariants: (projectId: string) =>
+    req<import("./structural-types").DesignVariantsResponse>(
+      `/analysis/${projectId}/design-variants`,
+    ),
+
+  createDesignVariant: (projectId: string, name: string, description = "") =>
+    req<import("./structural-types").DesignVariant>(
+      `/analysis/${projectId}/design-variants`,
+      { method: "POST", body: JSON.stringify({ name, description }) },
+    ),
+
+  updateDesignVariant: (
+    projectId: string,
+    variantId: string,
+    payload: { name?: string; description?: string; overrides?: Record<string, import("./structural-types").DesignVariantOverride | null> },
+  ) =>
+    req<import("./structural-types").DesignVariant>(
+      `/analysis/${projectId}/design-variants/${variantId}`,
+      { method: "PUT", body: JSON.stringify(payload) },
+    ),
+
+  deleteDesignVariant: (projectId: string, variantId: string) =>
+    req<{ deleted: string }>(
+      `/analysis/${projectId}/design-variants/${variantId}`,
+      { method: "DELETE" },
+    ),
 };
 
 // ── Editor del modelo estructural ────────────────────────────────────────────

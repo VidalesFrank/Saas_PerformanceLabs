@@ -1007,6 +1007,37 @@ export interface VDeltaPoint {
   drift_pct:  number;
 }
 
+// ── Variantes de diseño (Fase 6) ─────────────────────────────────────────────
+
+export interface DesignVariantOverride {
+  be_n_bars?:  number;
+  be_db_mm?:   number;
+  rho_v_pct?:  number;
+  rho_h_pct?:  number;
+  fc_mpa?:     number;
+  fy_mpa?:     number;
+  notes?:      string;
+}
+
+export type VariantStatus = "draft" | "analyzing" | "analyzed" | "failed";
+
+export interface DesignVariant {
+  variant_id:            string;
+  created_at:            string;
+  updated_at:            string;
+  name:                  string;
+  description:           string;
+  based_on:              string;
+  overrides:             Record<string, DesignVariantOverride>;  // key = "pier|story"
+  status:                VariantStatus;
+  analysis_job_id:       string | null;
+  analysis_result_path:  string | null;
+}
+
+export interface DesignVariantsResponse {
+  variants: DesignVariant[];
+}
+
 export interface PierResponseData {
   pier:            string;
   story:           string;

@@ -652,6 +652,99 @@ def get_nl_pushover_pier_response(
     }
 
 
+# ── Variantes de diseño (Fase 6) ──────────────────────────────────────────────
+
+@router.get("/{project_id}/design-variants")
+def list_design_variants(project_id: str, user: CurrentUser, db: DB):
+    """Lista todas las variantes de diseño creadas para el proyecto."""
+    from app.services.design_variants import list_variants
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    return {"variants": list_variants(work_dir)}
+
+
+class _VariantCreatePayload(BaseModel):
+    name:        str
+    description: str = ""
+
+
+@router.post("/{project_id}/design-variants", status_code=201)
+def create_design_variant(
+    project_id: str,
+    payload:    _VariantCreatePayload,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """Crea una nueva variante de diseño (sin overrides todavía)."""
+    from app.services.design_variants import create_variant
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    return create_variant(work_dir, payload.name, payload.description)
+
+
+class _VariantUpdatePayload(BaseModel):
+    name:        str | None = None
+    description: str | None = None
+    overrides:   dict | None = None    # {"pier|story": {be_n_bars, be_db_mm, ...} | null}
+
+
+@router.put("/{project_id}/design-variants/{variant_id}")
+def update_design_variant(
+    project_id: str,
+    variant_id: str,
+    payload:    _VariantUpdatePayload,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """
+    Actualiza una variante — nombre, descripción y/o overrides.
+    Los overrides se hacen merge: enviar {pier|story: null} elimina ese override.
+    """
+    from app.services.design_variants import update_variant
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    try:
+        return update_variant(
+            work_dir, variant_id,
+            {k: v for k, v in payload.model_dump().items() if v is not None},
+        )
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.delete("/{project_id}/design-variants/{variant_id}", status_code=200)
+def delete_design_variant(
+    project_id: str,
+    variant_id: str,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """Elimina una variante de diseño."""
+    from app.services.design_variants import delete_variant
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    ok = delete_variant(work_dir, variant_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Variante {variant_id} no encontrada")
+    return {"deleted": variant_id}
+
+
 @router.delete("/jobs/{job_id}/cancel", status_code=200)
 def cancel_job(job_id: str, user: CurrentUser, db: DB):
     """Cancela un job activo (pending o running)."""
