@@ -208,6 +208,7 @@ class StructuralAnalysisType(str, enum.Enum):
     wall_demands    = "wall_demands"     # FHE NSR-10 + combinaciones por pier (MVLEM_3D)
     wall_design     = "wall_design"      # Diseño RC de pieres (NSR-10 C.21): ρ, EBE, estribos
     nl_pushover     = "nl_pushover"      # Pushover no lineal de edificio de muros (MVLEM_3D)
+    variant_pushover = "variant_pushover" # Re-análisis pushover NL de una variante de rediseño
 
 
 class StructuralJobStatus(str, enum.Enum):

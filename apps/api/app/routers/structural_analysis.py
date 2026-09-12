@@ -217,6 +217,7 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
             StructuralAnalysisType.wall_demands:    "app.tasks.structural_wall_demands_task.run_wall_demands",
             StructuralAnalysisType.wall_design:     "app.tasks.structural_wall_design_task.run_wall_design",
             StructuralAnalysisType.nl_pushover:     "app.tasks.structural_nl_pushover_task.run_nl_pushover",
+            StructuralAnalysisType.variant_pushover: "app.tasks.structural_variant_pushover_task.run_variant_pushover",
         }
 
         kwargs: dict = {
@@ -743,6 +744,154 @@ def delete_design_variant(
     if not ok:
         raise HTTPException(status_code=404, detail=f"Variante {variant_id} no encontrada")
     return {"deleted": variant_id}
+
+
+@router.post(
+    "/{project_id}/design-variants/{variant_id}/analyze",
+    response_model=JobOut,
+    status_code=201,
+)
+def analyze_design_variant(
+    project_id: str,
+    variant_id: str,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """
+    Lanza el pushover no lineal de una variante de diseño (Sprint 6.2).
+
+    Reusa el pipeline `structural_variant_pushover_task`: aplica los overrides
+    sobre el diseño baseline y corre el pushover completo. Los resultados se
+    persisten por variante para poder compararlos con el baseline en el frontend.
+    """
+    from app.services.design_variants import get_variant, update_variant
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+
+    variant = get_variant(work_dir, variant_id)
+    if variant is None:
+        raise HTTPException(status_code=404, detail=f"Variante {variant_id} no encontrada")
+    if not variant.get("overrides"):
+        raise HTTPException(
+            status_code=400,
+            detail="La variante no tiene overrides. Añade al menos un cambio antes de analizarla.",
+        )
+    if variant.get("status") == "analyzing":
+        raise HTTPException(
+            status_code=409,
+            detail="La variante ya está siendo analizada. Espera a que termine.",
+        )
+
+    # Prerequisitos como en nl_pushover
+    baseline_design_path = os.path.join(work_dir, "results", "wall_design_results.json")
+    if not os.path.exists(baseline_design_path):
+        raise HTTPException(
+            status_code=400,
+            detail="No hay diseño baseline (wall_design_results.json). Ejecuta primero el diseño de muros RC.",
+        )
+    baseline_pushover = os.path.join(work_dir, "results", "nl_pushover_results.json")
+    if not os.path.exists(baseline_pushover):
+        raise HTTPException(
+            status_code=400,
+            detail="No hay pushover baseline. Ejecuta primero el pushover no lineal del baseline.",
+        )
+
+    # Crear el job
+    job = StructuralJob(
+        analysis_type = StructuralAnalysisType.variant_pushover,
+        status        = StructuralJobStatus.pending,
+        project_id    = project.id,
+        owner_id      = user.id,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    # Despachar tarea
+    try:
+        from app.tasks.celery_app import celery_app
+
+        parameters_dict = None
+        if project.parameters_json:
+            try:
+                parameters_dict = json.loads(project.parameters_json)
+            except Exception:
+                pass
+
+        kwargs = {
+            "job_id":          job.id,
+            "project_id":      project.id,
+            "input_file":      project.input_file_path,
+            "parameters_dict": parameters_dict,
+            "extra_params":    {"variant_id": variant_id},
+        }
+        task = celery_app.send_task(
+            "app.tasks.structural_variant_pushover_task.run_variant_pushover",
+            kwargs=kwargs,
+        )
+        job.celery_task_id = task.id
+        db.commit()
+        db.refresh(job)
+
+        # Marca la variante como analyzing (el task también lo hace, pero adelantamos
+        # el estado para que el frontend lo vea de inmediato en el listado).
+        update_variant(
+            work_dir, variant_id,
+            {
+                "status":               "analyzing",
+                "analysis_job_id":      job.id,
+                "analysis_result_path": None,
+                "error_message":        None,
+            },
+        )
+    except Exception as e:
+        job.status = StructuralJobStatus.failed
+        job.error_message = str(e)[:4000]
+        job.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Error al despachar tarea Celery: {e}")
+
+    return JobOut.from_orm(job)
+
+
+@router.get("/{project_id}/design-variants/{variant_id}/result")
+def get_design_variant_result(
+    project_id: str,
+    variant_id: str,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """
+    Retorna el resultado del pushover no lineal ejecutado sobre la variante.
+    Formato idéntico a `nl_pushover_results.json` + campos `variant_id`, `variant_name`.
+    """
+    from app.services.design_variants import get_variant
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+
+    variant = get_variant(work_dir, variant_id)
+    if variant is None:
+        raise HTTPException(status_code=404, detail=f"Variante {variant_id} no encontrada")
+
+    result_path = variant.get("analysis_result_path") or os.path.join(
+        work_dir, "results", f"nl_pushover_variant_{variant_id}_results.json"
+    )
+    if not os.path.exists(result_path):
+        raise HTTPException(
+            status_code=404,
+            detail="La variante aún no tiene resultado. Ejecuta el análisis primero.",
+        )
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 @router.delete("/jobs/{job_id}/cancel", status_code=200)

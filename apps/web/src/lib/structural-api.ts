@@ -185,6 +185,19 @@ export const structuralAnalysisApi = {
       `/analysis/${projectId}/design-variants/${variantId}`,
       { method: "DELETE" },
     ),
+
+  /** Lanza el pushover no lineal sobre la variante (Sprint 6.2). */
+  analyzeDesignVariant: (projectId: string, variantId: string) =>
+    req<StructuralJob>(
+      `/analysis/${projectId}/design-variants/${variantId}/analyze`,
+      { method: "POST" },
+    ),
+
+  /** Retorna el resultado del pushover NL de la variante. */
+  getDesignVariantResult: (projectId: string, variantId: string) =>
+    req<import("./structural-types").NLPushoverVariantResult>(
+      `/analysis/${projectId}/design-variants/${variantId}/result`,
+    ),
 };
 
 // ── Editor del modelo estructural ────────────────────────────────────────────

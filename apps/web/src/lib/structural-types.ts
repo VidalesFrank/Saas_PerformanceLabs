@@ -1032,6 +1032,14 @@ export interface DesignVariant {
   status:                VariantStatus;
   analysis_job_id:       string | null;
   analysis_result_path:  string | null;
+  analyzed_at?:          string | null;
+  error_message?:        string | null;
+}
+
+export interface NLPushoverVariantResult extends NLPushoverResult {
+  variant_id:    string;
+  variant_name?: string;
+  n_overrides:   number;
 }
 
 export interface DesignVariantsResponse {

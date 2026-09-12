@@ -3,16 +3,15 @@
 /**
  * VariantManager — Gestor de variantes de rediseño del edificio.
  *
- * Se ubica al inicio del NLPushoverPanel. Permite:
+ * Ubicado dentro de NLPushoverPanel. Permite:
  *   • Ver las variantes creadas
  *   • Seleccionar la variante activa (donde se guardan los overrides)
- *   • Crear una variante nueva
- *   • Borrar una variante
- *   • Ver cuántos overrides tiene cada variante
- *
- * El re-análisis se agrega en sprint 6.2.
+ *   • Crear / borrar variantes
+ *   • Lanzar el re-análisis (pushover NL) de una variante y hacer polling
+ *   • Cuando la variante queda "analyzed" ofrecer "Ver resultado" → dispara la
+ *     comparación baseline vs variante en el panel padre.
  */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { structuralAnalysisApi } from "@/lib/structural-api";
 import type { DesignVariant } from "@/lib/structural-types";
 
@@ -21,9 +20,18 @@ interface Props {
   activeVariantId:  string | null;
   onSelect:         (v: DesignVariant | null) => void;
   onVariantsChanged?: (list: DesignVariant[]) => void;
+  onShowResult?:    (v: DesignVariant) => void;
 }
 
-export default function VariantManager({ projectId, activeVariantId, onSelect, onVariantsChanged }: Props) {
+const POLL_INTERVAL_MS = 3000;
+
+export default function VariantManager({
+  projectId,
+  activeVariantId,
+  onSelect,
+  onVariantsChanged,
+  onShowResult,
+}: Props) {
   const [variants, setVariants] = useState<DesignVariant[]>([]);
   const [loading, setLoading]   = useState(true);
   const [creating, setCreating] = useState(false);
@@ -31,21 +39,47 @@ export default function VariantManager({ projectId, activeVariantId, onSelect, o
   const [newName, setNewName]   = useState("");
   const [newDesc, setNewDesc]   = useState("");
   const [err, setErr]           = useState<string | null>(null);
+  const [busyId, setBusyId]     = useState<string | null>(null);
 
-  async function loadList() {
-    setLoading(true); setErr(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const loadList = useCallback(async () => {
+    setErr(null);
     try {
       const res = await structuralAnalysisApi.listDesignVariants(projectId);
       setVariants(res.variants);
       onVariantsChanged?.(res.variants);
+      return res.variants;
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Error al cargar variantes");
-    } finally {
-      setLoading(false);
+      return [];
     }
-  }
+  }, [projectId, onVariantsChanged]);
 
-  useEffect(() => { loadList(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [projectId]);
+  useEffect(() => {
+    setLoading(true);
+    loadList().finally(() => setLoading(false));
+  }, [loadList]);
+
+  // ── Polling automático mientras haya variantes en estado "analyzing" ──────
+  useEffect(() => {
+    const hasAnalyzing = variants.some((v) => v.status === "analyzing");
+    if (!hasAnalyzing) {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+      return;
+    }
+    if (pollTimerRef.current) return; // ya hay uno activo
+    pollTimerRef.current = setInterval(loadList, POLL_INTERVAL_MS);
+    return () => {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+  }, [variants, loadList]);
 
   async function handleCreate() {
     if (!newName.trim()) return;
@@ -65,6 +99,10 @@ export default function VariantManager({ projectId, activeVariantId, onSelect, o
   }
 
   async function handleDelete(v: DesignVariant) {
+    if (v.status === "analyzing") {
+      alert("No se puede eliminar mientras el análisis está en curso. Espera a que termine.");
+      return;
+    }
     if (!confirm(`¿Eliminar la variante "${v.name}"?`)) return;
     try {
       await structuralAnalysisApi.deleteDesignVariant(projectId, v.variant_id);
@@ -77,6 +115,19 @@ export default function VariantManager({ projectId, activeVariantId, onSelect, o
     }
   }
 
+  async function handleAnalyze(v: DesignVariant) {
+    setBusyId(v.variant_id); setErr(null);
+    try {
+      await structuralAnalysisApi.analyzeDesignVariant(projectId, v.variant_id);
+      // Re-carga inmediata; el polling se activará por el useEffect al detectar analyzing.
+      await loadList();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Error al lanzar el análisis");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   const statusBadge = (s: string) => {
     const map: Record<string, string> = {
       draft:     "bg-slate-100 text-slate-700",
@@ -86,6 +137,10 @@ export default function VariantManager({ projectId, activeVariantId, onSelect, o
     };
     return map[s] ?? map.draft;
   };
+
+  const canAnalyze = (v: DesignVariant) =>
+    (v.status === "draft" || v.status === "failed") &&
+    Object.keys(v.overrides ?? {}).length > 0;
 
   return (
     <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
@@ -150,6 +205,7 @@ export default function VariantManager({ projectId, activeVariantId, onSelect, o
           {variants.map((v) => {
             const active = v.variant_id === activeVariantId;
             const nOverrides = Object.keys(v.overrides ?? {}).length;
+            const analyzeDisabled = !canAnalyze(v) || busyId === v.variant_id;
             return (
               <div
                 key={v.variant_id}
@@ -165,7 +221,7 @@ export default function VariantManager({ projectId, activeVariantId, onSelect, o
                   className="accent-[var(--accent)]"
                 />
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-sm font-medium text-[var(--text)] truncate">{v.name}</span>
                     <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${statusBadge(v.status)}`}>
                       {v.status}
@@ -177,14 +233,62 @@ export default function VariantManager({ projectId, activeVariantId, onSelect, o
                   {v.description && (
                     <p className="text-[11px] text-[var(--text-muted)] mt-0.5 truncate">{v.description}</p>
                   )}
+                  {v.status === "failed" && v.error_message && (
+                    <p className="text-[11px] text-red-600 mt-0.5 truncate" title={v.error_message}>
+                      Error: {v.error_message}
+                    </p>
+                  )}
                 </div>
-                <button
-                  onClick={() => handleDelete(v)}
-                  className="text-xs text-[var(--text-muted)] hover:text-red-600 px-2"
-                  title="Eliminar variante"
-                >
-                  ✕
-                </button>
+
+                <div className="flex items-center gap-1.5">
+                  {v.status === "analyzed" && (
+                    <button
+                      onClick={() => onShowResult?.(v)}
+                      className="px-2.5 py-1 rounded text-[11px] font-medium bg-green-600 text-white hover:bg-green-700"
+                      title="Comparar con baseline"
+                    >
+                      Ver resultado
+                    </button>
+                  )}
+                  {v.status === "analyzing" && (
+                    <span className="text-[11px] text-blue-700 font-medium animate-pulse px-2">
+                      Analizando…
+                    </span>
+                  )}
+                  {(v.status === "draft" || v.status === "failed") && (
+                    <button
+                      onClick={() => handleAnalyze(v)}
+                      disabled={analyzeDisabled}
+                      className={[
+                        "px-2.5 py-1 rounded text-[11px] font-medium transition-colors",
+                        analyzeDisabled
+                          ? "bg-[var(--surface-2)] text-[var(--text-muted)] opacity-50 cursor-not-allowed"
+                          : "bg-[var(--accent)] text-white hover:opacity-90",
+                      ].join(" ")}
+                      title={
+                        nOverrides === 0
+                          ? "Añade al menos un override para poder analizar"
+                          : v.status === "failed"
+                          ? "Reintentar análisis"
+                          : "Ejecutar pushover no lineal con esta variante"
+                      }
+                    >
+                      {busyId === v.variant_id
+                        ? "Lanzando…"
+                        : v.status === "failed"
+                        ? "Reintentar"
+                        : "Analizar"}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => handleDelete(v)}
+                    disabled={v.status === "analyzing"}
+                    className="text-xs text-[var(--text-muted)] hover:text-red-600 px-2 disabled:opacity-40 disabled:cursor-not-allowed"
+                    title="Eliminar variante"
+                  >
+                    ✕
+                  </button>
+                </div>
               </div>
             );
           })}
@@ -196,7 +300,7 @@ export default function VariantManager({ projectId, activeVariantId, onSelect, o
               Trabajar sin variante (solo baseline)
             </button>
             <span className="text-[10px] text-[var(--text-muted)] italic">
-              El re-análisis diferencial se habilitará en el próximo sprint
+              El análisis puede tardar varios minutos según el número de pieres.
             </span>
           </div>
         </div>

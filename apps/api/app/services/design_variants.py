@@ -111,6 +111,15 @@ def create_variant(
     return variant
 
 
+_ANALYSIS_FIELDS = (
+    "status",
+    "analysis_job_id",
+    "analysis_result_path",
+    "analyzed_at",
+    "error_message",
+)
+
+
 def update_variant(
     work_dir:    str,
     variant_id:  str,
@@ -120,6 +129,10 @@ def update_variant(
     Actualiza campos de una variante. Los `overrides` en updates se hacen MERGE
     con los existentes (no reemplazan). Para eliminar un override, envíalo como
     `{pier|story: null}`.
+
+    Campos de análisis (status, analysis_job_id, analysis_result_path,
+    analyzed_at, error_message) también son aceptados y usados por el task
+    Celery de re-análisis.
     """
     data = load_variants(work_dir)
     variant = next((v for v in data["variants"] if v["variant_id"] == variant_id), None)
@@ -127,6 +140,10 @@ def update_variant(
         raise KeyError(f"Variante {variant_id} no encontrada")
 
     for field in ("name", "description"):
+        if field in updates:
+            variant[field] = updates[field]
+
+    for field in _ANALYSIS_FIELDS:
         if field in updates:
             variant[field] = updates[field]
 
@@ -140,14 +157,15 @@ def update_variant(
                     **variant["overrides"].get(k, {}),
                     **v,
                 }
+        # Si se cambiaron overrides, el análisis previo queda invalidado
+        if variant.get("status") in ("analyzed", "failed"):
+            variant["status"] = "draft"
+            variant["analysis_job_id"] = None
+            variant["analysis_result_path"] = None
+            variant.pop("analyzed_at", None)
+            variant.pop("error_message", None)
 
     variant["updated_at"] = _now_iso()
-    # Si se cambiaron overrides, el análisis previo queda invalidado
-    if "overrides" in updates and variant.get("status") == "analyzed":
-        variant["status"] = "draft"
-        variant["analysis_job_id"] = None
-        variant["analysis_result_path"] = None
-
     save_variants(work_dir, data)
     return variant
 
