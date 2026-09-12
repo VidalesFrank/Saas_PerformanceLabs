@@ -57,13 +57,19 @@ class JobOut(BaseModel):
 
     @classmethod
     def from_orm(cls, j: BuildingJob) -> "JobOut":
+        raw = j.result_summary
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (ValueError, TypeError):
+                raw = None
         return cls(
             id=j.id,
             celery_task_id=j.celery_task_id,
             analysis_type=j.analysis_type.value,
             status=j.status.value,
             result_path=j.result_path,
-            result_summary=j.result_summary,
+            result_summary=raw,
             error_message=j.error_message,
             project_id=j.project_id,
             created_at=j.created_at.isoformat(),

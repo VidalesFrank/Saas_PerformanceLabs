@@ -7,7 +7,7 @@ interface Props {
   result: WallDemandsResult;
 }
 
-const COMBOS = ["1.4D", "1.2D+1.6L", "1.2D+L+E", "0.9D+E"];
+const COMBOS = ["1.4D", "1.2D+1.6L", "1.2D+L+E", "0.9D-E"];
 
 export default function WallDemandsPanel({ result }: Props) {
   const { fhe_params, story_forces, pier_demands } = result;
@@ -60,11 +60,12 @@ export default function WallDemandsPanel({ result }: Props) {
           </p>
           <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-sm">
             {[
-              ["hn", `${fhe_params.hn_m} m`],
-              ["T", `${fhe_params.T_s} s`],
-              ["Cs", fhe_params.Cs.toFixed(4)],
-              ["W", `${fhe_params.W_kN.toFixed(0)} kN`],
-              ["Vb", `${fhe_params.Vb_kN.toFixed(1)} kN`],
+              ["hn",     fhe_params.hn_m  != null ? `${fhe_params.hn_m} m`          : "—"],
+              ["T",      fhe_params.T_s   != null ? `${fhe_params.T_s} s`           : "—"],
+              ["Cs",     fhe_params.Cs    != null ? fhe_params.Cs.toFixed(4)        : "—"],
+              ["W",      fhe_params.W_kN  != null ? `${fhe_params.W_kN.toFixed(0)} kN`  : "—"],
+              ["Vb",     fhe_params.Vb_kN != null ? `${fhe_params.Vb_kN.toFixed(1)} kN` : "—"],
+              ["Fuente", fhe_params.source ?? "FHE"],
             ].map(([k, v]) => (
               <div key={k} className="flex justify-between gap-2">
                 <span className="text-[var(--text-muted)]">{k}</span>

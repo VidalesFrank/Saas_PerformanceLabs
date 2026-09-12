@@ -810,11 +810,14 @@ export interface ViewerTypeFilter {
 // ── Tipos para demandas de muros (FHE NSR-10 + MVLEM_3D) ────────────────────
 
 export interface WallFHEParams {
-  hn_m:  number;
-  T_s:   number;
-  Cs:    number;
-  W_kN:  number;
-  Vb_kN: number;
+  hn_m:   number;
+  W_kN:   number;
+  Vb_kN:  number;
+  /** "FHE" (interno) o "RSA" (vino de spectral_results.json). */
+  source?: string;
+  /** Solo definidos cuando source=FHE (el modo RSA no calcula T ni Cs). */
+  T_s?:   number;
+  Cs?:    number;
 }
 
 export interface WallPierDemand {

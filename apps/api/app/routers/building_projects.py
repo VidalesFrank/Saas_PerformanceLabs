@@ -100,11 +100,17 @@ class JobOut(BaseModel):
 
     @classmethod
     def from_orm_extra(cls, j: BuildingJob) -> "JobOut":
+        raw = j.result_summary
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (ValueError, TypeError):
+                raw = None
         return cls(
             id=j.id, analysis_type=j.analysis_type.value,
             status=j.status.value,
             result_path=j.result_path,
-            result_summary=j.result_summary,
+            result_summary=raw,
             error_message=j.error_message,
             created_at=j.created_at.isoformat(),
             finished_at=j.finished_at.isoformat() if j.finished_at else None,

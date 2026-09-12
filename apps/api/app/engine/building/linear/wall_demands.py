@@ -1,10 +1,24 @@
 """
-WallDemandAnalyzer — Módulo 1 (muros): Análisis FHE y combinaciones NSR-10.
+WallDemandAnalyzer — Módulo 1 (muros): Análisis por casos + combinaciones NSR-10.
 
-Corre sobre el dominio OpenSees activo (construido por WallModelBuilder):
-  1. Análisis gravitacional  → P_D por pier por historia
-  2. FHE en X y en Y        → V_X, V_Y, M_X, M_Y por pier por historia
-  3. Combos NSR-10 B.2.4    → envolvente de diseño (Pu, Vu, Mu)
+Corre 4 análisis independientes sobre el dominio MVLEM_3D (WallModelBuilder):
+  1. Caso CM (Dead)   → P_D, Vx_D, Vy_D, Mx_D, My_D por pier
+  2. Caso CV (Live)   → P_L, Vx_L, Vy_L, Mx_L, My_L por pier
+  3. Caso Sx          → P_Sx, Vx_Sx, Vy_Sx, Mx_Sx, My_Sx por pier
+  4. Caso Sy          → P_Sy, Vx_Sy, Vy_Sy, Mx_Sy, My_Sy por pier
+
+Luego superpone según NSR-10 B.2.4:
+  1.4D         →  aD·(P,V,M)_D
+  1.2D+1.6L    →  1.2·(P,V,M)_D + 1.6·(P,V,M)_L
+  1.2D+L+E     →  1.2·(P,V,M)_D + 1.0·(P,V,M)_L + 1.0·(P,V,M)_S(peor)
+  0.9D+E       →  0.9·(P,V,M)_D − 1.0·(P,V,M)_S (para máx tensión / mín compresión)
+
+Convención de fuerzas (globales, del eleForce del MVLEM_3D en nodos base i,j):
+  P    = |Fz_i + Fz_j|            axial (compresión positiva)
+  Vx   = |Fx_i + Fx_j|            cortante en dir X global
+  Vy   = |Fy_i + Fy_j|            cortante en dir Y global
+  Mx   = Vy · hw                  momento sobre eje X (por Vy actuando a altura hw)
+  My   = Vx · hw                  momento sobre eje Y (por Vx actuando a altura hw)
 
 Unidades de salida: kN, kN·m.
 """
@@ -15,12 +29,14 @@ from typing import Any
 
 
 # ── NSR-10: combos de diseño ─────────────────────────────────────────────────
-# (alpha_D, alpha_L, alpha_E, label)
+# (alpha_D, alpha_L, alpha_E, sign_E, label)
+# sign_E: +1 → sismo suma a gravedad (compresión máx / cortante máx)
+#         −1 → sismo resta (tensión / levantamiento — combo 0.9D+E)
 _COMBOS_NSR10 = [
-    (1.4,  0.0, 0.0, "1.4D"),
-    (1.2,  1.6, 0.0, "1.2D+1.6L"),
-    (1.2,  1.0, 1.0, "1.2D+L+E"),    # E seísmo máximo
-    (0.9,  0.0, 1.0, "0.9D+E"),       # mínima compresión + sismo
+    (1.4,  0.0, 0.0,  0, "1.4D"),
+    (1.2,  1.6, 0.0,  0, "1.2D+1.6L"),
+    (1.2,  1.0, 1.0, +1, "1.2D+L+E"),     # E máximo suma
+    (0.9,  0.0, 1.0, -1, "0.9D-E"),       # levantamiento / tensión
 ]
 
 GRAVITY = 9.81  # m/s²
@@ -106,31 +122,47 @@ class WallDemandAnalyzer:
                 "Vb_kN":  round(Vb_kN, 1),
             }
 
-        # ── 2. Fuerzas gravitacionales por pier ──────────────────────────────
-        # Si vienen overrides del GravityOPSBuilder (ShellMITC4 + 45°) los usamos.
-        # Si no (compatibilidad hacia atrás), usamos la distribución por masa.
-        if self._gov:
-            P_D = self._pier_gravity_from_overrides(pier_geom)
-        else:
-            P_D = self._run_gravity(ops, pier_geom, ele_map, node_map, story_mass, stories)
+        # ── 3. Cuatro análisis independientes (D, L, Sx, Sy) ─────────────────
+        gravity_dead = self._gravity_load_by_pier(pier_geom, "dead")
+        gravity_live = self._gravity_load_by_pier(pier_geom, "live")
 
-        # ── 3. Análisis lateral X ─────────────────────────────────────────────
-        V_x, M_x = self._run_lateral(
-            ops, "X", story_forces_x, cm_nodes, pier_geom, ele_map, node_map, stories
+        case_D = self._run_case(
+            ops, "D",
+            gravity_loads=gravity_dead, lateral_dir=None, lateral_forces=None,
+            cm_nodes=cm_nodes, pier_geom=pier_geom, ele_map=ele_map,
+            node_map=node_map,
+        )
+        case_L = self._run_case(
+            ops, "L",
+            gravity_loads=gravity_live, lateral_dir=None, lateral_forces=None,
+            cm_nodes=cm_nodes, pier_geom=pier_geom, ele_map=ele_map,
+            node_map=node_map,
+        )
+        case_Sx = self._run_case(
+            ops, "Sx",
+            gravity_loads=None, lateral_dir="X", lateral_forces=story_forces_x,
+            cm_nodes=cm_nodes, pier_geom=pier_geom, ele_map=ele_map,
+            node_map=node_map,
+        )
+        case_Sy = self._run_case(
+            ops, "Sy",
+            gravity_loads=None, lateral_dir="Y", lateral_forces=story_forces_y,
+            cm_nodes=cm_nodes, pier_geom=pier_geom, ele_map=ele_map,
+            node_map=node_map,
         )
 
-        # ── 4. Análisis lateral Y ─────────────────────────────────────────────
-        V_y, M_y = self._run_lateral(
-            ops, "Y", story_forces_y, cm_nodes, pier_geom, ele_map, node_map, stories
+        print(
+            f"[wall_demands] Casos ejecutados: D V_x_max={max(case_D['Vx'].values() or [0]):.2f} kN"
+            f" | L V_x_max={max(case_L['Vx'].values() or [0]):.2f} kN"
+            f" | Sx V_x_max={max(case_Sx['Vx'].values() or [0]):.2f} kN"
+            f" | Sy V_y_max={max(case_Sy['Vy'].values() or [0]):.2f} kN"
         )
 
-        # ── 5. Combinaciones NSR-10 ───────────────────────────────────────────
-        if self._gov:
-            P_L = {(pier, story): abs(self._gov.get(f'{pier}|{story}', {}).get('live_kN', 0.0))
-                   for (pier, story) in P_D}
-        else:
-            P_L = {k: 0.0 for k in P_D}  # sin override: conservador L=0
-        combos = self._combine(pier_geom, P_D, P_L, V_x, V_y, M_x, M_y)
+        # ── 4. Combinaciones NSR-10 B.2.4 por superposición ──────────────────
+        combos = self._combine(pier_geom, case_D, case_L, case_Sx, case_Sy)
+
+        # Compatibilidad: gravity_axials del caso D (para el UI/frontend actual)
+        P_D = case_D["P"]
 
         return {
             "fhe_params": demand_params,
@@ -204,182 +236,212 @@ class WallDemandAnalyzer:
 
         return forces, dict(forces)  # misma distribución en X e Y por ahora
 
-    # ── Gravitacional desde ShellMITC4 ───────────────────────────────────────
+    # ── Cargas gravitacionales por pier (desde overrides o distribución por masa) ─
 
-    def _pier_gravity_from_overrides(self, pier_geom: dict) -> dict[tuple, float]:
+    def _gravity_load_by_pier(self, pier_geom: dict, kind: str) -> dict[str, float]:
         """
-        Construye P_D por (pier, story) a partir de los resultados del
-        GravityOPSBuilder (ShellMITC4 + método de 45°).
-        Usa Dead + Live como carga de servicio total; los combos NSR-10
-        aplican los factores sobre P_D (dead) y P_L (live) en _combine().
+        Retorna la carga vertical Dead o Live por pier (kN, sentido gravitacional
+        hacia abajo) construida desde los overrides del GravityOPSBuilder.
+        Fallback: si no hay overrides para Live, retorna 0 por pier.
+
+        kind: "dead" o "live"
         """
-        P_D: dict[tuple, float] = {}
+        key_kN = "dead_kN" if kind == "dead" else "live_kN"
+        out: dict[str, float] = {}
         for (pier, story) in pier_geom:
-            key   = f'{pier}|{story}'
-            loads = self._gov.get(key, {})
-            P_D[(pier, story)] = abs(loads.get('dead_kN', 0.0))
-        return P_D
+            key   = f"{pier}|{story}"
+            loads = self._gov.get(key, {}) if self._gov else {}
+            out[key] = abs(float(loads.get(key_kN, 0.0)))
+        return out
 
-    # ── Análisis gravitacional (fallback: distribución por masa) ──────────────
+    # ── Análisis por caso de carga (D, L, Sx o Sy) ────────────────────────────
 
-    def _run_gravity(
+    def _run_case(
         self,
         ops,
-        pier_geom:  dict,
-        ele_map:    dict,
-        node_map:   dict,
-        story_mass: dict,
-        stories:    list[str],
-    ) -> dict[tuple, float]:
+        case_name:      str,
+        gravity_loads:  dict[str, float] | None,
+        lateral_dir:    str | None,
+        lateral_forces: dict[str, float] | None,
+        cm_nodes:       dict,
+        pier_geom:      dict,
+        ele_map:        dict,
+        node_map:       dict,
+    ) -> dict[str, dict[tuple, float]]:
         """
-        Aplica el peso de cada piso como cargas puntuales en los nodos top
-        del pier, proporcionales al área transversal (lw × tw).
-        Retorna P_D por (pier, story) en kN (compresión positiva).
+        Ejecuta un análisis lineal independiente para un caso de carga y extrae
+        P, Vx, Vy, Mx, My por pier.
+
+        - gravity_loads:  {"pier|story": F_kN}  → cargas Fz negativas en top nodes
+                                                    del pier (repartidas 50/50).
+        - lateral_dir:    "X" o "Y" o None
+        - lateral_forces: {story: F_kN}          → aplicadas en el CM del piso.
+
+        Entre casos se hace ops.reset() + wipeAnalysis() + remove pattern/ts
+        para que cada análisis sea independiente (superposición lineal explícita).
+
+        Retorna: {"P": {(pier,story): kN}, "Vx": ..., "Vy": ..., "Mx": ..., "My": ...}
         """
-        # Área total de pieres por piso
-        area_by_story: dict[str, float] = {}
-        for (pier, story), g in pier_geom.items():
-            area_by_story[story] = area_by_story.get(story, 0.0) + g["A_m2"]
+        # Reset del estado entre casos: limpia desplazamientos, reacciones y
+        # patterns residuales. En análisis lineal esto garantiza que cada caso
+        # arranque del estado indeformado sin cargas heredadas.
+        ops.wipeAnalysis()
+        try:
+            ops.reset()
+        except Exception:
+            pass
 
-        ops.timeSeries("Linear", 1)
-        ops.pattern("Plain", 1, 1)
+        # Tags únicos por caso para no chocar con patterns residuales
+        ts_tag  = {"D": 101, "L": 102, "Sx": 103, "Sy": 104}.get(case_name, 199)
+        pat_tag = ts_tag
 
-        for story in stories[1:]:  # skip base
-            W_story = story_mass.get(story, 0.0) * GRAVITY  # kN
-            A_total = area_by_story.get(story, 1.0)
-            for (pier, st), g in pier_geom.items():
-                if st != story:
-                    continue
-                frac = g["A_m2"] / A_total
-                P_pier = W_story * frac         # kN por pier (hacia abajo)
-                idx = g["story_idx"]
-                n_left  = node_map[(pier, idx, 0)]
-                n_right = node_map[(pier, idx, 1)]
-                # Reparte la mitad a cada nodo top
-                ops.load(n_left,  0.0, 0.0, -P_pier / 2, 0.0, 0.0, 0.0)
-                ops.load(n_right, 0.0, 0.0, -P_pier / 2, 0.0, 0.0, 0.0)
+        try:
+            ops.remove("loadPattern", pat_tag)
+        except Exception:
+            pass
+        try:
+            ops.remove("timeSeries", ts_tag)
+        except Exception:
+            pass
 
-        self._run_static(ops, n_steps=10, dt=0.1)
-
-        # Extrae axial en la base de cada pier (nodos base)
-        P_D: dict[tuple, float] = {}
-        for (pier, story), ele_tag in ele_map.items():
-            f = ops.eleForce(ele_tag)   # 24 DOF: [f_ni_1..6, f_nj_1..6, f_nk_1..6, f_nl_1..6]
-            # Fz en nodos base (ni, nj) → índices 2 y 8
-            Fz_i = f[2]; Fz_j = f[8]
-            P_D[(pier, story)] = abs(Fz_i + Fz_j)  # compresión positiva
-        return P_D
-
-    # ── Análisis lateral FHE ──────────────────────────────────────────────────
-
-    def _run_lateral(
-        self,
-        ops,
-        direction:    str,
-        story_forces: dict[str, float],
-        cm_nodes:     dict,
-        pier_geom:    dict,
-        ele_map:      dict,
-        node_map:     dict,
-        stories:      list[str],
-    ) -> tuple[dict[tuple, float], dict[tuple, float]]:
-        """
-        Aplica fuerzas de piso en los nodos CM (dirección X o Y).
-        Retorna (V, M) por (pier, story) en kN y kN·m.
-        """
-        # Mantener gravedad como carga constante y agregar lateral
-        ops.loadConst("-time", 0.0)
-
-        ts_tag  = 10 if direction == "X" else 20
-        pat_tag = 10 if direction == "X" else 20
         ops.timeSeries("Linear", ts_tag)
         ops.pattern("Plain", pat_tag, ts_tag)
 
-        dof_idx = 0 if direction == "X" else 1  # X=DOF 1 (idx 0), Y=DOF 2 (idx 1)
-        for story, cm in cm_nodes.items():
-            Fx = story_forces.get(story, 0.0)
-            load = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-            load[dof_idx] = Fx
-            ops.load(cm["tag"], *load)
+        # Aplicación de cargas
+        if gravity_loads:
+            for (pier, story), g in pier_geom.items():
+                F = gravity_loads.get(f"{pier}|{story}", 0.0)
+                if F == 0.0:
+                    continue
+                idx = g["story_idx"]
+                n_left  = node_map[(pier, idx, 0)]
+                n_right = node_map[(pier, idx, 1)]
+                half = F / 2.0
+                # Fz negativo → carga hacia abajo (compresión en el pier)
+                ops.load(n_left,  0.0, 0.0, -half, 0.0, 0.0, 0.0)
+                ops.load(n_right, 0.0, 0.0, -half, 0.0, 0.0, 0.0)
 
-        self._run_static(ops, n_steps=10, dt=0.1)
+        if lateral_dir in ("X", "Y") and lateral_forces:
+            dof_idx = 0 if lateral_dir == "X" else 1
+            for story, cm in cm_nodes.items():
+                F = lateral_forces.get(story, 0.0)
+                if F == 0.0:
+                    continue
+                load = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                load[dof_idx] = F
+                ops.load(cm["tag"], *load)
 
-        V: dict[tuple, float] = {}
-        M: dict[tuple, float] = {}
+        # Un solo paso con dt=1.0 aplica el pattern con factor 1.0 (lineal).
+        self._run_static(ops, n_steps=1, dt=1.0)
+
+        # Extracción de fuerzas por pier
+        P: dict[tuple, float]  = {}
+        Vx: dict[tuple, float] = {}
+        Vy: dict[tuple, float] = {}
+        Mx: dict[tuple, float] = {}
+        My: dict[tuple, float] = {}
 
         for (pier, story), ele_tag in ele_map.items():
-            f   = ops.eleForce(ele_tag)
-            g   = pier_geom[(pier, story)]
-            hw  = g["hw"]
+            f  = ops.eleForce(ele_tag)   # 24 DOF: 4 nodos × 6 DOF (global)
+            hw = pier_geom[(pier, story)]["hw"]
 
-            # Corte horizontal en base del elemento (nodos ni, nj)
-            # Para X: Fx en nodos base → índices 0 y 6
-            # Para Y: Fy en nodos base → índices 1 y 7
-            if direction == "X":
-                Vi = -(f[0] + f[6])   # suma Fx base, signo de reacción
-            else:
-                Vi = -(f[1] + f[7])
+            # Fuerzas sumadas en los dos nodos base (i, j):
+            # i: índices 0..5   (Fx_i, Fy_i, Fz_i, Mx_i, My_i, Mz_i)
+            # j: índices 6..11
+            Fx_base = f[0] + f[6]
+            Fy_base = f[1] + f[7]
+            Fz_base = f[2] + f[8]
 
-            # Momento en base por equilibrio estático: M = V × hw
-            # (válido para un pier de una historia; para multi-historia el
-            #  momento acumulado se calcula post-proceso en la API)
-            Mi = abs(Vi) * hw
+            P[(pier, story)]  = abs(Fz_base)     # compresión positiva
+            Vx[(pier, story)] = abs(Fx_base)     # cortante en X global
+            Vy[(pier, story)] = abs(Fy_base)     # cortante en Y global
+            # Momento en la base por equilibrio: la fuerza horizontal aplicada
+            # arriba genera un momento en la base = V × hw. Es una estimación
+            # razonable para muros aislados; para multi-piso el momento real
+            # incluye contribución de pisos superiores (superposición ya lo
+            # captura al sumar los casos, no acumulado por piso).
+            Mx[(pier, story)] = abs(Fy_base) * hw   # flexión sobre eje X (Vy·hw)
+            My[(pier, story)] = abs(Fx_base) * hw   # flexión sobre eje Y (Vx·hw)
 
-            V[(pier, story)] = abs(Vi)
-            M[(pier, story)] = Mi
+        # Limpia el pattern/ts para el próximo caso
+        try:
+            ops.remove("loadPattern", pat_tag)
+        except Exception:
+            pass
+        try:
+            ops.remove("timeSeries", ts_tag)
+        except Exception:
+            pass
 
-        return V, M
+        return {"P": P, "Vx": Vx, "Vy": Vy, "Mx": Mx, "My": My}
 
-    # ── Combinaciones NSR-10 ──────────────────────────────────────────────────
+    # ── Combinaciones NSR-10 B.2.4 por superposición ──────────────────────────
 
     def _combine(
         self,
         pier_geom: dict,
-        P_D:  dict[tuple, float],
-        P_L:  dict[tuple, float],
-        V_x:  dict[tuple, float],
-        V_y:  dict[tuple, float],
-        M_x:  dict[tuple, float],
-        M_y:  dict[tuple, float],
+        case_D:  dict[str, dict[tuple, float]],
+        case_L:  dict[str, dict[tuple, float]],
+        case_Sx: dict[str, dict[tuple, float]],
+        case_Sy: dict[str, dict[tuple, float]],
     ) -> list[dict]:
-        """Genera la envolvente de demandas de diseño NSR-10 B.2.4."""
+        """
+        Superpone los 4 casos (D, L, Sx, Sy) según NSR-10 B.2.4.
+
+        Para cada combo con sismo (alpha_E ≠ 0), se elige la componente sísmica
+        que MAXIMIZA cada demanda (Vu, Mu) en valor absoluto, tomando la peor
+        entre Sx y Sy:
+            Vu_x_E = max(|Vx_Sx|, |Vx_Sy|)
+            Mu_x_E = max(|Mx_Sx|, |Mx_Sy|)
+
+        Para el axial:
+            sign_E = +1 (combo 1.2D+L+E) → Pu = 1.2·P_D + 1.0·P_L + max(P_S)
+                                            (compresión máx para diseño flexo-compresión)
+            sign_E = −1 (combo 0.9D−E)   → Pu = 0.9·P_D − max(P_S)
+                                            (tensión máx / mín compresión para levantamiento)
+        Nota: en el modelo lineal simétrico ideal P_S ≈ 0 en muros interiores;
+        para muros perimetrales o cargados por sobre­carga excéntrica sí existe
+        aporte sísmico axial.
+        """
         rows: list[dict] = []
 
         for (pier, story), g in pier_geom.items():
-            pd_val = P_D.get((pier, story), 0.0)
-            pl_val = P_L.get((pier, story), 0.0)
-            vx     = V_x.get((pier, story), 0.0)
-            vy     = V_y.get((pier, story), 0.0)
-            mx     = M_x.get((pier, story), 0.0)
-            my     = M_y.get((pier, story), 0.0)
+            k = (pier, story)
+            PD  = case_D ["P"].get(k, 0.0); VxD  = case_D ["Vx"].get(k, 0.0)
+            VyD  = case_D ["Vy"].get(k, 0.0); MxD  = case_D ["Mx"].get(k, 0.0); MyD  = case_D ["My"].get(k, 0.0)
+            PL  = case_L ["P"].get(k, 0.0); VxL  = case_L ["Vx"].get(k, 0.0)
+            VyL  = case_L ["Vy"].get(k, 0.0); MxL  = case_L ["Mx"].get(k, 0.0); MyL  = case_L ["My"].get(k, 0.0)
+            PSx = case_Sx["P"].get(k, 0.0); VxSx = case_Sx["Vx"].get(k, 0.0)
+            VySx = case_Sx["Vy"].get(k, 0.0); MxSx = case_Sx["Mx"].get(k, 0.0); MySx = case_Sx["My"].get(k, 0.0)
+            PSy = case_Sy["P"].get(k, 0.0); VxSy = case_Sy["Vx"].get(k, 0.0)
+            VySy = case_Sy["Vy"].get(k, 0.0); MxSy = case_Sy["Mx"].get(k, 0.0); MySy = case_Sy["My"].get(k, 0.0)
 
-            # Dirección dominante: la que produce mayor cortante
-            V_E = max(vx, vy)
-            M_E = mx if vx >= vy else my
+            # Peor sismo para cada demanda (envolvente Sx vs Sy)
+            P_S  = max(PSx,  PSy)
+            VxS  = max(VxSx, VxSy)
+            VyS  = max(VySx, VySy)
+            MxS  = max(MxSx, MxSy)
+            MyS  = max(MySx, MySy)
 
-            for alpha_D, alpha_L, alpha_E, label in _COMBOS_NSR10:
-                Pu = alpha_D * pd_val + alpha_L * pl_val
-                if alpha_E > 0:
-                    # NSR-10 A.2.5.6: sismo en dos direcciones ortogonales
-                    Vu_x = alpha_E * vx
-                    Vu_y = alpha_E * vy
-                    Mu_x = alpha_E * mx
-                    Mu_y = alpha_E * my
-                else:
-                    Vu_x = Vu_y = Mu_x = Mu_y = 0.0
+            for aD, aL, aE, sign_E, label in _COMBOS_NSR10:
+                Pu   = aD * PD  + aL * PL  + aE * sign_E * P_S
+                Vu_x = aD * VxD + aL * VxL + aE * VxS
+                Vu_y = aD * VyD + aL * VyL + aE * VyS
+                Mu_x = aD * MxD + aL * MxL + aE * MxS
+                Mu_y = aD * MyD + aL * MyL + aE * MyS
 
                 rows.append({
-                    "pier":    pier,
-                    "story":   story,
-                    "combo":   label,
-                    "Pu_kN":   round(Pu, 2),
-                    "Vu_x_kN": round(Vu_x, 2),
-                    "Vu_y_kN": round(Vu_y, 2),
+                    "pier":     pier,
+                    "story":    story,
+                    "combo":    label,
+                    "Pu_kN":    round(Pu, 2),
+                    "Vu_x_kN":  round(Vu_x, 2),
+                    "Vu_y_kN":  round(Vu_y, 2),
                     "Mu_x_kNm": round(Mu_x, 2),
                     "Mu_y_kNm": round(Mu_y, 2),
-                    "lw_m":    g["lw"],
-                    "tw_m":    g["tw"],
-                    "hw_m":    g["hw"],
+                    "lw_m":     g["lw"],
+                    "tw_m":     g["tw"],
+                    "hw_m":     g["hw"],
                 })
 
         return rows
