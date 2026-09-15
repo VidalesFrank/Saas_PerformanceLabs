@@ -25,6 +25,12 @@ export const MODULE_CFG: Record<string, ModuleVisual> = {
     icon: "section",
     routePrefixes: ["/analysis", "/sections"],
   },
+  "triaje-post-sismo": {
+    color: "#c2410c",
+    desc: "Toma de datos en campo post-sismo: placard ATC-20 y triaje FEMA P-2018",
+    icon: "clipboard",
+    routePrefixes: ["/field-assessment"],
+  },
   "analisis-no-lineal-3d": {
     color: "#7c3aed",
     desc: "Análisis no lineal 3D de edificios: modal, pushover, dinámico e IDA",
@@ -102,10 +108,12 @@ export const ICON_D: Record<string, string> = {
   tool:       "M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z",
   column:     "M7 3h10v18H7zM7 8h10M7 13h10",
   calc:       "M4 2h16a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zM8 6h8M8 10h3M13 10h3M8 14h3M13 14h3M8 18h8",
+  clipboard:  "M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2M9 5v2h6V5M9 14l2 2 4-4",
   default:    "M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2zM12 8v4M12 16h.01",
 };
 
 export function iconTypeFor(id: string): string {
+  if (/safety-atc20|triage-fema/.test(id))                  return "clipboard";
   if (/import|conv/.test(id))                              return "import";
   if (/^gm-spectrum|^gm-fft|^gm-multi/.test(id))          return "wave";
   if (/^gm-timeseries/.test(id))                           return "seismograph";

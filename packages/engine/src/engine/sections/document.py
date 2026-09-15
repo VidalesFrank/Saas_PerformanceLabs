@@ -64,7 +64,170 @@ class PolygonShape:
     vertices: list[tuple[float, float]] = field(default_factory=list)  # (y, z) en mm
 
 
-RegionShape = RectShape | CircShape | PolygonShape
+@dataclass
+class IShape:
+    """Sección I (perfil) — 2 patines y 1 alma.
+
+    Convención: y vertical, z horizontal. Origen en el centro geométrico.
+    Alma centrada verticalmente. Patines simétricos por defecto (bf_top = bf_bot);
+    puede rehacerse por T (fijar tf_bot=0) o C (asimétrica en z).
+
+    Parámetros (todos en mm):
+        d     : altura total de la sección
+        bf_top: ancho patín superior
+        tf_top: espesor patín superior
+        bf_bot: ancho patín inferior (default = bf_top)
+        tf_bot: espesor patín inferior (default = tf_top)
+        tw    : espesor del alma
+    """
+    kind: Literal["ishape"] = "ishape"
+    y: float = 0.0
+    z: float = 0.0
+    d: float = 500.0
+    bf_top: float = 300.0
+    tf_top: float = 40.0
+    bf_bot: float = 300.0
+    tf_bot: float = 40.0
+    tw: float = 20.0
+
+    def to_polygon(self) -> list[tuple[float, float]]:
+        """Vértices CCW mirando desde +x hacia origen. Origen en el centroide."""
+        d, bft, tft, bfb, tfb, tw = self.d, self.bf_top, self.tf_top, self.bf_bot, self.tf_bot, self.tw
+        y_top    = self.y + d / 2
+        y_bot    = self.y - d / 2
+        y_web_top = y_top - tft
+        y_web_bot = y_bot + tfb
+        z0 = self.z
+        # Recorrido: patín inferior (izq→der), sube por alma derecha, patín superior (der→izq), baja por alma izquierda
+        verts = [
+            (y_bot,      z0 - bfb / 2),
+            (y_bot,      z0 + bfb / 2),
+            (y_web_bot,  z0 + bfb / 2),
+            (y_web_bot,  z0 + tw / 2),
+            (y_web_top,  z0 + tw / 2),
+            (y_web_top,  z0 + bft / 2),
+            (y_top,      z0 + bft / 2),
+            (y_top,      z0 - bft / 2),
+            (y_web_top,  z0 - bft / 2),
+            (y_web_top,  z0 - tw / 2),
+            (y_web_bot,  z0 - tw / 2),
+            (y_web_bot,  z0 - bfb / 2),
+        ]
+        return verts
+
+
+@dataclass
+class TShape:
+    """Sección T — patín superior + alma. Origen en el centroide del rect envolvente."""
+    kind: Literal["tshape"] = "tshape"
+    y: float = 0.0
+    z: float = 0.0
+    d: float = 500.0
+    bf: float = 300.0        # ancho patín
+    tf: float = 100.0        # espesor patín
+    tw: float = 20.0         # espesor alma
+
+    def to_polygon(self) -> list[tuple[float, float]]:
+        d, bf, tf, tw = self.d, self.bf, self.tf, self.tw
+        y_top    = self.y + d / 2
+        y_bot    = self.y - d / 2
+        y_web_top = y_top - tf
+        z0 = self.z
+        verts = [
+            (y_bot,      z0 - tw / 2),
+            (y_bot,      z0 + tw / 2),
+            (y_web_top,  z0 + tw / 2),
+            (y_web_top,  z0 + bf / 2),
+            (y_top,      z0 + bf / 2),
+            (y_top,      z0 - bf / 2),
+            (y_web_top,  z0 - bf / 2),
+            (y_web_top,  z0 - tw / 2),
+        ]
+        return verts
+
+
+@dataclass
+class LShape:
+    """Sección L — dos rectángulos ortogonales, patín vertical y horizontal.
+
+    Parámetros:
+        d   : altura total (vertical)
+        bf  : ancho patín horizontal (base)
+        tw  : espesor pierna vertical
+        tf  : espesor patín horizontal
+    Origen en el rincón inferior-izquierdo del bounding box.
+    """
+    kind: Literal["lshape"] = "lshape"
+    y: float = 0.0             # coordenada del punto inferior-izquierdo
+    z: float = 0.0
+    d: float = 500.0
+    bf: float = 500.0
+    tw: float = 50.0
+    tf: float = 50.0
+
+    def to_polygon(self) -> list[tuple[float, float]]:
+        y0, z0 = self.y, self.z
+        d, bf, tw, tf = self.d, self.bf, self.tw, self.tf
+        # Recorrido CCW empezando por rincón inferior-izquierdo
+        verts = [
+            (y0,           z0),
+            (y0,           z0 + bf),
+            (y0 + tf,      z0 + bf),
+            (y0 + tf,      z0 + tw),
+            (y0 + d,       z0 + tw),
+            (y0 + d,       z0),
+        ]
+        return verts
+
+
+@dataclass
+class DoubleTShape:
+    """Sección doble T (prefabricado típico) — 2 almas + patín superior.
+
+    Muy común en losas prefabricadas de estacionamientos y bodegas.
+    Parámetros: d altura total, bf ancho patín, tf espesor patín,
+    tw espesor de cada alma, spacing centro-a-centro de almas.
+    """
+    kind: Literal["doubletshape"] = "doubletshape"
+    y: float = 0.0
+    z: float = 0.0
+    d: float = 800.0
+    bf: float = 2400.0
+    tf: float = 100.0
+    tw: float = 100.0
+    spacing: float = 1200.0
+
+    def to_polygon(self) -> list[tuple[float, float]]:
+        """Contorno CCW simple. Requiere bf ≥ spacing + tw (patín envuelve almas)."""
+        d, bf, tf, tw, s = self.d, self.bf, self.tf, self.tw, self.spacing
+        y_top     = self.y + d / 2
+        y_bot     = self.y - d / 2
+        y_web_top = y_top - tf
+        z0 = self.z
+        z_L_out = z0 - s / 2 - tw / 2
+        z_L_in  = z0 - s / 2 + tw / 2
+        z_R_in  = z0 + s / 2 - tw / 2
+        z_R_out = z0 + s / 2 + tw / 2
+        z_p_R   = z0 + bf / 2
+        z_p_L   = z0 - bf / 2
+        verts = [
+            (y_bot,      z_L_out),   # 1: inferior izq alma izq
+            (y_bot,      z_L_in),    # 2: base alma izq
+            (y_web_top,  z_L_in),    # 3: sube cara interior alma izq
+            (y_web_top,  z_R_in),    # 4: cruza entre almas bajo patín
+            (y_bot,      z_R_in),    # 5: baja cara interior alma der
+            (y_bot,      z_R_out),   # 6: base alma der
+            (y_web_top,  z_R_out),   # 7: sube cara exterior alma der
+            (y_web_top,  z_p_R),     # 8: cruza cara inferior derecha patín
+            (y_top,      z_p_R),     # 9: sube lateral derecho patín
+            (y_top,      z_p_L),     # 10: cara superior patín
+            (y_web_top,  z_p_L),     # 11: baja lateral izquierdo patín
+            (y_web_top,  z_L_out),   # 12: cruza cara inferior izquierda patín
+        ]
+        return verts
+
+
+RegionShape = RectShape | CircShape | PolygonShape | IShape | TShape | LShape | DoubleTShape
 
 
 # ──────────────────────────────────────────────────────────────
@@ -101,19 +264,44 @@ ConfinementDef = RectConfinementDef | CircConfinementDef
 
 @dataclass
 class ConcreteDef:
+    """Definición de un concreto. Permite dos modelos constitutivos:
+
+    - ``concrete01`` (default): Kent-Scott-Park con degradación lineal, sin
+      resistencia a tensión. Rápido y suficiente para diagramas P-M/M-φ.
+    - ``concrete02``: Yassin (1994) con **resistencia a tensión** + tension
+      softening. Necesario para análisis cíclico y servicio (fisuración).
+    """
     id: str = field(default_factory=_new_id)
     label: str = "Concreto"
-    fpc: float = 28.0       # MPa — resistencia característica a compresión
-    eco: float = 0.002      # deformación unitaria en resistencia máxima
+    fpc: float = 28.0                # MPa — resistencia máxima a compresión
+    eco: float = 0.002                # deformación unitaria en fpc
+    model_kind: Literal["concrete01", "concrete02"] = "concrete01"
+    # Params Concrete02 (opcionales, ignorados si model_kind == "concrete01"):
+    ft: float | None = None          # MPa — resistencia a tensión (default 0.62·√f'c NSR-10 C.9.5.2.3)
+    Ets: float | None = None         # MPa — tension softening slope (default Ec/10)
+    lambda_c: float = 0.10           # ratio pendiente descarga / rigidez inicial
 
 
 @dataclass
 class SteelDef:
+    """Definición de un acero de refuerzo. Tres modelos disponibles:
+
+    - ``steel02`` (default): Menegotto-Pinto con Bauschinger. Recomendado para
+      todo análisis con inversión de carga (sismo, cíclico).
+    - ``steel01``: bilineal simple sin Bauschinger. Útil para diagramas
+      monotónicos P-M / M-φ donde la histéresis no se usa.
+    - ``prestressing``: acero de preesfuerzo. Se modela con Steel02 pero
+      con parámetros ajustados (fpy fluencia, fpu última) y b menor.
+    """
     id: str = field(default_factory=_new_id)
     label: str = "Acero"
-    fy: float = 420.0       # MPa — fluencia
-    Es: float = 200_000.0   # MPa — módulo de elasticidad
-    b: float = 0.01         # razón de endurecimiento por deformación
+    fy: float = 420.0                # MPa — fluencia (o fpy si es preesfuerzo)
+    Es: float = 200_000.0             # MPa — módulo de elasticidad
+    b: float = 0.01                    # razón de endurecimiento por deformación
+    model_kind: Literal["steel02", "steel01", "prestressing"] = "steel02"
+    # Params extra para preesfuerzo (opcionales):
+    fpu: float | None = None          # MPa — tensión última (preesfuerzo típ. 1860)
+    eps_ult: float | None = None     # deformación última
 
 
 # ──────────────────────────────────────────────────────────────

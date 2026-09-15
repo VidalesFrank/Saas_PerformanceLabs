@@ -4,6 +4,7 @@ import { FormEvent, useMemo, useState } from "react";
 import { AppHeader } from "@/components/app-header";
 import { InteractionChart, type LoadCombination } from "@/components/interaction-chart";
 import { SectionPreview } from "@/components/section-preview";
+import { applyBarEdit, applyBarDelete, applyBarDuplicate, computeBarSizesFromForm } from "@/lib/section-form-adapter";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/input";
@@ -36,6 +37,7 @@ const DEFAULT_FORM = {
   n_bars_z: 3,
   n_bars: 8,
   bar_id: "#8",
+  bar_sizes: [] as string[],   // se popula al editar barras individuales
   cover_to_bar_centroid: 52,
   // by-face rebar designer
   rebarMode: "uniform" as "uniform" | "perFace",
@@ -173,6 +175,7 @@ export default function InteractionDiagramPage() {
       fy: form.fy,
       es: form.es,
       bar_id: form.bar_id,
+      bar_sizes: computeBarSizesFromForm(form),
       cover_to_bar_centroid: form.cover_to_bar_centroid,
       hoop_bar_diameter: form.hoop_bar_diameter,
       hoop_spacing: form.hoop_spacing,
@@ -586,6 +589,10 @@ export default function InteractionDiagramPage() {
                 nBars={form.n_bars}
                 vertices={previewVertices}
                 bars={previewBars}
+                barSizes={computeBarSizesFromForm(form)}
+                onBarEdit={(idx, updates) => setForm(applyBarEdit(form, idx, updates))}
+                onBarDelete={(idx) => setForm(applyBarDelete(form, idx))}
+                onBarDuplicate={(idx) => setForm(applyBarDuplicate(form, idx))}
               />
             </CardBody>
           </Card>

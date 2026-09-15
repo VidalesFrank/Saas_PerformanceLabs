@@ -4,6 +4,7 @@ import { FormEvent, useMemo, useState } from "react";
 import { AppHeader } from "@/components/app-header";
 import { PMMSurface3D, PMMEnvelopeChart, MxMyPanel } from "@/components/pmm-chart";
 import { SectionPreview } from "@/components/section-preview";
+import { applyBarEdit, applyBarDelete, applyBarDuplicate, computeBarSizesFromForm } from "@/lib/section-form-adapter";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/input";
@@ -36,6 +37,7 @@ const DEFAULT_FORM = {
   n_bars_z: 3,
   n_bars: 8,
   bar_id: "#8",
+  bar_sizes: [] as string[],
   cover_to_bar_centroid: 52,
   num_angles: 8,
   num_points: 10,
@@ -130,6 +132,7 @@ export default function PMMPage() {
       fy: form.fy,
       es: form.es,
       bar_id: form.bar_id,
+      bar_sizes: computeBarSizesFromForm(form),
       cover_to_bar_centroid: form.cover_to_bar_centroid,
       hoop_bar_diameter: form.hoop_bar_diameter,
       hoop_spacing: form.hoop_spacing,
@@ -352,6 +355,10 @@ export default function PMMPage() {
                 nBarsY={form.n_bars_y} nBarsZ={form.n_bars_z} nBars={form.n_bars}
                 vertices={form.shape_type === "special" ? parsePairs(form.verticesText) : undefined}
                 bars={form.shape_type === "special" ? parsePairs(form.barsText) : undefined}
+                barSizes={computeBarSizesFromForm(form)}
+                onBarEdit={(idx, updates) => setForm(applyBarEdit(form, idx, updates))}
+                onBarDelete={(idx) => setForm(applyBarDelete(form, idx))}
+                onBarDuplicate={(idx) => setForm(applyBarDuplicate(form, idx))}
               />
             </CardBody>
           </Card>

@@ -66,19 +66,30 @@ export type ConfinementDef = RectConfinementDef | CircConfinementDef;
 
 // ── Materiales ────────────────────────────────────────────────────────────────
 
+export type ConcreteModelKind = "concrete01" | "concrete02";
+
 export interface ConcreteDef {
   id: string;
   label: string;
-  fpc: number;  // MPa
-  eco: number;  // deformación en pico
+  fpc: number;             // MPa
+  eco: number;              // deformación en pico
+  model_kind?: ConcreteModelKind;
+  ft?: number | null;      // MPa — solo Concrete02 (default 0.62·√f'c)
+  Ets?: number | null;     // MPa — tension softening slope (default Ec/10)
+  lambda_c?: number;       // 0..1 — unload ratio (default 0.10)
 }
+
+export type SteelModelKind = "steel02" | "steel01" | "prestressing";
 
 export interface SteelDef {
   id: string;
   label: string;
-  fy: number;   // MPa
-  Es: number;   // MPa
-  b: number;    // endurecimiento
+  fy: number;              // MPa
+  Es: number;              // MPa
+  b: number;                // endurecimiento
+  model_kind?: SteelModelKind;
+  fpu?: number | null;    // solo preesfuerzo
+  eps_ult?: number | null;
 }
 
 // ── Elementos de la sección ───────────────────────────────────────────────────

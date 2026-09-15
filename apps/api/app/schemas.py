@@ -83,6 +83,12 @@ class SectionCreate(BaseModel):
     bar_id: str = "#8"
     cover_to_bar_centroid: float | None = None
 
+    # Tamaños individuales por barra (paralelo a `bars` o a las barras generadas).
+    # Si está presente y tiene la misma longitud que la cantidad total de barras,
+    # cada entrada se usa como bar_size individual. Si es None o longitud distinta,
+    # se usa `bar_id` global.
+    bar_sizes: list[str] | None = None
+
     # Refuerzo rectangular avanzado por cara (Section Designer)
     corner_bar_id: str | None = None
     n_top: int | None = None

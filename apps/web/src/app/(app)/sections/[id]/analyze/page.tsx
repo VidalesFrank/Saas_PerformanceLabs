@@ -24,7 +24,7 @@ import { PMMSurface3D, PMMEnvelopeChart, MxMyPanel } from "@/components/pmm-char
 import { MomentCurvatureChart } from "@/components/section-editor/MomentCurvatureChart";
 import type { InteractionPoint, PMMArcOut, PMMDemandOut } from "@/lib/types";
 
-type Tab = "pm" | "mc" | "pmm" | "nsr10" | "diagnostico";
+type Tab = "props" | "pm" | "mc" | "pmm" | "shear" | "ductility" | "cyclic" | "service" | "nsr10" | "diagnostico";
 
 // ── Conversión de unidades ──────────────────────────────────────────────────
 
@@ -585,17 +585,71 @@ function PMMTab({
       </div>
 
       <div className="rounded-xl border border-border bg-surface overflow-hidden">
-        <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-2.5">
           <p className="text-xs font-semibold text-text">
             Verificación de demandas
             <span className="ml-2 font-normal text-text-muted">(se incluyen al calcular P-M-M)</span>
           </p>
-          <button
-            onClick={() => setDemands((d) => [...d, { ...EMPTY_DEMAND }])}
-            className="rounded-lg bg-accent/15 px-2.5 py-1 text-xs text-accent hover:bg-accent/25"
-          >
-            + Agregar demanda
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setDemands((d) => [...d, { ...EMPTY_DEMAND }])}
+              className="rounded-lg bg-accent/15 px-2.5 py-1 text-xs text-accent hover:bg-accent/25"
+            >
+              + Agregar
+            </button>
+            <label className="cursor-pointer rounded-lg bg-surface-2 border border-border px-2.5 py-1 text-xs text-text-muted hover:text-text">
+              ⬆ Importar CSV
+              <input
+                type="file" accept=".csv,.txt" className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = (ev) => {
+                    const text = String(ev.target?.result ?? "");
+                    const rows = text.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith("#"));
+                    const parsed: PMMDemand[] = [];
+                    for (const line of rows) {
+                      const parts = line.split(/[,;\t]/).map((p) => parseFloat(p.trim()));
+                      if (parts.length >= 3 && parts.every((v) => !isNaN(v))) {
+                        parsed.push({ p_kn: parts[0], mx_knm: parts[1], my_knm: parts[2] });
+                      }
+                    }
+                    if (parsed.length > 0) setDemands((d) => [...d, ...parsed]);
+                  };
+                  reader.readAsText(file);
+                  e.target.value = "";  // reset para permitir reimportar
+                }}
+              />
+            </label>
+            {result && demands.length > 0 && (
+              <button
+                onClick={() => {
+                  const header = "# P (kN), Mx (kN·m), My (kN·m), M_demanda (kN·m), M_capacidad (kN·m), DCR, Estado";
+                  const lines = demands.map((d, i) => {
+                    const r = demandResults[i];
+                    const dcr = r ? r.dcr.toFixed(4) : "";
+                    const est = r ? (r.inside ? "OK" : "FAIL") : "";
+                    const mdem = r ? r.m_demand_knm.toFixed(3) : "";
+                    const mcap = r ? r.m_capacity_knm.toFixed(3) : "";
+                    return `${d.p_kn},${d.mx_knm},${d.my_knm},${mdem},${mcap},${dcr},${est}`;
+                  });
+                  downloadCsv([header, ...lines], `${sectionName || "pmm"}_demands.csv`);
+                }}
+                className="rounded-lg bg-surface-2 border border-border px-2.5 py-1 text-xs text-text-muted hover:text-text"
+              >
+                ⬇ Exportar CSV
+              </button>
+            )}
+            {demands.length > 0 && (
+              <button
+                onClick={() => { if (confirm(`Eliminar ${demands.length} combinaciones?`)) setDemands([]); }}
+                className="rounded-lg bg-danger/10 border border-danger/30 px-2.5 py-1 text-xs text-danger hover:bg-danger/20"
+              >
+                Limpiar
+              </button>
+            )}
+          </div>
         </div>
         {demands.length === 0 ? (
           <p className="px-4 py-3 text-xs text-text-muted">
@@ -1143,12 +1197,931 @@ function DiagnosticoTab({
   );
 }
 
+// ── Tab Propiedades geométricas ─────────────────────────────────────────────
+
+function PropRow({ label, value, unit, mono = true, hint }: {
+  label: string; value: string | number; unit?: string; mono?: boolean; hint?: string;
+}) {
+  return (
+    <div className="flex items-baseline justify-between border-b border-border/60 py-1.5">
+      <span className="text-[11px] text-text-muted flex items-center gap-1.5">
+        {label}
+        {hint && <span title={hint} className="opacity-60 cursor-help">ⓘ</span>}
+      </span>
+      <span className={`${mono ? "font-mono" : ""} text-xs font-semibold text-text tabular-nums`}>
+        {typeof value === "number"
+          ? value.toLocaleString("es-CO", { maximumFractionDigits: 3 })
+          : value}
+        {unit && <span className="ml-1 text-[10px] font-normal text-text-muted">{unit}</span>}
+      </span>
+    </div>
+  );
+}
+
+function PropSection({ title, accent, children }: { title: string; accent: string; children: React.ReactNode }) {
+  return (
+    <section className="rounded-2xl border border-border bg-surface overflow-hidden shadow-sm">
+      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-border">
+        <span className="w-1.5 h-4 rounded-sm" style={{ background: accent }} />
+        <h3 className="text-sm font-semibold text-text">{title}</h3>
+      </div>
+      <div className="px-4 py-2">{children}</div>
+    </section>
+  );
+}
+
+function PropsTab({ sectionId }: { sectionId: string }) {
+  const [data, setData]         = useState<import("@/lib/editor-api").GeometricPropertiesResult | null>(null);
+  const [error, setError]       = useState<string | null>(null);
+  const [loading, setLoading]   = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    sectionEditorApi
+      .geometricProperties(sectionId)
+      .then((r) => { setData(r); setError(null); })
+      .catch((e) => setError(e instanceof ApiError ? e.message : String(e)))
+      .finally(() => setLoading(false));
+  }, [sectionId]);
+
+  if (loading) return <Spinner />;
+  if (error)   return <p className="text-danger text-sm">{error}</p>;
+  if (!data)   return null;
+  const p = data.engineering;
+
+  return (
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+      <PropSection title="Áreas y refuerzo" accent="#0891b2">
+        <PropRow label="Ag — área bruta"    value={p.gross_area_cm2}  unit="cm²" />
+        <PropRow label="An — área neta"     value={p.net_area_cm2}    unit="cm²" hint="An = Ag − As" />
+        <PropRow label="As — total barras"  value={p.steel_area_cm2}  unit="cm²" />
+        <PropRow label="ρg — cuantía"       value={p.rho_g_pct}       unit="%" hint="ρg = As / Ag" />
+      </PropSection>
+
+      <PropSection title="Centroide y envolvente" accent="#8b5cf6">
+        <PropRow label="yc"       value={p.centroid_y_cm} unit="cm" hint="Centroide en dirección de flexión y" />
+        <PropRow label="zc"       value={p.centroid_z_cm} unit="cm" />
+        <PropRow label="h — altura"  value={p.depth_cm}   unit="cm" hint="Dimensión total en y" />
+        <PropRow label="b — ancho"   value={p.width_cm}   unit="cm" hint="Dimensión total en z" />
+      </PropSection>
+
+      <PropSection title="Momentos de inercia" accent="#10b981">
+        <PropRow label="Iy" value={p.Iy_cm4}  unit="cm⁴" hint="Momento respecto al eje y (flexión sobre z)" />
+        <PropRow label="Iz" value={p.Iz_cm4}  unit="cm⁴" hint="Momento respecto al eje z (flexión sobre y)" />
+        <PropRow label="Iyz" value={p.Iyz_cm4} unit="cm⁴" hint="Producto de inercia (0 si simétrica)" />
+      </PropSection>
+
+      <PropSection title="Módulos elásticos" accent="#f59e0b">
+        <PropRow label="Sz⁺ (fibra y_max)" value={p.Sz_pos_cm3} unit="cm³" />
+        <PropRow label="Sz⁻ (fibra y_min)" value={p.Sz_neg_cm3} unit="cm³" />
+        <PropRow label="Sy⁺ (fibra z_max)" value={p.Sy_pos_cm3} unit="cm³" />
+        <PropRow label="Sy⁻ (fibra z_min)" value={p.Sy_neg_cm3} unit="cm³" />
+      </PropSection>
+
+      <PropSection title="Módulos plásticos" accent="#ec4899">
+        <PropRow label="Zpz (flex. sobre y)" value={p.Zpz_cm3} unit="cm³" hint="Fully-yielded, partición A/2" />
+        <PropRow label="Zpy (flex. sobre z)" value={p.Zpy_cm3} unit="cm³" />
+        <PropRow label="fsz — factor forma z" value={p.fs_z}   unit=""    hint="Zpz / Sz_promedio · rect=1.5 · circ≈1.7" />
+        <PropRow label="fsy — factor forma y" value={p.fs_y}   unit="" />
+      </PropSection>
+
+      <PropSection title="Radios de giro" accent="#0369a1">
+        <PropRow label="ry" value={p.ry_cm} unit="cm" hint="ry = √(Iy/Ag)" />
+        <PropRow label="rz" value={p.rz_cm} unit="cm" hint="rz = √(Iz/Ag)" />
+      </PropSection>
+
+      <PropSection title="Ejes principales" accent="#dc2626">
+        <PropRow label="I₁ (máximo)" value={p.I1_cm4} unit="cm⁴" hint="Autovalor mayor del tensor de inercia" />
+        <PropRow label="I₂ (mínimo)" value={p.I2_cm4} unit="cm⁴" />
+        <PropRow label="θp (rotación)" value={p.theta_p_deg} unit="°" hint="Ángulo del eje principal 1 respecto a y" />
+      </PropSection>
+
+      <PropSection title="Método" accent="#6b7280">
+        <p className="py-2 text-[11px] text-text-muted leading-relaxed">
+          Integrales cerradas sobre polígonos (Green/Bird 2005) para rectángulos y polígonos.
+          Círculos con hueco: fórmulas exactas + Steiner. Barras contribuyen como áreas
+          concentradas (As · d²) al centroide. Módulo plástico Zp por bisección del PNA en
+          la sección homogénea. Validado con 27 tests contra fórmulas cerradas conocidas.
+        </p>
+      </PropSection>
+    </div>
+  );
+}
+
+// ── Tab Cortante ────────────────────────────────────────────────────────────
+
+function ShearTab({ sectionId }: { sectionId: string }) {
+  type Code    = "NSR-10" | "ACI 318-19";
+  type Elem    = "beam" | "column" | "wall";
+  type Duct    = "DMI" | "DMO" | "DES";
+
+  const [code, setCode]           = useState<Code>("NSR-10");
+  const [element, setElement]     = useState<Elem>("beam");
+  const [ductility, setDuctility] = useState<Duct>("DMI");
+  const [vu, setVu]               = useState("150");
+  const [nu, setNu]               = useState("0");
+  const [av, setAv]               = useState("142");    // 2 ramas #3 = 2·71 = 142 mm²
+  const [s, setS]                 = useState("150");
+  const [fyt, setFyt]             = useState("420");
+  const [rhoW, setRhoW]           = useState("0.010");
+  const [dbLong, setDbLong]       = useState("25.4");
+  const [d, setD]                 = useState("");
+  const [bw, setBw]               = useState("");
+  const [result, setResult]       = useState<import("@/lib/editor-api").ShearCheckResult | null>(null);
+  const [error, setError]         = useState<string | null>(null);
+  const [loading, setLoading]     = useState(false);
+
+  const run = async () => {
+    setLoading(true); setError(null);
+    try {
+      const r = await sectionEditorApi.shearCheck(sectionId, {
+        code, element, ductility,
+        Vu_kN: parseFloat(vu) || 0,
+        Nu_kN: parseFloat(nu) || 0,
+        Av_mm2: av.trim() ? parseFloat(av) : null,
+        s_mm: parseFloat(s) || 150,
+        fyt_MPa: parseFloat(fyt) || 420,
+        rho_w: parseFloat(rhoW) || 0.01,
+        db_long_mm: parseFloat(dbLong) || 25.4,
+        d_mm: d.trim() ? parseFloat(d) : null,
+        bw_mm: bw.trim() ? parseFloat(bw) : null,
+      });
+      setResult(r);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const badgeCls = (st: string) => (
+    st === "ok"     ? "bg-emerald-500/15 text-emerald-500 border-emerald-500/30" :
+    st === "warning"? "bg-amber-500/15 text-amber-500 border-amber-500/30" :
+                      "bg-danger/15 text-danger border-danger/30"
+  );
+
+  return (
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+      {/* Panel de configuración */}
+      <div className="lg:col-span-1 flex flex-col gap-4">
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Código y ductilidad</h3>
+          <div className="grid grid-cols-2 gap-2">
+            {(["NSR-10", "ACI 318-19"] as Code[]).map((c) => (
+              <button key={c} onClick={() => setCode(c)}
+                className={`rounded-lg border py-2 text-xs font-semibold transition-all
+                  ${code === c ? "border-accent bg-accent/10 text-accent" : "border-border text-text-muted hover:text-text"}`}>
+                {c}
+              </button>
+            ))}
+          </div>
+          <div className="mt-3 grid grid-cols-3 gap-2">
+            {(["beam", "column", "wall"] as Elem[]).map((el) => (
+              <button key={el} onClick={() => setElement(el)}
+                className={`rounded-lg border py-2 text-xs font-semibold transition-all
+                  ${element === el ? "border-accent bg-accent/10 text-accent" : "border-border text-text-muted hover:text-text"}`}>
+                {el === "beam" ? "Viga" : el === "column" ? "Columna" : "Muro"}
+              </button>
+            ))}
+          </div>
+          <div className="mt-3 grid grid-cols-3 gap-2">
+            {(["DMI", "DMO", "DES"] as Duct[]).map((d) => (
+              <button key={d} onClick={() => setDuctility(d)}
+                className={`rounded-lg border py-2 text-xs font-semibold transition-all
+                  ${ductility === d ? "border-accent bg-accent/10 text-accent" : "border-border text-text-muted hover:text-text"}`}>
+                {d}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Demanda</h3>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-[11px] text-text-muted">Vu (kN)
+              <input value={vu} onChange={(e) => setVu(e.target.value)} type="number"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            <label className="text-[11px] text-text-muted">Nu (kN, + comp.)
+              <input value={nu} onChange={(e) => setNu(e.target.value)} type="number"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Refuerzo transversal</h3>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-[11px] text-text-muted">Av total (mm²)
+              <input value={av} onChange={(e) => setAv(e.target.value)} type="number"
+                placeholder="vacío = sin"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            <label className="text-[11px] text-text-muted">s (mm)
+              <input value={s} onChange={(e) => setS(e.target.value)} type="number"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            <label className="text-[11px] text-text-muted">fyt (MPa)
+              <input value={fyt} onChange={(e) => setFyt(e.target.value)} type="number"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            <label className="text-[11px] text-text-muted">db_long (mm)
+              <input value={dbLong} onChange={(e) => setDbLong(e.target.value)} type="number"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Avanzado (opcional)</h3>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-[11px] text-text-muted">d (mm)
+              <input value={d} onChange={(e) => setD(e.target.value)} type="number"
+                placeholder="auto"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            <label className="text-[11px] text-text-muted">bw (mm)
+              <input value={bw} onChange={(e) => setBw(e.target.value)} type="number"
+                placeholder="auto"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            {code === "ACI 318-19" && (
+              <label className="text-[11px] text-text-muted col-span-2">ρw = As/(bw·d) (ACI 22.5.5)
+                <input value={rhoW} onChange={(e) => setRhoW(e.target.value)} type="number" step="0.001"
+                  className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+              </label>
+            )}
+          </div>
+        </div>
+
+        <Button onClick={run} disabled={loading}>
+          {loading ? "Calculando…" : "Verificar cortante"}
+        </Button>
+        {error && <p className="text-danger text-xs">{error}</p>}
+      </div>
+
+      {/* Panel de resultados */}
+      <div className="lg:col-span-2 flex flex-col gap-4">
+        {!result && (
+          <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-surface-2 py-16">
+            <p className="text-sm text-text-muted">Configura la demanda y refuerzo, luego pulsa <strong>Verificar cortante</strong>.</p>
+            <p className="mt-1 text-xs text-text-muted">Motor validado contra fórmulas exactas de NSR-10 C.11 y ACI 318-19 §22.5.</p>
+          </div>
+        )}
+
+        {result && (
+          <>
+            <div className="rounded-2xl border border-border bg-surface p-5 shadow-sm">
+              <div className="flex items-baseline justify-between">
+                <h3 className="text-lg font-bold">Resultado — {result.code}</h3>
+                <span className={`rounded-full border px-3 py-1 text-xs font-bold uppercase ${badgeCls(result.status)}`}>
+                  {result.status === "ok" ? "Cumple" :
+                   result.status === "warning" ? "Advertencia" :
+                   result.status === "no-transverse" ? "Sin refuerzo" : "No cumple"}
+                </span>
+              </div>
+              <div className="mt-4 grid grid-cols-2 gap-3 md:grid-cols-3">
+                <Stat label="Vc"     value={result.components.Vc_kN.toFixed(1)}     unit="kN" />
+                <Stat label="Vs"     value={result.components.Vs_kN.toFixed(1)}     unit="kN" />
+                <Stat label="Vn"     value={result.components.Vn_kN.toFixed(1)}     unit="kN" />
+                <Stat label="φVn"    value={result.components.phi_Vn_kN.toFixed(1)} unit="kN" />
+                <Stat label="Vu"     value={result.components.Vu_kN.toFixed(1)}     unit="kN" />
+                <Stat label="DCR"    value={result.components.DCR.toFixed(3)} />
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-border bg-surface p-5 shadow-sm">
+              <h4 className="mb-3 text-sm font-semibold">Detallado</h4>
+              <div className="grid grid-cols-2 gap-3">
+                <Stat label="s máx admisible" value={result.detailing.s_max_mm.toFixed(0)} unit="mm" />
+                <Stat label="Av,mín requerido" value={result.detailing.Av_min_mm2.toFixed(0)} unit="mm²" />
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-border bg-surface p-5 shadow-sm">
+              <h4 className="mb-3 text-sm font-semibold">Referencias del código</h4>
+              <div className="grid grid-cols-2 gap-1.5 text-xs md:grid-cols-3">
+                {Object.entries(result.articles).map(([k, v]) => (
+                  <div key={k} className="flex items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2 py-1">
+                    <span className="text-text-muted">{k}:</span>
+                    <span className="font-mono font-semibold text-text">{v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {result.notes.length > 0 && (
+              <div className="rounded-2xl border border-amber-500/40 bg-amber-500/5 p-4">
+                <h4 className="mb-2 text-sm font-semibold text-amber-500">Notas del diseño</h4>
+                <ul className="list-disc pl-5 text-xs text-text-muted space-y-1">
+                  {result.notes.map((n, i) => <li key={i}>{n}</li>)}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Tab Ductilidad ──────────────────────────────────────────────────────────
+
+function DuctilityTab({ sectionId }: { sectionId: string }) {
+  const [pKn, setPKn]         = useState("0");
+  const [L, setL]             = useState("3000");
+  const [db, setDb]           = useState("25.4");
+  const [fuFy, setFuFy]       = useState("1.35");
+  const [method, setMethod]   = useState<"priestley_2007" | "paulay_priestley" | "baker" | "atc_32">("priestley_2007");
+  const [result, setResult]   = useState<import("@/lib/editor-api").DuctilityResult | null>(null);
+  const [error, setError]     = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const run = async () => {
+    setLoading(true); setError(null);
+    try {
+      const r = await sectionEditorApi.ductility(sectionId, {
+        axial_load_kn: parseFloat(pKn) || 0,
+        member_length_mm: parseFloat(L) || 3000,
+        db_long_mm: parseFloat(db) || 25.4,
+        Lp_method: method,
+        fu_over_fy: parseFloat(fuFy) || 1.35,
+      });
+      setResult(r);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+      {/* Panel de entrada */}
+      <div className="lg:col-span-1 flex flex-col gap-4">
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Parámetros del análisis</h3>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-[11px] text-text-muted">P axial (kN, + comp.)
+              <input value={pKn} onChange={(e) => setPKn(e.target.value)} type="number"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            <label className="text-[11px] text-text-muted">L miembro (mm)
+              <input value={L} onChange={(e) => setL(e.target.value)} type="number"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            <label className="text-[11px] text-text-muted">db longitudinal (mm)
+              <input value={db} onChange={(e) => setDb(e.target.value)} type="number"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            <label className="text-[11px] text-text-muted">fu/fy
+              <input value={fuFy} onChange={(e) => setFuFy(e.target.value)} type="number" step="0.05"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Método para Lp</h3>
+          <div className="flex flex-col gap-1.5 text-xs">
+            {([
+              ["priestley_2007", "Priestley 2007 (recomendado)"],
+              ["paulay_priestley", "Paulay & Priestley 1992"],
+              ["baker", "Baker 1956 (0.5·d)"],
+              ["atc_32", "ATC-32 / Caltrans"],
+            ] as const).map(([v, label]) => (
+              <button key={v} onClick={() => setMethod(v)}
+                className={`rounded-lg border py-2 text-left px-3 transition-all
+                  ${method === v ? "border-accent bg-accent/10 text-accent font-semibold" : "border-border text-text-muted hover:text-text"}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <Button onClick={run} disabled={loading}>
+          {loading ? "Analizando…" : "Calcular ductilidad"}
+        </Button>
+        {error && <p className="text-danger text-xs">{error}</p>}
+      </div>
+
+      {/* Resultados */}
+      <div className="lg:col-span-2 flex flex-col gap-4">
+        {!result && (
+          <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-surface-2 py-16">
+            <p className="text-sm text-text-muted">
+              Configura carga axial y longitud del miembro y pulsa <strong>Calcular ductilidad</strong>.
+            </p>
+            <p className="mt-1 text-xs text-text-muted">
+              Motor implementa idealización bilineal Priestley + Lp por 4 métodos + μΔ + energía.
+            </p>
+          </div>
+        )}
+
+        {result && (
+          <>
+            {/* KPI cards */}
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <Stat label="μφ (curvatura)"   value={result.ductility.mu_phi.toFixed(2)} />
+              <Stat label="μΔ (desplaz.)"     value={result.ductility.mu_delta.toFixed(2)} />
+              <Stat label="Lp"                value={result.plastic_hinge.Lp_mm.toFixed(0)} unit="mm" />
+              <Stat label="Lp/L"              value={(result.plastic_hinge.Lp_over_L * 100).toFixed(1)} unit="%" />
+              <Stat label="φy idealizado"     value={result.bilinear.phi_yield_ideal_1_per_m.toFixed(4)} unit="1/m" />
+              <Stat label="φu"                value={result.bilinear.phi_ultimate_1_per_m.toFixed(4)} unit="1/m" />
+              <Stat label="My idealizado"     value={result.bilinear.moment_yield_ideal_kNm.toFixed(1)} unit="kN·m" />
+              <Stat label="Energía disipada" value={result.energy.capacity_kNm_per_m.toFixed(1)} unit="kN" />
+            </div>
+
+            {/* Referencia del método */}
+            <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+              <p className="text-[11px] text-text-muted uppercase tracking-wider font-bold">Método Lp usado</p>
+              <p className="mt-1 text-sm font-mono text-text">{result.plastic_hinge.method}</p>
+            </div>
+
+            {/* Curva M-φ con bilineal superpuesta */}
+            <MPhiWithBilinear result={result} />
+
+            {result.notes.length > 0 && (
+              <div className="rounded-2xl border border-amber-500/40 bg-amber-500/5 p-4">
+                <h4 className="mb-2 text-sm font-semibold text-amber-500">Notas del análisis</h4>
+                <ul className="list-disc pl-5 text-xs text-text-muted space-y-1">
+                  {result.notes.map((n, i) => <li key={i}>{n}</li>)}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// SVG minimalista para la curva M-φ con la aproximación bilineal superpuesta
+function MPhiWithBilinear({ result }: { result: import("@/lib/editor-api").DuctilityResult }) {
+  if (!result.curve.length) return null;
+
+  const W = 640, H = 320, pad = { l: 60, r: 20, t: 20, b: 44 };
+  const phi_max = Math.max(...result.curve.map((p) => p.phi_1_per_m));
+  const m_max = Math.max(...result.curve.map((p) => p.moment_kNm));
+  const sx = (v: number) => pad.l + (v / phi_max) * (W - pad.l - pad.r);
+  const sy = (v: number) => H - pad.b - (v / m_max) * (H - pad.t - pad.b);
+
+  const curvePath = result.curve
+    .map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p.phi_1_per_m).toFixed(1)} ${sy(p.moment_kNm).toFixed(1)}`)
+    .join(" ");
+
+  const phi_y = result.bilinear.phi_yield_ideal_1_per_m;
+  const my = result.bilinear.moment_yield_ideal_kNm;
+  const phi_u = result.bilinear.phi_ultimate_1_per_m;
+
+  return (
+    <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+      <h4 className="mb-2 text-sm font-semibold">Curva M-φ con idealización bilineal Priestley</h4>
+      <svg width={W} height={H} className="max-w-full">
+        {/* ejes */}
+        <line x1={pad.l} y1={H - pad.b} x2={W - pad.r} y2={H - pad.b} stroke="var(--color-border)" />
+        <line x1={pad.l} y1={pad.t} x2={pad.l} y2={H - pad.b} stroke="var(--color-border)" />
+        {/* grid */}
+        {[0.25, 0.5, 0.75, 1.0].map((f) => (
+          <g key={f}>
+            <line x1={pad.l} y1={sy(f * m_max)} x2={W - pad.r} y2={sy(f * m_max)}
+              stroke="var(--color-border)" strokeOpacity="0.3" strokeDasharray="3 4" />
+            <text x={pad.l - 6} y={sy(f * m_max) + 3} fontSize="10" fill="var(--color-text-muted)" textAnchor="end">
+              {(f * m_max).toFixed(0)}
+            </text>
+          </g>
+        ))}
+        {/* curva real */}
+        <path d={curvePath} fill="none" stroke="var(--color-accent)" strokeWidth="1.8" />
+        {/* bilineal: origen → (φy, My) → (φu, My) */}
+        <polyline
+          points={`${sx(0)},${sy(0)} ${sx(phi_y)},${sy(my)} ${sx(phi_u)},${sy(my)}`}
+          fill="none" stroke="#ef4444" strokeWidth="1.5" strokeDasharray="6 4"
+        />
+        {/* marcadores */}
+        <circle cx={sx(phi_y)} cy={sy(my)} r="4" fill="#ef4444" />
+        <circle cx={sx(phi_u)} cy={sy(my)} r="4" fill="#ef4444" />
+        <text x={sx(phi_y) + 8} y={sy(my) - 8} fontSize="11" fill="#ef4444" fontWeight="600">
+          (φy, My) ideal
+        </text>
+        <text x={sx(phi_u) - 8} y={sy(my) - 8} fontSize="11" fill="#ef4444" fontWeight="600" textAnchor="end">
+          φu
+        </text>
+        {/* labels */}
+        <text x={(pad.l + W - pad.r) / 2} y={H - 8} fontSize="11" fill="var(--color-text-muted)" textAnchor="middle">
+          Curvatura φ (1/m)
+        </text>
+        <text x={16} y={(pad.t + H - pad.b) / 2} fontSize="11" fill="var(--color-text-muted)"
+          transform={`rotate(-90 16 ${(pad.t + H - pad.b) / 2})`} textAnchor="middle">
+          Momento M (kN·m)
+        </text>
+      </svg>
+      <div className="mt-2 flex gap-4 text-[11px]">
+        <span className="text-accent">━ Curva real M-φ</span>
+        <span className="text-danger">╌╌ Idealización bilineal Priestley 2007</span>
+      </div>
+    </div>
+  );
+}
+
+// ── Tab Cíclico (histéresis M-φ) ───────────────────────────────────────────
+
+function CyclicTab({ sectionId }: { sectionId: string }) {
+  type Proto = "atc_24" | "sinusoidal";
+  const [proto, setProto]       = useState<Proto>("atc_24");
+  const [pKn, setPKn]           = useState("0");
+  const [phiY, setPhiY]         = useState("0.05");
+  const [phiMax, setPhiMax]     = useState("0.10");
+  const [cps, setCps]           = useState("2");
+  const [nc, setNc]             = useState("5");
+  const [decay, setDecay]       = useState("0");
+  const [duct, setDuct]         = useState("0.5, 1, 2, 3, 4");
+  const [result, setResult]     = useState<import("@/lib/editor-api").CyclicResult | null>(null);
+  const [error, setError]       = useState<string | null>(null);
+  const [loading, setLoading]   = useState(false);
+
+  const run = async () => {
+    setLoading(true); setError(null);
+    try {
+      const req: import("@/lib/editor-api").CyclicRequest = {
+        axial_load_kn: parseFloat(pKn) || 0,
+        protocol: proto,
+        steps_per_cycle: 20,
+      };
+      if (proto === "atc_24") {
+        req.phi_yield_1_per_m = parseFloat(phiY) || 0.05;
+        req.cycles_per_step = parseInt(cps) || 2;
+        req.ductilities = duct.split(",").map((v) => parseFloat(v.trim())).filter((v) => v > 0);
+      } else {
+        req.phi_max_1_per_m = parseFloat(phiMax) || 0.05;
+        req.n_cycles = parseInt(nc) || 5;
+        req.decay = parseFloat(decay) || 0;
+      }
+      const r = await sectionEditorApi.cyclic(sectionId, req);
+      setResult(r);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+      {/* Configuración */}
+      <div className="lg:col-span-1 flex flex-col gap-4">
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Protocolo de carga</h3>
+          <div className="grid grid-cols-2 gap-2">
+            {(["atc_24", "sinusoidal"] as Proto[]).map((p) => (
+              <button key={p} onClick={() => setProto(p)}
+                className={`rounded-lg border py-2 text-xs font-semibold transition-all
+                  ${proto === p ? "border-accent bg-accent/10 text-accent" : "border-border text-text-muted hover:text-text"}`}>
+                {p === "atc_24" ? "ATC-24 escalones" : "Senoidal"}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Parámetros</h3>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-[11px] text-text-muted">P axial (kN, + comp.)
+              <input value={pKn} onChange={(e) => setPKn(e.target.value)} type="number"
+                className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+            </label>
+            {proto === "atc_24" && (
+              <>
+                <label className="text-[11px] text-text-muted">φy (1/m, ref.)
+                  <input value={phiY} onChange={(e) => setPhiY(e.target.value)} type="number" step="0.01"
+                    className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+                </label>
+                <label className="text-[11px] text-text-muted col-span-2">Ductilidades objetivo
+                  <input value={duct} onChange={(e) => setDuct(e.target.value)}
+                    placeholder="0.5, 1, 2, 3, 4"
+                    className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+                </label>
+                <label className="text-[11px] text-text-muted">Ciclos por nivel
+                  <input value={cps} onChange={(e) => setCps(e.target.value)} type="number" min="1"
+                    className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+                </label>
+              </>
+            )}
+            {proto === "sinusoidal" && (
+              <>
+                <label className="text-[11px] text-text-muted">φmax (1/m)
+                  <input value={phiMax} onChange={(e) => setPhiMax(e.target.value)} type="number" step="0.01"
+                    className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+                </label>
+                <label className="text-[11px] text-text-muted">Nº ciclos
+                  <input value={nc} onChange={(e) => setNc(e.target.value)} type="number" min="1"
+                    className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+                </label>
+                <label className="text-[11px] text-text-muted">Decay (0=constante)
+                  <input value={decay} onChange={(e) => setDecay(e.target.value)} type="number" step="0.1" min="0"
+                    className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+                </label>
+              </>
+            )}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-amber-500/40 bg-amber-500/5 p-4">
+          <p className="text-xs text-amber-500 font-semibold">Requisitos del modelo</p>
+          <p className="mt-1 text-[11px] text-text-muted leading-relaxed">
+            La sección debe usar <strong>Concrete02</strong> y <strong>Steel02</strong> (memoria histerética).
+            Configúralo en el editor → Materiales.
+          </p>
+        </div>
+
+        <Button onClick={run} disabled={loading}>
+          {loading ? "Analizando…" : "Ejecutar análisis cíclico"}
+        </Button>
+        {error && <p className="text-danger text-xs">{error}</p>}
+      </div>
+
+      {/* Resultados */}
+      <div className="lg:col-span-2 flex flex-col gap-4">
+        {!result && (
+          <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-surface-2 py-16">
+            <p className="text-sm text-text-muted">Configura protocolo y parámetros, pulsa <strong>Ejecutar análisis cíclico</strong>.</p>
+          </div>
+        )}
+
+        {result && (
+          <>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <Stat label="Puntos historia" value={result.n_points} />
+              <Stat label="Ciclos detectados" value={result.n_cycles} />
+              <Stat label="Energía total disipada" value={result.total_energy_dis_kN.toFixed(3)} unit="kN" />
+              <Stat label="Protocolo" value={result.protocol} />
+            </div>
+
+            <HysteresisChart curve={result.curve} />
+
+            {result.cycles.length > 0 && (
+              <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+                <h4 className="mb-3 text-sm font-semibold">Métricas por ciclo</h4>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-text-muted border-b border-border">
+                        <th className="text-left py-1.5 pr-3">#</th>
+                        <th className="text-right pr-3">M+ (kN·m)</th>
+                        <th className="text-right pr-3">M− (kN·m)</th>
+                        <th className="text-right pr-3">φ+ (1/m)</th>
+                        <th className="text-right pr-3">φ− (1/m)</th>
+                        <th className="text-right pr-3">ξ_eq (%)</th>
+                        <th className="text-right pr-3">Ed (kN)</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {result.cycles.map((c, i) => (
+                        <tr key={i} className="border-b border-border/40 font-mono">
+                          <td className="py-1 pr-3">{i + 1}</td>
+                          <td className="text-right pr-3 tabular-nums">{c.peak_pos_M_kNm.toFixed(1)}</td>
+                          <td className="text-right pr-3 tabular-nums">{c.peak_neg_M_kNm.toFixed(1)}</td>
+                          <td className="text-right pr-3 tabular-nums">{(c.peak_pos_phi_1_per_m * 1000).toFixed(3)}</td>
+                          <td className="text-right pr-3 tabular-nums">{(c.peak_neg_phi_1_per_m * 1000).toFixed(3)}</td>
+                          <td className="text-right pr-3 tabular-nums text-accent">{c.xi_eq_pct.toFixed(1)}</td>
+                          <td className="text-right pr-3 tabular-nums">{c.Ed_kNm2.toFixed(2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {result.notes.length > 0 && (
+              <div className="rounded-2xl border border-amber-500/40 bg-amber-500/5 p-4">
+                <h4 className="mb-2 text-sm font-semibold text-amber-500">Notas</h4>
+                <ul className="list-disc pl-5 text-xs text-text-muted space-y-1">
+                  {result.notes.map((n, i) => <li key={i}>{n}</li>)}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function HysteresisChart({ curve }: { curve: { phi_1_per_m: number; moment_kNm: number }[] }) {
+  if (!curve.length) return null;
+  const W = 720, H = 420, pad = { l: 60, r: 20, t: 20, b: 46 };
+  const phis = curve.map((c) => c.phi_1_per_m * 1000);  // 1/m → ×1000 → 1/km para visualizar
+  const moms = curve.map((c) => c.moment_kNm);
+  const phi_max = Math.max(Math.abs(Math.max(...phis)), Math.abs(Math.min(...phis)));
+  const m_max   = Math.max(Math.abs(Math.max(...moms)), Math.abs(Math.min(...moms)));
+  const sx = (v: number) => pad.l + (W - pad.l - pad.r) / 2 + (v / phi_max) * (W - pad.l - pad.r) / 2;
+  const sy = (v: number) => pad.t + (H - pad.t - pad.b) / 2 - (v / m_max) * (H - pad.t - pad.b) / 2;
+
+  const path = curve.map((p, i) => `${i === 0 ? "M" : "L"} ${sx(p.phi_1_per_m * 1000).toFixed(1)} ${sy(p.moment_kNm).toFixed(1)}`).join(" ");
+
+  return (
+    <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+      <h4 className="mb-2 text-sm font-semibold">Lazos histeréticos M-φ</h4>
+      <svg width={W} height={H} className="max-w-full">
+        {/* Ejes cruzados */}
+        <line x1={pad.l} y1={sy(0)} x2={W - pad.r} y2={sy(0)} stroke="var(--color-border)" />
+        <line x1={sx(0)} y1={pad.t} x2={sx(0)} y2={H - pad.b} stroke="var(--color-border)" />
+        {/* Ticks y grid */}
+        {[-1, -0.5, 0.5, 1].map((f) => (
+          <g key={f}>
+            <line x1={pad.l} y1={sy(f * m_max)} x2={W - pad.r} y2={sy(f * m_max)}
+              stroke="var(--color-border)" strokeOpacity="0.2" strokeDasharray="2 4" />
+            <text x={pad.l - 6} y={sy(f * m_max) + 3} fontSize="10" fill="var(--color-text-muted)" textAnchor="end">
+              {(f * m_max).toFixed(0)}
+            </text>
+            <line x1={sx(f * phi_max)} y1={pad.t} x2={sx(f * phi_max)} y2={H - pad.b}
+              stroke="var(--color-border)" strokeOpacity="0.2" strokeDasharray="2 4" />
+            <text x={sx(f * phi_max)} y={H - pad.b + 14} fontSize="10" fill="var(--color-text-muted)" textAnchor="middle">
+              {(f * phi_max).toFixed(2)}
+            </text>
+          </g>
+        ))}
+        {/* Curva histerética */}
+        <path d={path} fill="none" stroke="var(--color-accent)" strokeWidth="1.3" strokeOpacity="0.85" />
+        {/* Labels */}
+        <text x={(pad.l + W - pad.r) / 2} y={H - 8} fontSize="11" fill="var(--color-text-muted)" textAnchor="middle">
+          Curvatura φ (1/km)
+        </text>
+        <text x={16} y={(pad.t + H - pad.b) / 2} fontSize="11" fill="var(--color-text-muted)"
+          transform={`rotate(-90 16 ${(pad.t + H - pad.b) / 2})`} textAnchor="middle">
+          Momento M (kN·m)
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+// ── Tab Servicio (fisuración) ──────────────────────────────────────────────
+
+function ServiceTab({ sectionId }: { sectionId: string }) {
+  type Elem = "beam" | "column" | "wall" | "slab_2d" | "diaphragm";
+  const [ma, setMa]                 = useState("0");
+  const [elem, setElem]             = useState<Elem>("beam");
+  const [wallCracked, setWallCracked] = useState(false);
+  const [result, setResult]         = useState<import("@/lib/editor-api").ServiceabilityResult | null>(null);
+  const [error, setError]           = useState<string | null>(null);
+  const [loading, setLoading]       = useState(false);
+
+  const run = async () => {
+    setLoading(true); setError(null);
+    try {
+      const r = await sectionEditorApi.serviceability(sectionId, {
+        Ma_kNm: parseFloat(ma) || 0,
+        element_kind: elem,
+        wall_cracked: wallCracked,
+      });
+      setResult(r);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+      {/* Entrada */}
+      <div className="lg:col-span-1 flex flex-col gap-4">
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Tipo de elemento</h3>
+          <div className="grid grid-cols-2 gap-1.5">
+            {([
+              ["beam", "Viga"],
+              ["column", "Columna"],
+              ["wall", "Muro"],
+              ["slab_2d", "Losa 2D"],
+              ["diaphragm", "Diafragma"],
+            ] as const).map(([v, label]) => (
+              <button key={v} onClick={() => setElem(v)}
+                className={`rounded-lg border py-2 text-xs font-semibold transition-all
+                  ${elem === v ? "border-accent bg-accent/10 text-accent" : "border-border text-text-muted hover:text-text"}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+          {elem === "wall" && (
+            <label className="mt-3 flex items-center gap-2 text-xs cursor-pointer">
+              <input type="checkbox" checked={wallCracked}
+                onChange={(e) => setWallCracked(e.target.checked)} />
+              Muro considerado fisurado (0.35·Ig vs 0.70·Ig)
+            </label>
+          )}
+        </div>
+
+        <div className="rounded-2xl border border-border bg-surface p-4 shadow-sm">
+          <h3 className="mb-3 text-sm font-semibold">Momento aplicado</h3>
+          <label className="text-[11px] text-text-muted">Ma (kN·m)
+            <input value={ma} onChange={(e) => setMa(e.target.value)} type="number"
+              className="mt-1 w-full rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-sm font-mono" />
+          </label>
+          <p className="mt-2 text-[11px] text-text-muted italic">
+            Se usa para calcular Ie de Branson (interpola entre Ig e Icr).
+            Ma = 0 → sin Branson.
+          </p>
+        </div>
+
+        <Button onClick={run} disabled={loading}>
+          {loading ? "Calculando…" : "Analizar servicio"}
+        </Button>
+        {error && <p className="text-danger text-xs">{error}</p>}
+      </div>
+
+      {/* Resultados */}
+      <div className="lg:col-span-2 flex flex-col gap-4">
+        {!result && (
+          <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed border-border bg-surface-2 py-16">
+            <p className="text-sm text-text-muted">Configura Ma y tipo, pulsa <strong>Analizar servicio</strong>.</p>
+            <p className="mt-1 text-xs text-text-muted">Calcula Mcr, Icr (sección transformada), Ie (Branson) y recomendación NSR-10 A.5.3.</p>
+          </div>
+        )}
+
+        {result && (
+          <>
+            {/* Cracking */}
+            <section>
+              <h4 className="mb-2 text-[11px] font-bold uppercase tracking-[0.14em] text-text">Fisuración</h4>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                <Stat label="fr" value={result.materials.fr_MPa.toFixed(3)} unit="MPa" />
+                <Stat label="Mcr (+)" value={result.cracking.Mcr_kNm.toFixed(1)} unit="kN·m" />
+                <Stat label="Mcr (−)" value={result.cracking.Mcr_neg_kNm.toFixed(1)} unit="kN·m" />
+                <Stat label="yt" value={result.cracking.yt_mm.toFixed(0)} unit="mm" />
+              </div>
+            </section>
+
+            {/* Inercias */}
+            <section>
+              <h4 className="mb-2 text-[11px] font-bold uppercase tracking-[0.14em] text-text">Inercias</h4>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
+                <Stat label="Ig (bruta)" value={result.cracking.Ig_cm4.toFixed(0)} unit="cm⁴" />
+                <Stat label="Icr (fisurada)" value={result.cracked_section.Icr_cm4.toFixed(0)} unit="cm⁴" />
+                <Stat label="Ie (Branson)" value={result.effective.Ie_cm4.toFixed(0)} unit="cm⁴" />
+                <Stat label="Icr/Ig" value={(result.cracked_section.Icr_cm4/result.cracking.Ig_cm4*100).toFixed(1)} unit="%" />
+                <Stat label="Ie/Ig" value={(result.effective.Ie_cm4/result.cracking.Ig_cm4*100).toFixed(1)} unit="%" />
+                <Stat label="c (fibra→eje neutro)" value={result.cracked_section.c_neutral_mm.toFixed(0)} unit="mm" />
+              </div>
+            </section>
+
+            {/* NSR-10 A.5.3 */}
+            <section>
+              <h4 className="mb-2 text-[11px] font-bold uppercase tracking-[0.14em] text-text">Recomendación NSR-10 A.5.3 (análisis sísmico)</h4>
+              <div className="rounded-2xl border border-accent/30 bg-accent/5 p-4">
+                <p className="text-xs text-text-muted mb-2">
+                  Para análisis elástico modal/espectral, NSR-10 A.5.3 recomienda usar:
+                </p>
+                <div className="grid grid-cols-3 gap-3">
+                  <Stat label={`Ie/Ig (${result.nsr10_A53.element_kind})`}
+                    value={(result.nsr10_A53.Ie_over_Ig * 100).toFixed(0)} unit="%" />
+                  <Stat label="Ie recomendada" value={result.nsr10_A53.Ie_recommended_cm4.toFixed(0)} unit="cm⁴" />
+                  <Stat label="EI recomendada" value={(result.materials.Ec_MPa * result.nsr10_A53.Ie_recommended_cm4 * 1e4 / 1e12).toFixed(2)} unit="MN·m²" />
+                </div>
+              </div>
+            </section>
+
+            {/* Curvaturas y materiales */}
+            <section>
+              <h4 className="mb-2 text-[11px] font-bold uppercase tracking-[0.14em] text-text">Materiales derivados</h4>
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                <Stat label="Ec" value={result.materials.Ec_MPa.toFixed(0)} unit="MPa" />
+                <Stat label="Es" value={result.materials.Es_MPa.toFixed(0)} unit="MPa" />
+                <Stat label="n = Es/Ec" value={result.materials.n.toFixed(2)} />
+                {result.input.Ma_kNm !== 0 && (
+                  <Stat label="φ servicio" value={result.effective.phi_service_1_per_km.toFixed(4)} unit="1/km" />
+                )}
+              </div>
+            </section>
+
+            {result.notes.length > 0 && (
+              <div className="rounded-2xl border border-amber-500/40 bg-amber-500/5 p-4">
+                <h4 className="mb-2 text-sm font-semibold text-amber-500">Notas del análisis</h4>
+                <ul className="list-disc pl-5 text-xs text-text-muted space-y-1">
+                  {result.notes.map((n, i) => <li key={i}>{n}</li>)}
+                </ul>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Página principal ────────────────────────────────────────────────────────
 
 const TAB_LABELS: Record<Tab, string> = {
+  props:       "Propiedades",
   pm:          "Diagrama P-M",
   mc:          "Curva M-φ",
   pmm:         "Superficie P-M-M",
+  shear:       "Cortante",
+  ductility:   "Ductilidad",
+  cyclic:      "Cíclico",
+  service:     "Servicio",
   nsr10:       "NSR-10",
   diagnostico: "Diagnóstico",
 };
@@ -1232,7 +2205,7 @@ export default function AnalyzePage() {
 
         {/* Tabs */}
         <div className="mb-4 flex gap-1 rounded-xl border border-border bg-surface p-1 print:hidden">
-          {(["pm", "mc", "pmm", "nsr10", "diagnostico"] as Tab[]).map((t) => (
+          {(["props", "pm", "mc", "pmm", "shear", "ductility", "cyclic", "service", "nsr10", "diagnostico"] as Tab[]).map((t) => (
             <button
               key={t}
               onClick={() => setActiveTab(t)}
@@ -1248,6 +2221,9 @@ export default function AnalyzePage() {
           <h2 className="text-lg font-bold">{TAB_LABELS[activeTab]} — {sectionName}</h2>
         </div>
 
+        {id && activeTab === "props" && (
+          <PropsTab sectionId={id} />
+        )}
         {id && activeTab === "pm" && (
           <PMTab sectionId={id} sectionName={sectionName} onResult={setPmResult} />
         )}
@@ -1256,6 +2232,18 @@ export default function AnalyzePage() {
         )}
         {id && activeTab === "pmm" && (
           <PMMTab sectionId={id} sectionName={sectionName} pMaxRef={0} />
+        )}
+        {id && activeTab === "shear" && (
+          <ShearTab sectionId={id} />
+        )}
+        {id && activeTab === "ductility" && (
+          <DuctilityTab sectionId={id} />
+        )}
+        {id && activeTab === "cyclic" && (
+          <CyclicTab sectionId={id} />
+        )}
+        {id && activeTab === "service" && (
+          <ServiceTab sectionId={id} />
         )}
         {id && activeTab === "nsr10" && (
           <NSR10Tab sectionId={id} sectionName={sectionName} onResult={setNsr10Result} />

@@ -242,6 +242,15 @@ export default function SectionEditorPage() {
         onRedo={() => dispatch({ type: "REDO" })}
         canUndo={state.history.length > 0}
         canRedo={state.future.length > 0}
+        nRegions={state.doc.regions.length}
+        nBars={state.doc.bars.length}
+        nSelected={
+          state.selection?.kind === "multi"
+            ? state.selection.regionIds.length + state.selection.barIds.length
+            : state.selection ? 1 : 0
+        }
+        showGrid={state.view.showGrid}
+        onToggleGrid={() => dispatch({ type: "SET_VIEW", view: { showGrid: !state.view.showGrid } })}
       />
 
       {/* Cuerpo del editor */}

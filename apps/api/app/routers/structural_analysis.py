@@ -9,6 +9,7 @@ Flujo de análisis:
 
 Cada etapa es un job Celery independiente. El frontend hace polling cada 3s.
 """
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -79,6 +80,76 @@ class JobOut(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _input_hash(
+    project:       StructuralProject,
+    analysis_type: StructuralAnalysisType,
+    extra_params:  dict | None,
+) -> str | None:
+    """
+    Hash SHA-256 de las entradas que determinan el resultado de un análisis:
+      - contenido del canonical_model.json (si existe)
+      - project.parameters_json
+      - extra_params serializado con sort_keys
+      - analysis_type
+
+    Si canonical_model no existe todavía, retorna None (no se puede cachear).
+    """
+    if not project.canonical_model_path or not os.path.exists(project.canonical_model_path):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(project.canonical_model_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+        h.update((project.parameters_json or "").encode("utf-8"))
+        h.update(
+            json.dumps(extra_params or {}, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        )
+        h.update(analysis_type.value.encode("ascii"))
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _cached_success_for(
+    db:            Session,
+    project:       StructuralProject,
+    analysis_type: StructuralAnalysisType,
+    input_hash:    str,
+) -> StructuralJob | None:
+    """
+    Busca el último job success del mismo tipo y proyecto cuyo result_summary
+    contenga el mismo input_hash. Si el archivo de resultado ya no existe en
+    disco (ej. fue borrado manualmente), NO se considera cache hit.
+    """
+    candidates = (
+        db.query(StructuralJob)
+        .filter(
+            StructuralJob.project_id == project.id,
+            StructuralJob.analysis_type == analysis_type,
+            StructuralJob.status == StructuralJobStatus.success,
+        )
+        .order_by(StructuralJob.finished_at.desc())
+        .limit(8)
+        .all()
+    )
+    for j in candidates:
+        raw = j.result_summary
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("input_hash") != input_hash:
+            continue
+        if j.result_path and not os.path.exists(j.result_path):
+            continue
+        return j
+    return None
+
 
 def _get_project(db: Session, project_id: str, user: User) -> StructuralProject:
     project = db.get(StructuralProject, project_id)
@@ -195,6 +266,16 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
                 status_code=400,
                 detail="Ejecuta el diseño de muros RC antes del pushover no lineal.",
             )
+
+    # ── Cache por hash: si el último job success del mismo tipo tiene los
+    #    mismos inputs (canonical + parameters + extra_params), reutilízalo
+    #    en vez de re-lanzar Celery. Ahorra 1-190s por corrida.
+    if payload.analysis_type != StructuralAnalysisType.import_validate:
+        input_hash = _input_hash(project, payload.analysis_type, payload.extra_params)
+        if input_hash:
+            cached = _cached_success_for(db, project, payload.analysis_type, input_hash)
+            if cached:
+                return JobOut.from_orm(cached)
 
     # Crear el registro del job
     job = StructuralJob(

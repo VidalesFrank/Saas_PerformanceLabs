@@ -2,6 +2,8 @@
 Utilidades compartidas por las tareas Celery del Módulo 1 (Constructor de Modelos).
 Gestión de sesiones DB y transiciones de estado de StructuralJob.
 """
+import hashlib
+import json
 import os
 from datetime import datetime, timezone
 
@@ -9,6 +11,34 @@ from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 from app.models import StructuralJob, StructuralJobStatus, StructuralProject
+
+
+def compute_input_hash(
+    canonical_path:     str | None,
+    parameters_json:    str | None,
+    extra_params:       dict | None,
+    analysis_type_str:  str,
+) -> str | None:
+    """
+    Hash SHA-256 de los inputs de un análisis (para cache por hash).
+    Coincide con la implementación de `_input_hash` en structural_analysis.py.
+    Retorna None si el canonical no existe todavía.
+    """
+    if not canonical_path or not os.path.exists(canonical_path):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(canonical_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 16), b""):
+                h.update(chunk)
+        h.update((parameters_json or "").encode("utf-8"))
+        h.update(
+            json.dumps(extra_params or {}, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        )
+        h.update(analysis_type_str.encode("ascii"))
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def get_db_session() -> Session:

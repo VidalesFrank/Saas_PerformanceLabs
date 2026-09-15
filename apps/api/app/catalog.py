@@ -136,6 +136,27 @@ CATALOG = [
         ],
     },
     {
+        "id": "triaje-post-sismo",
+        "name": "Toma de datos en campo y triaje sísmico post-sismo",
+        "products": [
+            {
+                "id": "safety-atc20",
+                "name": "Evaluación rápida de seguridad (ATC-20 / AIS-IDIGER)",
+                "nivel": "free", "estado": "en_desarrollo", "route": "/field-assessment",
+            },
+            {
+                "id": "triage-fema-p2018",
+                "name": "Triaje FEMA P-2018 (Building Rating) para concreto reforzado",
+                "nivel": "pro", "estado": "en_desarrollo", "route": "/field-assessment",
+            },
+            {
+                "id": "reporte-triaje",
+                "name": "Reporte de placard + Building Rating (PDF)",
+                "nivel": "pro", "estado": "idea", "route": "/field-assessment",
+            },
+        ],
+    },
+    {
         "id": "analisis-no-lineal-3d",
         "name": "Módulo 3 - Análisis No Lineal de Edificios",
         "products": [

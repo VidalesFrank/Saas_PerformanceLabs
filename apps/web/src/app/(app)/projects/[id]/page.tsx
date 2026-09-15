@@ -1005,7 +1005,17 @@ export default function StructuralProjectPage() {
                         <p className="text-sm text-[var(--text-muted)] animate-pulse">Cargando modelo...</p>
                       </div>
                     ) : modelGeometry ? (
-                      <ModelViewSwitcher geometry={modelGeometry} />
+                      <ModelViewSwitcher
+                        geometry={modelGeometry}
+                        sections={fullModelData?.sections}
+                        onSwitchTo2D={() => {
+                          // Lazy-load: la vista 2D quiere dimensiones reales
+                          // de columnas/vigas. Si aún no está cargado, dispara.
+                          if (!fullModelData && project?.canonical_model_path) {
+                            structuralEditorApi.modelData(project.id).then(setFullModelData).catch(() => {});
+                          }
+                        }}
+                      />
                     ) : (
                       <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] flex items-center justify-center h-48">
                         <p className="text-sm text-[var(--text-muted)]">

@@ -49,6 +49,10 @@ export interface SectionCreatePayload {
   n_bars?: number;
   bars?: [number, number][];
   bar_id: string;
+  /** Tamaños individuales por barra. Paralelo al array de barras generadas o
+   *  a `bars` en modo especial. Si el índice no existe o el tamaño es inválido,
+   *  el backend cae al `bar_id` global. */
+  bar_sizes?: string[];
   cover_to_bar_centroid?: number;
 }
 

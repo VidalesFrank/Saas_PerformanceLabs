@@ -15,6 +15,7 @@ import type {
 } from "@/lib/structural-types";
 import { structuralEditorApi } from "@/lib/structural-api";
 import { LinearModelViewer3D } from "./LinearModelViewer3D";
+import Building2DPlanView    from "./Building2DPlanView";
 import ModelPropertiesPanel from "./ModelPropertiesPanel";
 import ModelSectionsPanel from "./ModelSectionsPanel";
 import ModelMaterialsPanel from "./ModelMaterialsPanel";
@@ -326,6 +327,8 @@ export default function ModelEditorPanel({
 
   // ── Right panel ────────────────────────────────────────────────────────────
   const [rightPanel, setRightPanel] = useState<RightPanelTab>("properties");
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState(false);
+  const [leftPanelCollapsed, setLeftPanelCollapsed]   = useState(false);
 
   // ── Model data ─────────────────────────────────────────────────────────────
   const [modelData, setModelData]       = useState<FullModelData | null>(null);
@@ -725,7 +728,7 @@ export default function ModelEditorPanel({
         {/* Cámara */}
         <TGroup>
           <TBtn active={cameraViewMode === "3d"}    onClick={() => setCameraViewMode("3d")}    title="Vista 3D perspectiva">3D</TBtn>
-          <TBtn active={cameraViewMode === "plan"}  onClick={() => setCameraViewMode("plan")}  title="Vista en planta ortográfica">Planta</TBtn>
+          <TBtn active={cameraViewMode === "plan"}  onClick={() => setCameraViewMode("plan")}  title="Vista en planta 2D (SVG)">Planta</TBtn>
           <TBtn active={cameraViewMode === "elevX"} onClick={() => setCameraViewMode("elevX")} title="Elevación eje X">Elev X</TBtn>
           <TBtn active={cameraViewMode === "elevY"} onClick={() => setCameraViewMode("elevY")} title="Elevación eje Y">Elev Y</TBtn>
         </TGroup>
@@ -977,11 +980,27 @@ export default function ModelEditorPanel({
       {/* ── Cuerpo: árbol | viewport | inspector ─────────────────────────── */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
 
-        {/* Panel izquierdo: árbol del modelo con tabs ───────────────────── */}
-        <div className="w-52 flex-shrink-0 border-r border-border flex flex-col overflow-hidden bg-surface">
+        {/* Panel izquierdo: árbol del modelo con tabs (colapsable) ──────── */}
+        <div className={[
+          "flex-shrink-0 border-r border-border flex flex-col overflow-hidden bg-surface transition-[width] duration-150",
+          leftPanelCollapsed ? "w-8" : "w-52",
+        ].join(" ")}>
 
+          {leftPanelCollapsed ? (
+            <button
+              onClick={() => setLeftPanelCollapsed(false)}
+              title="Mostrar panel Modelo / Pisos / Secc."
+              className="w-full py-2 flex flex-col items-center gap-1 border-b border-border bg-surface-2 hover:bg-surface text-text-muted hover:text-text transition-colors"
+            >
+              <span aria-hidden className="text-sm">▶</span>
+              <span className="text-[9px] font-semibold uppercase tracking-wider [writing-mode:vertical-rl] mt-1">
+                Modelo · Pisos · Secc.
+              </span>
+            </button>
+          ) : (
+            <>
           {/* Tabs */}
-          <div className="flex border-b border-border flex-shrink-0 bg-surface-2">
+          <div className="flex items-stretch border-b border-border flex-shrink-0 bg-surface-2">
             {(["model", "stories", "sections"] as const).map(tab => (
               <button
                 key={tab}
@@ -996,6 +1015,13 @@ export default function ModelEditorPanel({
                 {tab === "model" ? "Modelo" : tab === "stories" ? "Pisos" : "Secc."}
               </button>
             ))}
+            <button
+              onClick={() => setLeftPanelCollapsed(true)}
+              title="Ocultar panel"
+              className="px-2 border-l border-border text-text-muted hover:text-text hover:bg-surface transition-colors"
+            >
+              ◀
+            </button>
           </div>
 
           <div className="flex-1 overflow-y-auto text-[11px]">
@@ -1131,6 +1157,8 @@ export default function ModelEditorPanel({
             )}
 
           </div>
+            </>
+          )}
         </div>
 
         {/* Viewport central — captura clic derecho para el menú contextual */}
@@ -1148,7 +1176,25 @@ export default function ModelEditorPanel({
               <p className="text-sm text-danger text-center">{modelError}</p>
             </div>
           )}
-          {!modelError && (
+          {!modelError && cameraViewMode === "plan" && (
+            <div className="flex-1 p-2 min-h-0 flex flex-col">
+              <Building2DPlanView
+                geometry={geometry}
+                initialStory={storyFilter ?? undefined}
+                sections={modelData?.sections}
+                height={640}
+                onElementClick={(info) => {
+                  handleClickElement(info.id, {
+                    id: info.id,
+                    element_type: info.type,
+                    story: storyFilter ?? "",
+                    section: "",
+                  });
+                }}
+              />
+            </div>
+          )}
+          {!modelError && cameraViewMode !== "plan" && (
             <div className="flex-1 p-2 min-h-0">
               <LinearModelViewer3D
                 geometry={geometry}
@@ -1178,28 +1224,51 @@ export default function ModelEditorPanel({
           )}
         </div>
 
-        {/* Panel derecho: inspector */}
-        <div className="w-64 flex-shrink-0 border-l border-border flex flex-col overflow-hidden bg-surface">
-          <div className="flex border-b border-border flex-shrink-0 bg-surface-2">
-            {RIGHT_TABS.map(tab => (
-              <button key={tab.id}
-                onClick={() => setRightPanel(tab.id)}
-                className={[
-                  "flex-1 py-2 text-[10px] font-semibold uppercase tracking-wide transition-colors border-b-2",
-                  rightPanel === tab.id
-                    ? "text-accent border-accent"
-                    : "text-text-muted border-transparent hover:text-text",
-                ].join(" ")}
+        {/* Panel derecho: inspector (colapsable) */}
+        <div className={[
+          "flex-shrink-0 border-l border-border flex flex-col overflow-hidden bg-surface transition-[width] duration-150",
+          rightPanelCollapsed ? "w-8" : "w-64",
+        ].join(" ")}>
+          {rightPanelCollapsed ? (
+            <button
+              onClick={() => setRightPanelCollapsed(false)}
+              title="Mostrar panel del inspector"
+              className="w-full py-2 flex flex-col items-center gap-1 border-b border-border bg-surface-2 hover:bg-surface text-text-muted hover:text-text transition-colors"
+            >
+              <span aria-hidden className="text-sm">◀</span>
+              <span className="text-[9px] font-semibold uppercase tracking-wider [writing-mode:vertical-rl] rotate-180 mt-1">
+                Inspector
+              </span>
+            </button>
+          ) : (
+            <div className="flex items-stretch border-b border-border flex-shrink-0 bg-surface-2">
+              {RIGHT_TABS.map(tab => (
+                <button key={tab.id}
+                  onClick={() => setRightPanel(tab.id)}
+                  className={[
+                    "flex-1 py-2 text-[10px] font-semibold uppercase tracking-wide transition-colors border-b-2",
+                    rightPanel === tab.id
+                      ? "text-accent border-accent"
+                      : "text-text-muted border-transparent hover:text-text",
+                  ].join(" ")}
+                >
+                  {tab.label}
+                  {tab.id === "properties" && nSelected > 0 && (
+                    <span className="ml-1 text-accent">{nSelected}</span>
+                  )}
+                </button>
+              ))}
+              <button
+                onClick={() => setRightPanelCollapsed(true)}
+                title="Ocultar panel del inspector"
+                className="px-2 border-l border-border text-text-muted hover:text-text hover:bg-surface transition-colors"
               >
-                {tab.label}
-                {tab.id === "properties" && nSelected > 0 && (
-                  <span className="ml-1 text-accent">{nSelected}</span>
-                )}
+                ▶
               </button>
-            ))}
-          </div>
+            </div>
+          )}
 
-          <div className="flex-1 overflow-hidden">
+          <div className={rightPanelCollapsed ? "hidden" : "flex-1 overflow-hidden"}>
             {rightPanel === "properties" && modelData && (
               <ModelPropertiesPanel
                 projectId={projectId}

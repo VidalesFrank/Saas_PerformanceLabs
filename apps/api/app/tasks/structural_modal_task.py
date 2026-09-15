@@ -21,7 +21,7 @@ import numpy as np
 
 from app.tasks.celery_app import celery_app
 from app.tasks.structural_helpers import (
-    get_db_session, mark_running, mark_success, mark_failed,
+    get_db_session, mark_running, mark_success, mark_failed, compute_input_hash,
 )
 
 
@@ -189,6 +189,9 @@ def run_modal(
         summary = {
             "T1": round(T1, 4), "T1_x": round(T1_x, 4), "T1_y": round(T1_y, 4),
             "num_modes": len(eigenvalues), "n_stories": n_stories,
+            "input_hash": compute_input_hash(
+                canonical_path, project.parameters_json, extra_params, "modal",
+            ),
         }
         print(f"[modal] T1={T1:.4f}s | T1_x={T1_x:.4f}s | T1_y={T1_y:.4f}s")
         mark_success(db, job_id, modal_path, summary=summary)

@@ -457,3 +457,227 @@ class GMJob(Base):
 
     record: Mapped["GroundMotionRecord"] = relationship("GroundMotionRecord", back_populates="jobs")
     owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fase 0 — Toma de datos en campo y triaje sísmico post-sismo
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AssessmentStage(str, enum.Enum):
+    draft         = "draft"          # capturando datos
+    safety_done   = "safety_done"    # placard ATC-20 emitido
+    triage_done   = "triage_done"    # triaje FEMA P-2018 emitido (opcional)
+    archived      = "archived"
+
+
+class SyncStatus(str, enum.Enum):
+    """Preparado para v2 offline/PWA — actualmente todo llega como 'synced'."""
+    local_only    = "local_only"
+    pending_sync  = "pending_sync"
+    synced        = "synced"
+
+
+class FieldAssessment(Base):
+    """Inspección post-sismo (raíz). Independiente de BuildingProject.
+
+    Todo lo que se captura en campo cuelga de esta entidad. client_uuid y
+    sync_status están pensados para la futura versión PWA offline: el cliente
+    genera el UUID en el dispositivo y el servidor hace UPSERT por client_uuid
+    en la sincronización — no requiere rediseño de esquema.
+    """
+    __tablename__ = "field_assessments"
+
+    id:            Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    client_uuid:   Mapped[str] = mapped_column(String(36), unique=True, default=_uuid, nullable=False)
+    owner_id:      Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False)
+
+    # Vínculo OPCIONAL y MANUAL a un proyecto del Módulo 3 (nunca automático).
+    linked_building_project_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("building_projects.id"), nullable=True
+    )
+
+    title:              Mapped[str] = mapped_column(String(255), nullable=False)
+    stage:              Mapped["AssessmentStage"] = mapped_column(
+        Enum(AssessmentStage), default=AssessmentStage.draft, nullable=False
+    )
+    sync_status:        Mapped["SyncStatus"] = mapped_column(
+        Enum(SyncStatus), default=SyncStatus.synced, nullable=False
+    )
+    client_created_at:  Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at:         Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    owner:              Mapped["User"] = relationship("User", foreign_keys=[owner_id])
+    snapshot:           Mapped["BuildingSnapshot | None"] = relationship(
+        "BuildingSnapshot", back_populates="assessment",
+        cascade="all, delete-orphan", uselist=False,
+    )
+    safety_evaluation:  Mapped["SafetyEvaluation | None"] = relationship(
+        "SafetyEvaluation", back_populates="assessment",
+        cascade="all, delete-orphan", uselist=False,
+    )
+    triage_result:      Mapped["TriageResult | None"] = relationship(
+        "TriageResult", back_populates="assessment",
+        cascade="all, delete-orphan", uselist=False,
+    )
+    photos:             Mapped[list["FieldPhoto"]] = relationship(
+        "FieldPhoto", back_populates="assessment", cascade="all, delete-orphan"
+    )
+
+
+class BuildingSnapshot(Base):
+    """Datos as-built del edificio inspeccionado (1:1 con FieldAssessment)."""
+    __tablename__ = "building_snapshots"
+
+    id:             Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    assessment_id:  Mapped[str] = mapped_column(
+        String(36), ForeignKey("field_assessments.id"), unique=True, nullable=False
+    )
+
+    address_line:   Mapped[str | None] = mapped_column(String(500), nullable=True)
+    city:           Mapped[str | None] = mapped_column(String(200), nullable=True)
+    municipio_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    latitude:       Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude:      Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    year_built:         Mapped[int | None] = mapped_column(Integer, nullable=True)
+    n_stories_above:    Mapped[int | None] = mapped_column(Integer, nullable=True)
+    n_stories_below:    Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_height_m:     Mapped[float | None] = mapped_column(Float, nullable=True)
+    plan_area_m2:       Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    structural_system:  Mapped[str | None] = mapped_column(String(30), nullable=True)
+    floor_system:       Mapped[str | None] = mapped_column(String(30), nullable=True)
+    occupancy_use_nsr10:Mapped[str | None] = mapped_column(String(4), nullable=True)
+
+    has_asbuilt_docs:   Mapped[bool] = mapped_column(default=False, nullable=False)
+    has_geotech_hazard: Mapped[bool] = mapped_column(default=False, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    assessment: Mapped["FieldAssessment"] = relationship(back_populates="snapshot")
+
+
+class Placard(str, enum.Enum):
+    green  = "green"    # INSPECCIONADO
+    yellow = "yellow"   # USO RESTRINGIDO
+    red    = "red"      # INSEGURO
+
+
+class SafetyEvaluation(Base):
+    """Sub-flujo A: evaluación rápida ATC-20 / AIS-IDIGER (1:1 con assessment)."""
+    __tablename__ = "safety_evaluations"
+
+    id:             Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    assessment_id:  Mapped[str] = mapped_column(
+        String(36), ForeignKey("field_assessments.id"), unique=True, nullable=False
+    )
+
+    inspector_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    inspector_id:   Mapped[str | None] = mapped_column(String(100), nullable=True)
+    inspector_org:  Mapped[str | None] = mapped_column(String(255), nullable=True)
+    inspected_at:   Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Payloads estructurados guardados como JSON (esquemas versionables sin migración)
+    hazards_json:          Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    component_damage_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    access_condition_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    residual_drift_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    placard:            Mapped["Placard | None"] = mapped_column(Enum(Placard), nullable=True)
+    placard_reasons:    Mapped[list | None] = mapped_column(JSON, nullable=True)
+    restrictions:       Mapped[list | None] = mapped_column(JSON, nullable=True)
+
+    manual_override:    Mapped["Placard | None"] = mapped_column(
+        Enum(Placard, name="placard_override"), nullable=True
+    )
+    manual_override_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    assessment: Mapped["FieldAssessment"] = relationship(back_populates="safety_evaluation")
+
+
+class FieldPhoto(Base):
+    """Foto georreferenciada asociada a una inspección."""
+    __tablename__ = "field_photos"
+
+    id:            Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    assessment_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("field_assessments.id"), nullable=False
+    )
+    file_path:     Mapped[str] = mapped_column(String(1000), nullable=False)
+    latitude:      Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude:     Mapped[float | None] = mapped_column(Float, nullable=True)
+    taken_at:      Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    component_tag: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    caption:       Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at:    Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    assessment:    Mapped["FieldAssessment"] = relationship(back_populates="photos")
+
+
+class TriageDecision(str, enum.Enum):
+    low_risk         = "low_risk"          # BR <= 0.30
+    asce41_candidate = "asce41_candidate"  # 0.30 < BR < 0.70
+    high_risk        = "high_risk"         # BR >= 0.70
+    not_applicable   = "not_applicable"    # tipología fuera de alcance v1
+
+
+class TriageResult(Base):
+    """Sub-flujo B: resultado del triaje FEMA P-2018 (0..1 con assessment).
+
+    Es re-ejecutable: el usuario puede recalcular con datos mejorados de planos
+    as-built o cambiando la Tabla 6-6 sin afectar el placard ATC-20.
+    """
+    __tablename__ = "triage_results"
+
+    id:             Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    assessment_id:  Mapped[str] = mapped_column(
+        String(36), ForeignKey("field_assessments.id"), unique=True, nullable=False
+    )
+
+    applicability_ok:  Mapped[bool] = mapped_column(default=True, nullable=False)
+    exceptional_flags_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    shortcut_applied:  Mapped[str | None] = mapped_column(String(30), nullable=True)  # "wsi" | "elastic_global"
+    stories_json:      Mapped[list | None] = mapped_column(JSON, nullable=True)       # snapshot input pisos
+    story_ratings_json:Mapped[list | None] = mapped_column(JSON, nullable=True)       # SR calculados
+
+    table_6_6_config_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("fema_table_6_6_configs.id"), nullable=True
+    )
+
+    building_rating:  Mapped[float | None] = mapped_column(Float, nullable=True)
+    decision:         Mapped["TriageDecision | None"] = mapped_column(Enum(TriageDecision), nullable=True)
+    decision_reason:  Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    assessment:  Mapped["FieldAssessment"] = relationship(back_populates="triage_result")
+    table_6_6:   Mapped["FemaTable66Config | None"] = relationship("FemaTable66Config")
+
+
+class FemaTable66Config(Base):
+    """Tabla 6-6 configurable por usuario. NULL owner_id = default del sistema."""
+    __tablename__ = "fema_table_6_6_configs"
+
+    id:         Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    owner_id:   Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
+    name:       Mapped[str] = mapped_column(String(255), nullable=False)
+    bands_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    is_default: Mapped[bool] = mapped_column(default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    owner:      Mapped["User | None"] = relationship("User", foreign_keys=[owner_id])

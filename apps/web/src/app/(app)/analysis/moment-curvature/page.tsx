@@ -3,6 +3,7 @@
 import { FormEvent, useState } from "react";
 import { AppHeader } from "@/components/app-header";
 import { SectionPreview } from "@/components/section-preview";
+import { applyBarEdit, applyBarDelete, applyBarDuplicate, computeBarSizesFromForm, parsePairs } from "@/lib/section-form-adapter";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/input";
@@ -29,9 +30,12 @@ const DEFAULT_FORM = {
   hoop_legs_x: 2, hoop_legs_y: 2, hoop_leg_area: 71,
   is_spiral: true,
   n_bars_y: 3, n_bars_z: 3, n_bars: 8,
-  bar_id: "#8", cover_to_bar_centroid: 52,
+  bar_id: "#8", bar_sizes: [] as string[], cover_to_bar_centroid: 52,
   axial_load_kn: 500,
   num_incr: 120,
+  // Coordenadas explícitas (se activan al editar barras individuales — modo "special")
+  verticesText: "",
+  barsText: "",
 };
 
 const BAR_IDS = ["#3","#4","#5","#6","#7","#8","#9","#10","#11"];
@@ -278,10 +282,17 @@ export default function MomentCurvaturePage() {
         hoop_leg_area: form.hoop_leg_area,
         is_spiral: form.is_spiral,
         bar_id: form.bar_id,
+        bar_sizes: computeBarSizesFromForm(form),
         cover_to_bar_centroid: form.cover_to_bar_centroid,
         ...(form.shape_type === "rectangular" || form.shape_type === "square"
           ? { width: form.width, height: form.height, n_bars_y: form.n_bars_y, n_bars_z: form.n_bars_z }
-          : { diameter: form.diameter, n_bars: form.n_bars }),
+          : form.shape_type === "circular"
+          ? { diameter: form.diameter, n_bars: form.n_bars }
+          : {
+              // "special": coordenadas explícitas (viene de editar barra individual)
+              vertices: parsePairs(form.verticesText ?? ""),
+              bars: parsePairs(form.barsText ?? ""),
+            }),
       };
 
       const sec = await api.post<SectionOut>("/api/v1/sections", payload);
@@ -438,6 +449,12 @@ export default function MomentCurvaturePage() {
                   cover={form.cover}
                   coverToBarCentroid={form.cover_to_bar_centroid}
                   nBarsY={form.n_bars_y} nBarsZ={form.n_bars_z} nBars={form.n_bars}
+                  vertices={form.shape_type === "special" ? parsePairs(form.verticesText ?? "") : undefined}
+                  bars={form.shape_type === "special" ? parsePairs(form.barsText ?? "") : undefined}
+                  barSizes={computeBarSizesFromForm(form)}
+                  onBarEdit={(idx, updates) => setForm(applyBarEdit(form, idx, updates))}
+                  onBarDelete={(idx) => setForm(applyBarDelete(form, idx))}
+                  onBarDuplicate={(idx) => setForm(applyBarDuplicate(form, idx))}
                 />
               </CardBody>
             </Card>

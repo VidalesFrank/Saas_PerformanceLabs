@@ -14,8 +14,14 @@ interface Props {
 
 type Tab = "concreto" | "acero";
 
-const EMPTY_CONCRETE: Omit<ConcreteDef, "id"> = { label: "", fpc: 28, eco: 0.002 };
-const EMPTY_STEEL: Omit<SteelDef, "id"> = { label: "", fy: 420, Es: 200000, b: 0.01 };
+const EMPTY_CONCRETE: Omit<ConcreteDef, "id"> = {
+  label: "", fpc: 28, eco: 0.002, model_kind: "concrete01",
+  ft: null, Ets: null, lambda_c: 0.10,
+};
+const EMPTY_STEEL: Omit<SteelDef, "id"> = {
+  label: "", fy: 420, Es: 200000, b: 0.01, model_kind: "steel02",
+  fpu: null, eps_ult: null,
+};
 
 function NumInput({
   label, value, onChange, step = 1, min,
@@ -50,7 +56,12 @@ function ConcretePanel({ defs, dispatch }: { defs: ConcreteDef[]; dispatch: (a: 
   });
 
   function startEdit(def: ConcreteDef) {
-    setForm({ label: def.label, fpc: def.fpc, eco: def.eco, editId: def.id });
+    setForm({
+      label: def.label, fpc: def.fpc, eco: def.eco,
+      model_kind: def.model_kind ?? "concrete01",
+      ft: def.ft ?? null, Ets: def.Ets ?? null, lambda_c: def.lambda_c ?? 0.10,
+      editId: def.id,
+    });
   }
 
   function cancel() {
@@ -59,10 +70,14 @@ function ConcretePanel({ defs, dispatch }: { defs: ConcreteDef[]; dispatch: (a: 
 
   function save() {
     if (!form.label.trim()) return;
+    const payload = {
+      label: form.label, fpc: form.fpc, eco: form.eco,
+      model_kind: form.model_kind, ft: form.ft, Ets: form.Ets, lambda_c: form.lambda_c,
+    };
     if (form.editId) {
-      dispatch({ type: "UPDATE_CONCRETE_DEF", id: form.editId, updates: { label: form.label, fpc: form.fpc, eco: form.eco } });
+      dispatch({ type: "UPDATE_CONCRETE_DEF", id: form.editId, updates: payload });
     } else {
-      dispatch({ type: "ADD_CONCRETE_DEF", def: { id: uid(), label: form.label, fpc: form.fpc, eco: form.eco } });
+      dispatch({ type: "ADD_CONCRETE_DEF", def: { id: uid(), ...payload } });
     }
     cancel();
   }
@@ -122,6 +137,28 @@ function ConcretePanel({ defs, dispatch }: { defs: ConcreteDef[]; dispatch: (a: 
           <NumInput label="f'c (MPa)" value={form.fpc} onChange={(v) => setForm({ ...form, fpc: v })} step={1} min={10} />
           <NumInput label="εco" value={form.eco} onChange={(v) => setForm({ ...form, eco: v })} step={0.0001} min={0.001} />
         </div>
+        <div className="mt-2">
+          <label className="text-[10px] text-text-muted">Modelo constitutivo</label>
+          <div className="mt-0.5 flex gap-1">
+            {(["concrete01", "concrete02"] as const).map((k) => (
+              <button key={k} onClick={() => setForm({ ...form, model_kind: k })}
+                className={`flex-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-all
+                  ${form.model_kind === k ? "border-accent bg-accent/10 text-accent" : "border-border text-text-muted hover:text-text"}`}>
+                {k === "concrete01" ? "Concrete01 (K-S-P)" : "Concrete02 (con tensión)"}
+              </button>
+            ))}
+          </div>
+        </div>
+        {form.model_kind === "concrete02" && (
+          <div className="mt-2 grid grid-cols-3 gap-2 rounded-md border border-border bg-surface-2 p-2">
+            <NumInput label="ft (MPa, opcional)" value={form.ft ?? 0}
+              onChange={(v) => setForm({ ...form, ft: v || null })} step={0.1} min={0} />
+            <NumInput label="Ets (MPa, opcional)" value={form.Ets ?? 0}
+              onChange={(v) => setForm({ ...form, Ets: v || null })} step={100} min={0} />
+            <NumInput label="λ (descarga)" value={form.lambda_c ?? 0.10}
+              onChange={(v) => setForm({ ...form, lambda_c: v })} step={0.05} min={0} />
+          </div>
+        )}
         <div className="mt-3 flex gap-2">
           <button
             onClick={save}
@@ -150,7 +187,12 @@ function SteelPanel({ defs, dispatch }: { defs: SteelDef[]; dispatch: (a: Editor
   });
 
   function startEdit(def: SteelDef) {
-    setForm({ label: def.label, fy: def.fy, Es: def.Es, b: def.b, editId: def.id });
+    setForm({
+      label: def.label, fy: def.fy, Es: def.Es, b: def.b,
+      model_kind: def.model_kind ?? "steel02",
+      fpu: def.fpu ?? null, eps_ult: def.eps_ult ?? null,
+      editId: def.id,
+    });
   }
 
   function cancel() {
@@ -159,10 +201,14 @@ function SteelPanel({ defs, dispatch }: { defs: SteelDef[]; dispatch: (a: Editor
 
   function save() {
     if (!form.label.trim()) return;
+    const payload = {
+      label: form.label, fy: form.fy, Es: form.Es, b: form.b,
+      model_kind: form.model_kind, fpu: form.fpu, eps_ult: form.eps_ult,
+    };
     if (form.editId) {
-      dispatch({ type: "UPDATE_STEEL_DEF", id: form.editId, updates: { label: form.label, fy: form.fy, Es: form.Es, b: form.b } });
+      dispatch({ type: "UPDATE_STEEL_DEF", id: form.editId, updates: payload });
     } else {
-      dispatch({ type: "ADD_STEEL_DEF", def: { id: uid(), label: form.label, fy: form.fy, Es: form.Es, b: form.b } });
+      dispatch({ type: "ADD_STEEL_DEF", def: { id: uid(), ...payload } });
     }
     cancel();
   }
@@ -221,6 +267,31 @@ function SteelPanel({ defs, dispatch }: { defs: SteelDef[]; dispatch: (a: Editor
           <NumInput label="Es (MPa)" value={form.Es} onChange={(v) => setForm({ ...form, Es: v })} step={1000} min={100000} />
           <NumInput label="b (ratio)" value={form.b} onChange={(v) => setForm({ ...form, b: v })} step={0.001} min={0} />
         </div>
+        <div className="mt-2">
+          <label className="text-[10px] text-text-muted">Modelo constitutivo</label>
+          <div className="mt-0.5 flex gap-1">
+            {(["steel02", "steel01", "prestressing"] as const).map((k) => (
+              <button key={k} onClick={() => setForm({ ...form, model_kind: k })}
+                className={`flex-1 rounded-md border px-2 py-1 text-[11px] font-medium transition-all
+                  ${form.model_kind === k ? "border-accent bg-accent/10 text-accent" : "border-border text-text-muted hover:text-text"}`}>
+                {k === "steel02" ? "Steel02 (M-P)" : k === "steel01" ? "Steel01 (bilineal)" : "Preesfuerzo"}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1 text-[10px] text-text-muted italic">
+            {form.model_kind === "steel02" && "Menegotto-Pinto con Bauschinger — recomendado para sismo/cíclico."}
+            {form.model_kind === "steel01" && "Bilineal sin Bauschinger — más rápido para monotónico puro."}
+            {form.model_kind === "prestressing" && "Steel02 con parámetros de preesfuerzo (b bajo, R0 alto)."}
+          </p>
+        </div>
+        {form.model_kind === "prestressing" && (
+          <div className="mt-2 grid grid-cols-2 gap-2 rounded-md border border-border bg-surface-2 p-2">
+            <NumInput label="fpu (MPa)" value={form.fpu ?? 1860}
+              onChange={(v) => setForm({ ...form, fpu: v || null })} step={10} min={0} />
+            <NumInput label="εsu (última)" value={form.eps_ult ?? 0.035}
+              onChange={(v) => setForm({ ...form, eps_ult: v || null })} step={0.005} min={0} />
+          </div>
+        )}
         <div className="mt-3 flex gap-2">
           <button
             onClick={save}

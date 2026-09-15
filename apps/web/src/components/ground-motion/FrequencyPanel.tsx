@@ -2,103 +2,168 @@
 
 import { useEffect, useRef } from 'react'
 import { FFTResult } from '@/lib/ground-motion-types'
+import { GM_PALETTE, baseLayout, gmPlotConfig, useGmTheme } from '@/lib/gm-plotly-theme'
+import { ChartCard, FooterNote, KpiCard, SectionHeader } from './_visual'
 
 declare const window: Window & { Plotly: any }
 
 interface Props { data: FFTResult }
 
+// Devuelve los índices de los N picos locales más altos (separados por > minGapHz).
+function findTopPeaks(freq: number[], amp: number[], n = 3, minGapHz = 0.5): number[] {
+  const peaks: { idx: number; amp: number }[] = []
+  for (let i = 2; i < amp.length - 2; i++) {
+    if (amp[i] > amp[i - 1] && amp[i] > amp[i + 1] && amp[i] > amp[i - 2] && amp[i] > amp[i + 2]) {
+      peaks.push({ idx: i, amp: amp[i] })
+    }
+  }
+  peaks.sort((a, b) => b.amp - a.amp)
+  const selected: number[] = []
+  for (const p of peaks) {
+    if (selected.every(idx => Math.abs(freq[idx] - freq[p.idx]) >= minGapHz)) {
+      selected.push(p.idx)
+      if (selected.length >= n) break
+    }
+  }
+  return selected
+}
+
 export default function FrequencyPanel({ data }: Props) {
   const fftRef = useRef<HTMLDivElement>(null)
   const psdRef = useRef<HTMLDivElement>(null)
+  const t = useGmTheme()
 
   useEffect(() => {
     if (!fftRef.current || !psdRef.current || typeof window === 'undefined' || !window.Plotly) return
 
-    const cfg = { responsive: true, displaylogo: false }
-    const baseLayout = {
-      paper_bgcolor: 'transparent', plot_bgcolor: 'transparent',
-      font: { color: '#94a3b8', size: 11 },
-      margin: { l: 60, r: 20, t: 20, b: 45 },
-      legend: { bgcolor: 'transparent' },
-    }
-
-    // Espectro de amplitud FFT
+    // ── FFT ───────────────────────────────────────────────────────────────────
     const fftFreq = data.fft.freq
     const fftAmp  = data.fft.amplitude
+    const maxAmp  = Math.max(...fftAmp)
+
+    const topIdx = findTopPeaks(fftFreq, fftAmp, 3, Math.max(0.3, data.nyquist / 40))
+    const peakColors = [GM_PALETTE.peak, '#f97316', '#eab308']
+
+    const peakTraces = topIdx.map((idx, k) => ({
+      x: [fftFreq[idx]], y: [fftAmp[idx]],
+      type: 'scatter', mode: 'markers',
+      name: `#${k + 1}: ${fftFreq[idx].toFixed(3)} Hz`,
+      marker: {
+        color: peakColors[k], size: 11, symbol: 'diamond',
+        line: { color: t.hoverBg, width: 2 },
+      },
+      hovertemplate: `<b>Pico #${k + 1}</b><br>f = %{x:.3f} Hz<br>T = ${(1 / fftFreq[idx]).toFixed(3)} s<br>A = %{y:.4e}<extra></extra>`,
+    }))
+
+    const peakShapes = topIdx.map((idx, k) => ({
+      type: 'line', xref: 'x', yref: 'y',
+      x0: fftFreq[idx], x1: fftFreq[idx], y0: 0, y1: fftAmp[idx],
+      line: { color: peakColors[k], width: 1, dash: 'dash' },
+      opacity: 0.55,
+    }))
 
     window.Plotly.newPlot(fftRef.current, [
       {
         x: fftFreq, y: fftAmp,
         type: 'scatter', mode: 'lines', fill: 'tozeroy',
         name: 'Amplitud',
-        line: { color: '#60a5fa', width: 1.5 },
-        fillcolor: 'rgba(96,165,250,0.1)',
+        line: { color: GM_PALETTE.fft, width: 1.6, shape: 'spline' },
+        fillcolor: GM_PALETTE.fftFill,
+        hovertemplate: 'f = %{x:.3f} Hz<br>A = %{y:.4e}<extra></extra>',
+        showlegend: false,
       },
-      {
-        x: [data.fft.dominant_freq_hz, data.fft.dominant_freq_hz],
-        y: [0, Math.max(...fftAmp)],
-        type: 'scatter', mode: 'lines',
-        name: `f_dom = ${data.fft.dominant_freq_hz.toFixed(3)} Hz`,
-        line: { color: '#f59e0b', width: 1.5, dash: 'dash' },
+      ...peakTraces,
+    ], baseLayout(t, {
+      margin: { l: 68, r: 28, t: 12, b: 46 },
+      xaxis: {
+        gridcolor: t.grid, zerolinecolor: t.zeroLine, linecolor: t.gridStrong,
+        showgrid: true, zeroline: false, ticks: 'outside', ticklen: 4, tickcolor: t.gridStrong,
+        tickfont: { size: 11, color: t.textMuted },
+        title: { text: 'Frecuencia (Hz)', font: { size: 12, color: t.text } },
+        range: [0, data.nyquist],
       },
-    ], {
-      ...baseLayout,
-      xaxis: { title: 'Frecuencia (Hz)', gridcolor: '#1e293b', showgrid: true, zeroline: false },
-      yaxis: { title: 'Amplitud (m/s²)', gridcolor: '#1e293b', showgrid: true, zeroline: false },
-    }, cfg)
+      yaxis: {
+        gridcolor: t.grid, zerolinecolor: t.zeroLine, linecolor: t.gridStrong,
+        showgrid: true, zeroline: false, ticks: 'outside', ticklen: 4, tickcolor: t.gridStrong,
+        tickfont: { size: 11, color: t.textMuted },
+        title: { text: 'Amplitud (m/s²)', font: { size: 12, color: t.text } },
+        range: [0, maxAmp * 1.1],
+      },
+      legend: {
+        bgcolor: 'transparent',
+        x: 0.98, xanchor: 'right', y: 0.98,
+        font: { size: 11, color: t.text },
+      },
+      shapes: peakShapes,
+    }), gmPlotConfig)
 
-    // PSD (Welch)
+    // ── PSD Welch ─────────────────────────────────────────────────────────────
     window.Plotly.newPlot(psdRef.current, [
       {
         x: data.psd.freq, y: data.psd.psd,
         type: 'scatter', mode: 'lines', fill: 'tozeroy',
         name: 'PSD (Welch)',
-        line: { color: '#a78bfa', width: 1.5 },
-        fillcolor: 'rgba(167,139,250,0.1)',
+        line: { color: GM_PALETTE.psd, width: 1.6, shape: 'spline' },
+        fillcolor: 'rgba(236,72,153,0.10)',
+        hovertemplate: 'f = %{x:.3f} Hz<br>PSD = %{y:.4e}<extra></extra>',
+        showlegend: false,
       },
-    ], {
-      ...baseLayout,
-      xaxis: { title: 'Frecuencia (Hz)', gridcolor: '#1e293b', showgrid: true, zeroline: false },
-      yaxis: { title: 'PSD (m²/s⁴ / Hz)', gridcolor: '#1e293b', showgrid: true, zeroline: false, type: 'log' },
-    }, cfg)
-  }, [data])
+    ], baseLayout(t, {
+      margin: { l: 78, r: 28, t: 12, b: 46 },
+      xaxis: {
+        gridcolor: t.grid, zerolinecolor: t.zeroLine, linecolor: t.gridStrong,
+        showgrid: true, zeroline: false, ticks: 'outside', ticklen: 4, tickcolor: t.gridStrong,
+        tickfont: { size: 11, color: t.textMuted },
+        title: { text: 'Frecuencia (Hz)', font: { size: 12, color: t.text } },
+        range: [0, data.nyquist],
+      },
+      yaxis: {
+        gridcolor: t.grid, zerolinecolor: t.zeroLine, linecolor: t.gridStrong,
+        showgrid: true, zeroline: false, ticks: 'outside', ticklen: 4, tickcolor: t.gridStrong,
+        tickfont: { size: 11, color: t.textMuted },
+        title: { text: 'PSD (m²/s⁴ / Hz)', font: { size: 12, color: t.text } },
+        type: 'log',
+      },
+    }), gmPlotConfig)
+  }, [data, t.isDark])
+
+  const T_dom = data.fft.dominant_period_s === Infinity ? '∞' : data.fft.dominant_period_s.toFixed(3)
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* Resumen */}
+    <div className="flex flex-col gap-6">
+      <SectionHeader
+        title="Análisis en Frecuencia"
+        subtitle="Espectro de amplitud de Fourier (FFT unilateral) y Densidad Espectral de Potencia con el método de Welch."
+        chip="FFT · Welch"
+      />
+
+      {/* KPIs */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Kpi label="Frec. dominante" value={data.fft.dominant_freq_hz.toFixed(3)} unit="Hz" />
-        <Kpi label="Período dominante" value={data.fft.dominant_period_s === Infinity ? '∞' : data.fft.dominant_period_s.toFixed(3)} unit="s" />
-        <Kpi label="Frec. de Nyquist" value={data.nyquist.toFixed(1)} unit="Hz" />
-        <Kpi label="Muestras" value={data.n_samples.toLocaleString()} unit="pts" />
+        <KpiCard label="Frec. dominante" value={data.fft.dominant_freq_hz.toFixed(3)} unit="Hz"
+                 sub={`T = ${T_dom} s`} accent={GM_PALETTE.fft} />
+        <KpiCard label="Período dominante" value={T_dom} unit="s"
+                 sub="del pico FFT" accent="#a855f7" />
+        <KpiCard label="Frec. de Nyquist" value={data.nyquist.toFixed(1)} unit="Hz"
+                 sub="fs / 2" accent={GM_PALETTE.psd} />
+        <KpiCard label="Muestras" value={data.n_samples.toLocaleString()} unit="pts"
+                 sub={`Δf = ${(1 / (data.n_samples * data.dt)).toFixed(4)} Hz`} accent="#0891b2" />
       </div>
 
-      {/* Gráfica FFT */}
-      <div className="bg-[var(--surface-alt)] rounded-xl p-1">
-        <p className="text-xs font-medium text-[var(--muted)] px-3 pt-2">Espectro de Amplitud de Fourier</p>
-        <div ref={fftRef} style={{ height: 240 }} />
-      </div>
+      <ChartCard title="Espectro de Amplitud de Fourier" unitBadge="FFT" accent={GM_PALETTE.fft}>
+        <div ref={fftRef} style={{ height: 300 }} />
+      </ChartCard>
 
-      {/* Gráfica PSD */}
-      <div className="bg-[var(--surface-alt)] rounded-xl p-1">
-        <p className="text-xs font-medium text-[var(--muted)] px-3 pt-2">Densidad Espectral de Potencia — Welch</p>
-        <div ref={psdRef} style={{ height: 220 }} />
-      </div>
+      <ChartCard title="Densidad Espectral de Potencia (Welch)" unitBadge="PSD · log" accent={GM_PALETTE.psd}>
+        <div ref={psdRef} style={{ height: 280 }} />
+      </ChartCard>
 
-      <p className="text-xs text-[var(--muted)]">
-        FFT: espectro de amplitud unilateral (normalizado por N). PSD: método de Welch con segmentos solapados.
-        Resolución frecuencial Δf = 1/duración. Frecuencia máxima = Nyquist = fs/2 = {data.nyquist.toFixed(1)} Hz.
-      </p>
-    </div>
-  )
-}
-
-function Kpi({ label, value, unit }: { label: string; value: string; unit: string }) {
-  return (
-    <div className="bg-[var(--surface-alt)] rounded-xl px-4 py-3">
-      <div className="text-xs text-[var(--muted)]">{label}</div>
-      <div className="text-xl font-bold font-mono mt-1">{value}</div>
-      <div className="text-xs text-[var(--muted)]">{unit}</div>
+      <FooterNote>
+        <strong>FFT:</strong> espectro unilateral normalizado por N.&nbsp;
+        <strong>PSD:</strong> método de Welch con segmentos solapados.&nbsp;
+        Resolución frecuencial Δf = 1/duración.&nbsp;
+        Frecuencia máxima = Nyquist = fs/2 = <strong>{data.nyquist.toFixed(1)} Hz</strong>.&nbsp;
+        Marcadores rojo/naranja/amarillo = 3 armónicos dominantes.
+      </FooterNote>
     </div>
   )
 }

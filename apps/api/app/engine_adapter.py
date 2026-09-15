@@ -34,6 +34,7 @@ def split_payload(payload: SectionCreate) -> tuple[dict, dict, dict]:
         "bar_id": payload.bar_id, "cover_to_bar_centroid": payload.cover_to_bar_centroid,
         "n_bars_y": payload.n_bars_y, "n_bars_z": payload.n_bars_z, "n_bars": payload.n_bars,
         "bars": payload.bars,
+        "bar_sizes": payload.bar_sizes,
     }
     return geometry, materials, reinforcement
 

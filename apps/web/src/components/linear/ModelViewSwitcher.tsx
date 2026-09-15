@@ -8,7 +8,7 @@
  * componente montar.
  */
 import { useState } from "react";
-import type { ModelGeometry } from "@/lib/structural-types";
+import type { ModelGeometry, SectionData } from "@/lib/structural-types";
 import { LinearModelViewer3D } from "./LinearModelViewer3D";
 import Building2DPlanView     from "./Building2DPlanView";
 
@@ -16,10 +16,16 @@ type ViewMode = "3d" | "2d";
 
 interface Props {
   geometry: ModelGeometry;
+  /** Secciones del canonical model — usadas por la vista 2D para dibujar
+   *  columnas y vigas con dimensiones reales (h×b). Opcional. */
+  sections?: Record<string, SectionData>;
   initial?: ViewMode;
+  /** Callback opcional que la página puede usar para lazy-cargar sections
+   *  cuando el usuario cambia a Vista en Planta y todavía no están listas. */
+  onSwitchTo2D?: () => void;
 }
 
-export default function ModelViewSwitcher({ geometry, initial = "3d" }: Props) {
+export default function ModelViewSwitcher({ geometry, sections, initial = "3d", onSwitchTo2D }: Props) {
   const [mode, setMode] = useState<ViewMode>(initial);
 
   return (
@@ -37,7 +43,7 @@ export default function ModelViewSwitcher({ geometry, initial = "3d" }: Props) {
           Vista 3D
         </button>
         <button
-          onClick={() => setMode("2d")}
+          onClick={() => { setMode("2d"); onSwitchTo2D?.(); }}
           className={[
             "px-3 py-1.5 rounded-md text-xs font-medium transition-colors",
             mode === "2d"
@@ -52,7 +58,7 @@ export default function ModelViewSwitcher({ geometry, initial = "3d" }: Props) {
       {mode === "3d" ? (
         <LinearModelViewer3D geometry={geometry} />
       ) : (
-        <Building2DPlanView geometry={geometry} />
+        <Building2DPlanView geometry={geometry} sections={sections} />
       )}
     </div>
   );

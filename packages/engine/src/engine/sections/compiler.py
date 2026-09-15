@@ -90,6 +90,15 @@ class CompiledFiberSection:
     # Reportes Mander por región (para UI)
     mander_reports: dict[str, ConfinedConcreteReport | None] = field(default_factory=dict)
 
+    # ── Selección de modelo constitutivo (para _define_materials) ──────────
+    # concrete_model_kind aplica a TODOS los concretos (uniforme por sección);
+    # los params extra (ft, Ets, lambda_c) se toman del primer ConcreteDef.
+    concrete_model_kind: str = "concrete01"
+    concrete_ft:         float | None = None
+    concrete_Ets:        float | None = None
+    concrete_lambda:     float = 0.10
+    steel_model_kind:    str = "steel02"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Función principal
@@ -181,11 +190,24 @@ def compile(doc: SectionDocument) -> CompiledFiberSection:
     # Hints de simetría
     is_isotropic, is_doubly_sym = _detect_symmetry(doc)
 
+    # Selección del modelo constitutivo (aplica uniformemente por sección)
+    first_cdef = doc.default_concrete()
+    concrete_kind = getattr(first_cdef, "model_kind", "concrete01") if first_cdef else "concrete01"
+    concrete_ft = getattr(first_cdef, "ft", None) if first_cdef else None
+    concrete_Ets = getattr(first_cdef, "Ets", None) if first_cdef else None
+    concrete_lambda = getattr(first_cdef, "lambda_c", 0.10) if first_cdef else 0.10
+    steel_kind = getattr(steel_def, "model_kind", "steel02")
+
     return CompiledFiberSection(
         concrete_materials=concrete_materials,
         steel_params=steel_params,
         steel_tag=steel_tag,
         steel_wrapped_tag=steel_wrapped_tag,
+        concrete_model_kind=concrete_kind,
+        concrete_ft=concrete_ft,
+        concrete_Ets=concrete_Ets,
+        concrete_lambda=concrete_lambda,
+        steel_model_kind=steel_kind,
         rect_patches=rect_patches,
         circ_patches=circ_patches,
         point_fibers=point_fibers,
@@ -599,6 +621,17 @@ def document_from_legacy(
 
     # Barras de acero
     bar_id = reinforcement.get("bar_id", "#8")
+    bar_sizes_list = reinforcement.get("bar_sizes")   # lista opcional paralela a bars
+
+    def _size_for(idx: int) -> str:
+        """Devuelve el tamaño de la barra idx: usa bar_sizes[idx] si existe y es válido,
+        sino cae al bar_id global. Silenciosamente ignora índices fuera de rango."""
+        if bar_sizes_list and idx < len(bar_sizes_list):
+            s = bar_sizes_list[idx]
+            if isinstance(s, str) and s in BAR_AREAS_MM2:
+                return s
+        return bar_id
+
     bars: list[ReinforcementBar] = []
 
     if shape_type in ("rectangular", "square"):
@@ -611,13 +644,13 @@ def document_from_legacy(
         # Cara superior e inferior
         for i in range(n_y):
             z = -z_out + i * (2 * z_out) / (n_y - 1) if n_y > 1 else 0.0
-            bars.append(ReinforcementBar(y=y_out, z=z, bar_size=bar_id, steel_id="s0"))
-            bars.append(ReinforcementBar(y=-y_out, z=z, bar_size=bar_id, steel_id="s0"))
+            bars.append(ReinforcementBar(y=y_out, z=z, bar_size=_size_for(len(bars)), steel_id="s0"))
+            bars.append(ReinforcementBar(y=-y_out, z=z, bar_size=_size_for(len(bars)), steel_id="s0"))
         # Caras laterales (sin contar esquinas)
         for i in range(1, n_z - 1):
             y = -y_out + i * (2 * y_out) / (n_z - 1)
-            bars.append(ReinforcementBar(y=y, z=z_out, bar_size=bar_id, steel_id="s0"))
-            bars.append(ReinforcementBar(y=y, z=-z_out, bar_size=bar_id, steel_id="s0"))
+            bars.append(ReinforcementBar(y=y, z=z_out, bar_size=_size_for(len(bars)), steel_id="s0"))
+            bars.append(ReinforcementBar(y=y, z=-z_out, bar_size=_size_for(len(bars)), steel_id="s0"))
 
     elif shape_type == "circular":
         import math
@@ -629,13 +662,13 @@ def document_from_legacy(
             theta = 2 * math.pi * i / n
             bars.append(ReinforcementBar(
                 y=r * math.cos(theta), z=r * math.sin(theta),
-                bar_size=bar_id, steel_id="s0",
+                bar_size=_size_for(i), steel_id="s0",
             ))
 
     elif shape_type == "special":
         explicit_bars = reinforcement.get("bars") or []
-        for y, z in explicit_bars:
-            bars.append(ReinforcementBar(y=y, z=z, bar_size=bar_id, steel_id="s0"))
+        for i, (y, z) in enumerate(explicit_bars):
+            bars.append(ReinforcementBar(y=y, z=z, bar_size=_size_for(i), steel_id="s0"))
 
     return SectionDocument(
         concrete_defs=[cdef],

@@ -161,6 +161,10 @@ app.include_router(wall_design_router.router)
 # ── Ground Motion Analysis — Análisis de Acelerogramas ───────────────────────
 app.include_router(ground_motion_router.router)
 
+# ── Fase 0 — Toma de datos en campo y triaje sísmico post-sismo ──────────────
+from app.routers import field_assessment as field_assessment_router
+app.include_router(field_assessment_router.router)
+
 
 @app.get("/api/v1/health")
 def health() -> dict:

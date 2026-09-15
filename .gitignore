@@ -40,3 +40,7 @@ apps/api/alembic/versions/__pycache__/
 /test_*.py
 gm01_test.txt
 apps/api/data/
+
+# Referencias externas (documentos FEMA, ATC, papers)
+PEER/
+*.pptx

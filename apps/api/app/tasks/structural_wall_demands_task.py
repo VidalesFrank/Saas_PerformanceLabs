@@ -147,6 +147,8 @@ def run_wall_demands(
         with open(res_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
 
+        from app.tasks.structural_helpers import compute_input_hash
+
         summary = {
             "pier_count":    payload["pier_count"],
             "story_count":   payload["story_count"],
@@ -155,6 +157,9 @@ def run_wall_demands(
             "T_s":           result["fhe_params"].get("T_s"),
             "source":        result["fhe_params"].get("source", "FHE"),
             "demands_count": len(result["pier_demands"]),
+            "input_hash":    compute_input_hash(
+                canonical_path, project.parameters_json, extra_params, "wall_demands",
+            ),
         }
 
         job.status        = StructuralJobStatus.success

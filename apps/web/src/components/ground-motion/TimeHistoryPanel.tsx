@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { TimeseriesData } from '@/lib/ground-motion-types'
+import { GM_PALETTE, baseLayout, gmPlotConfig, useGmTheme } from '@/lib/gm-plotly-theme'
+import { ChartCard, FooterNote, KpiCard, SectionHeader } from './_visual'
 
 declare const window: Window & { Plotly: any }
 
@@ -15,13 +17,11 @@ const G = 9.80665
 function toDisplayUnit(vals: number[], unit: string): number[] {
   if (unit === 'g')    return vals.map(v => v / G)
   if (unit === 'cm/s²' || unit === 'Gal') return vals.map(v => v * 100)
-  return vals  // m/s²
+  return vals
 }
 
 function unitLabel(unit: string): string {
-  const map: Record<string, string> = {
-    'g': 'g', 'm/s²': 'm/s²', 'cm/s²': 'cm/s²', 'Gal': 'Gal'
-  }
+  const map: Record<string, string> = { g: 'g', 'm/s²': 'm/s²', 'cm/s²': 'cm/s²', Gal: 'Gal' }
   return map[unit] || 'm/s²'
 }
 
@@ -30,144 +30,179 @@ export default function TimeHistoryPanel({ data, accUnit }: Props) {
   const velRef  = useRef<HTMLDivElement>(null)
   const dispRef = useRef<HTMLDivElement>(null)
   const [displayUnit, setDisplayUnit] = useState(accUnit || 'g')
+  const t = useGmTheme()
 
   useEffect(() => {
     if (!accRef.current || !velRef.current || !dispRef.current) return
     if (typeof window === 'undefined' || !window.Plotly) return
 
-    const t    = data.t
-    const a_ms2 = data.a_ms2
-    const a_disp = toDisplayUnit(a_ms2, displayUnit)
-    const v_cms  = data.v_ms.map(v => v * 100)   // m/s → cm/s
-    const d_cm   = data.d_m.map(v => v * 100)    // m → cm
+    const time   = data.t
+    const a_disp = toDisplayUnit(data.a_ms2, displayUnit)
+    const v_cms  = data.v_ms.map(v => v * 100)
+    const d_cm   = data.d_m.map(v => v * 100)
+    const uAcc   = unitLabel(displayUnit)
 
-    const pga_disp = Math.max(...a_disp.map(Math.abs))
-    const pgv_cms  = data.pgv_ms * 100
-    const pgd_cm   = data.pgd_m * 100
+    const t_pgv = findTimeOfPeak(v_cms, time)
+    const t_pgd = findTimeOfPeak(d_cm, time)
+    const pgv_signed = v_cms[time.indexOf(t_pgv)] ?? Math.sign(Math.max(...v_cms.map(Math.abs))) * Math.max(...v_cms.map(Math.abs))
+    const pgd_signed = d_cm[time.indexOf(t_pgd)] ?? Math.sign(Math.max(...d_cm.map(Math.abs))) * Math.max(...d_cm.map(Math.abs))
 
-    const layout_base = {
-      paper_bgcolor: 'transparent',
-      plot_bgcolor: 'transparent',
-      font: { color: '#94a3b8', size: 11 },
-      margin: { l: 60, r: 20, t: 20, b: 40 },
-      xaxis: { gridcolor: '#1e293b', showgrid: true, title: 'Tiempo (s)', zeroline: false },
-      showlegend: true,
-      legend: { x: 1, xanchor: 'right', y: 1, bgcolor: 'transparent', font: { size: 10 } },
-    }
-
-    const config = { responsive: true, displaylogo: false }
-
-    // Aceleración
     const a_pos = Math.max(...a_disp)
     const a_neg = Math.min(...a_disp)
+    const pga_signed = Math.abs(a_pos) >= Math.abs(a_neg) ? a_pos : a_neg
 
-    window.Plotly.newPlot(accRef.current, [
-      {
-        x: t, y: a_disp, type: 'scatter', mode: 'lines',
-        name: `Aceleración (${unitLabel(displayUnit)})`,
-        line: { color: '#60a5fa', width: 1 },
-      },
-      {
-        x: [data.t_pga], y: [a_pos > Math.abs(a_neg) ? a_pos : a_neg],
-        type: 'scatter', mode: 'markers',
-        name: `PGA = ${pga_disp.toFixed(4)} ${unitLabel(displayUnit)}`,
-        marker: { color: '#f59e0b', size: 8, symbol: 'diamond' },
-      },
-    ], {
-      ...layout_base,
-      yaxis: { gridcolor: '#1e293b', showgrid: true, title: unitLabel(displayUnit), zeroline: true, zerolinecolor: '#334155' },
-      annotations: [
-        { x: 0.01, y: 0.95, xref: 'paper', yref: 'paper', text: `PGA+ = +${a_pos.toFixed(4)}  PGA− = ${a_neg.toFixed(4)} ${unitLabel(displayUnit)}`, showarrow: false, font: { size: 10, color: '#f59e0b' }, xanchor: 'left' }
-      ]
-    }, config)
+    plotChannel(
+      accRef.current, time, a_disp, uAcc, data.t_pga, pga_signed,
+      GM_PALETTE.acceleration, GM_PALETTE.accelerationFill, 'a', t,
+    )
+    plotChannel(
+      velRef.current, time, v_cms, 'cm/s', t_pgv, pgv_signed,
+      GM_PALETTE.velocity, GM_PALETTE.velocityFill, 'v', t,
+    )
+    plotChannel(
+      dispRef.current, time, d_cm, 'cm', t_pgd, pgd_signed,
+      GM_PALETTE.displacement, GM_PALETTE.displacementFill, 'd', t,
+    )
+  }, [data, displayUnit, t.isDark])
 
-    // Velocidad
-    window.Plotly.newPlot(velRef.current, [
-      {
-        x: t, y: v_cms, type: 'scatter', mode: 'lines',
-        name: 'Velocidad (cm/s)',
-        line: { color: '#34d399', width: 1 },
-      },
-    ], {
-      ...layout_base,
-      yaxis: { gridcolor: '#1e293b', showgrid: true, title: 'cm/s', zeroline: true, zerolinecolor: '#334155' },
-      annotations: [
-        { x: 0.01, y: 0.95, xref: 'paper', yref: 'paper', text: `PGV = ${pgv_cms.toFixed(3)} cm/s`, showarrow: false, font: { size: 10, color: '#34d399' }, xanchor: 'left' }
-      ]
-    }, config)
-
-    // Desplazamiento
-    window.Plotly.newPlot(dispRef.current, [
-      {
-        x: t, y: d_cm, type: 'scatter', mode: 'lines',
-        name: 'Desplazamiento (cm)',
-        line: { color: '#f472b6', width: 1 },
-      },
-    ], {
-      ...layout_base,
-      yaxis: { gridcolor: '#1e293b', showgrid: true, title: 'cm', zeroline: true, zerolinecolor: '#334155' },
-      annotations: [
-        { x: 0.01, y: 0.95, xref: 'paper', yref: 'paper', text: `PGD = ${pgd_cm.toFixed(3)} cm`, showarrow: false, font: { size: 10, color: '#f472b6' }, xanchor: 'left' }
-      ]
-    }, config)
-  }, [data, displayUnit])
+  const pga_disp = toDisplayUnit([data.pga_ms2], displayUnit)[0]
+  const uAcc     = unitLabel(displayUnit)
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* KPIs principales */}
+    <div className="flex flex-col gap-6">
+      {/* Header */}
+      <SectionHeader
+        title="Historia de Tiempo"
+        subtitle="Aceleración, velocidad y desplazamiento del suelo. Integración trapezoidal con corrección de tendencia."
+        chip="a · v · d"
+      />
+
+      {/* KPI cards premium */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <Kpi label="PGA" value={`${toDisplayUnit([data.pga_ms2], displayUnit)[0].toFixed(4)}`} unit={unitLabel(displayUnit)} color="blue" />
-        <Kpi label="PGV" value={(data.pgv_ms * 100).toFixed(3)} unit="cm/s" color="emerald" />
-        <Kpi label="PGD" value={(data.pgd_m * 100).toFixed(3)} unit="cm" color="pink" />
-        <Kpi label="Duración" value={data.duration.toFixed(2)} unit="s" color="amber" />
+        <KpiCard label="PGA" value={pga_disp.toFixed(4)} unit={uAcc}
+          sub={`t = ${data.t_pga.toFixed(3)} s`} accent={GM_PALETTE.acceleration} />
+        <KpiCard label="PGV" value={(data.pgv_ms * 100).toFixed(3)} unit="cm/s"
+          sub="pico absoluto" accent={GM_PALETTE.velocity} />
+        <KpiCard label="PGD" value={(data.pgd_m * 100).toFixed(3)} unit="cm"
+          sub="pico absoluto" accent={GM_PALETTE.displacement} />
+        <KpiCard label="Duración" value={data.duration.toFixed(2)} unit="s"
+          sub={`${data.a_ms2.length.toLocaleString()} pts`} accent="#0891b2" />
       </div>
 
-      {/* Selector de unidad */}
-      <div className="flex items-center gap-3">
-        <span className="text-xs text-[var(--muted)]">Unidad:</span>
-        {['g', 'm/s²', 'cm/s²'].map(u => (
-          <button
-            key={u}
-            onClick={() => setDisplayUnit(u)}
-            className={`px-3 py-1 rounded-lg text-xs font-mono transition-colors
-              ${displayUnit === u ? 'bg-[var(--accent)] text-white' : 'bg-[var(--surface-alt)] text-[var(--muted)] hover:text-[var(--foreground)]'}`}
-          >
-            {u}
-          </button>
-        ))}
+      {/* Selector de unidad — pill toolbar */}
+      <div className="flex items-center gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">
+          Unidad de aceleración
+        </span>
+        <div className="flex gap-1 bg-[var(--surface-alt)] rounded-lg p-1">
+          {['g', 'm/s²', 'cm/s²'].map(u => (
+            <button
+              key={u}
+              onClick={() => setDisplayUnit(u)}
+              className={`px-3 py-1 rounded-md text-xs font-mono font-semibold transition-all
+                ${displayUnit === u
+                  ? 'bg-[var(--surface)] text-[var(--foreground)] shadow-sm ring-1 ring-[var(--border)]'
+                  : 'text-[var(--muted)] hover:text-[var(--foreground)]'}`}
+            >
+              {u}
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* Gráficas */}
-      <div className="bg-[var(--surface-alt)] rounded-xl p-1">
-        <p className="text-xs font-medium text-[var(--muted)] px-3 pt-2">Aceleración</p>
-        <div ref={accRef} style={{ height: 180 }} />
-      </div>
-      <div className="bg-[var(--surface-alt)] rounded-xl p-1">
-        <p className="text-xs font-medium text-[var(--muted)] px-3 pt-2">Velocidad</p>
-        <div ref={velRef} style={{ height: 180 }} />
-      </div>
-      <div className="bg-[var(--surface-alt)] rounded-xl p-1">
-        <p className="text-xs font-medium text-[var(--muted)] px-3 pt-2">Desplazamiento</p>
-        <div ref={dispRef} style={{ height: 180 }} />
-      </div>
+      {/* Gráficas premium */}
+      <ChartCard title="Aceleración" unitBadge={uAcc} accent={GM_PALETTE.acceleration}>
+        <div ref={accRef} style={{ height: 240 }} />
+      </ChartCard>
+      <ChartCard title="Velocidad" unitBadge="cm/s" accent={GM_PALETTE.velocity}>
+        <div ref={velRef} style={{ height: 240 }} />
+      </ChartCard>
+      <ChartCard title="Desplazamiento" unitBadge="cm" accent={GM_PALETTE.displacement}>
+        <div ref={dispRef} style={{ height: 240 }} />
+      </ChartCard>
 
-      {/* Nota */}
-      <p className="text-xs text-[var(--muted)]">
+      <FooterNote>
         Velocidad y desplazamiento obtenidos por integración trapezoidal numérica con corrección de tendencia lineal.
-      </p>
+      </FooterNote>
     </div>
   )
 }
 
-function Kpi({ label, value, unit, color }: { label: string; value: string; unit: string; color: string }) {
-  const colors: Record<string, string> = {
-    blue: 'text-blue-400', emerald: 'text-emerald-400', pink: 'text-pink-400', amber: 'text-amber-400'
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers de trazado
+// ─────────────────────────────────────────────────────────────────────────────
+
+function findTimeOfPeak(y: number[], t: number[]): number {
+  let idx = 0, best = 0
+  for (let i = 0; i < y.length; i++) {
+    const v = Math.abs(y[i])
+    if (v > best) { best = v; idx = i }
   }
-  return (
-    <div className="bg-[var(--surface-alt)] rounded-xl px-4 py-3">
-      <div className="text-xs text-[var(--muted)]">{label}</div>
-      <div className={`text-xl font-bold font-mono mt-1 ${colors[color] || 'text-[var(--foreground)]'}`}>{value}</div>
-      <div className="text-xs text-[var(--muted)]">{unit}</div>
-    </div>
-  )
+  return t[idx] ?? 0
 }
+
+function plotChannel(
+  el: HTMLDivElement, x: number[], y: number[], unit: string,
+  tPeak: number, yPeak: number, color: string, fillColor: string,
+  symbol: 'a' | 'v' | 'd', t: ReturnType<typeof useGmTheme>,
+) {
+  const yMax = Math.max(...y)
+  const yMin = Math.min(...y)
+  const range = Math.max(Math.abs(yMax), Math.abs(yMin))
+
+  window.Plotly.newPlot(el, [
+    {
+      x, y, type: 'scatter', mode: 'lines',
+      name: 'Serie',
+      line: { color, width: 1.3, shape: 'linear' },
+      fill: 'tozeroy',
+      fillcolor: fillColor,
+      hovertemplate: `t = %{x:.3f} s<br>${symbol} = %{y:.4f} ${unit}<extra></extra>`,
+      showlegend: false,
+    },
+    {
+      x: [tPeak], y: [yPeak],
+      type: 'scatter', mode: 'markers',
+      name: 'Pico',
+      marker: { color: GM_PALETTE.peak, size: 11, symbol: 'diamond',
+                line: { color: t.hoverBg, width: 2 } },
+      hovertemplate: `Pico<br>t = %{x:.3f} s<br>${symbol} = %{y:.4f} ${unit}<extra></extra>`,
+      showlegend: false,
+    },
+  ], baseLayout(t, {
+    margin: { l: 68, r: 28, t: 12, b: 46 },
+    yaxis: {
+      gridcolor: t.grid, zerolinecolor: t.zeroLine, linecolor: t.gridStrong,
+      showgrid: true, zeroline: true, ticks: 'outside', ticklen: 4, tickcolor: t.gridStrong,
+      tickfont: { size: 11, color: t.textMuted },
+      title: { text: unit, font: { size: 12, color: t.text } },
+      range: [-range * 1.15, range * 1.15],
+    },
+    xaxis: {
+      gridcolor: t.grid, zerolinecolor: t.zeroLine, linecolor: t.gridStrong,
+      showgrid: true, zeroline: false, ticks: 'outside', ticklen: 4, tickcolor: t.gridStrong,
+      tickfont: { size: 11, color: t.textMuted },
+      title: { text: 'Tiempo (s)', font: { size: 12, color: t.text } },
+    },
+    shapes: [
+      // Línea vertical discontinua en el pico
+      {
+        type: 'line', xref: 'x', yref: 'y',
+        x0: tPeak, x1: tPeak, y0: -range * 1.15, y1: range * 1.15,
+        line: { color: GM_PALETTE.peak, width: 1, dash: 'dash' },
+        opacity: 0.55,
+      },
+    ],
+    annotations: [
+      {
+        x: tPeak, y: yPeak, xref: 'x', yref: 'y',
+        text: `<b>${symbol.toUpperCase()} pico</b>  ${yPeak >= 0 ? '+' : ''}${yPeak.toFixed(4)} ${unit}`,
+        showarrow: true, arrowhead: 0, arrowsize: 0.8, arrowwidth: 1,
+        arrowcolor: GM_PALETTE.peak, ax: 40, ay: yPeak >= 0 ? -30 : 30,
+        bgcolor: t.hoverBg, bordercolor: GM_PALETTE.peak, borderwidth: 1, borderpad: 4,
+        font: { size: 10.5, color: t.text, family: 'JetBrains Mono, ui-monospace, monospace' },
+      },
+    ],
+  }), gmPlotConfig)
+}
+

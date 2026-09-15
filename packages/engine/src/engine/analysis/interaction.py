@@ -29,13 +29,48 @@ class InteractionPoint:
 
 
 def _define_materials(compiled: CompiledFiberSection) -> None:
-    """Registra todos los materiales de la sección compilada en OpenSees."""
+    """Registra todos los materiales de la sección compilada en OpenSees.
+
+    Despacha entre modelos según compiled.concrete_model_kind y steel_model_kind:
+      - concrete01  → Kent-Scott-Park (sin tensión)
+      - concrete02  → Yassin/Mander con tension softening
+      - steel01     → bilineal (sin Bauschinger)
+      - steel02     → Menegotto-Pinto (con Bauschinger)
+      - prestressing→ Steel02 con parámetros de preesfuerzo (fpu, b bajo)
+    """
+    # ── Concreto ──
+    kind_c = compiled.concrete_model_kind
     for tag, params in compiled.concrete_materials:
-        ops.uniaxialMaterial("Concrete01", tag,
-                             -params.fpc, -params.epsc0, -params.fpcu, -params.epsU)
+        if kind_c == "concrete02":
+            # ft por defecto: 0.62·√f'c (NSR-10 C.9.5.2.3, ACI 318 24.2.3.5)
+            ft = compiled.concrete_ft if compiled.concrete_ft is not None \
+                 else 0.62 * (params.fpc ** 0.5)
+            # Ec inicial aproximado: 4700·√f'c (NSR-10 C.8.5.1, MPa)
+            Ec = 4700.0 * (params.fpc ** 0.5)
+            Ets = compiled.concrete_Ets if compiled.concrete_Ets is not None else Ec / 10.0
+            lam = compiled.concrete_lambda
+            ops.uniaxialMaterial("Concrete02", tag,
+                                 -params.fpc, -params.epsc0, -params.fpcu, -params.epsU,
+                                 lam, ft, Ets)
+        else:
+            ops.uniaxialMaterial("Concrete01", tag,
+                                 -params.fpc, -params.epsc0, -params.fpcu, -params.epsU)
+
+    # ── Acero ──
     s = compiled.steel_params
-    ops.uniaxialMaterial("Steel02", compiled.steel_tag,
-                         s.fy, s.E0, s.b, s.R0, s.cR1, s.cR2)
+    kind_s = compiled.steel_model_kind
+    if kind_s == "steel01":
+        ops.uniaxialMaterial("Steel01", compiled.steel_tag, s.fy, s.E0, s.b)
+    elif kind_s == "prestressing":
+        # Modelado como Steel02 con endurecimiento típico de preesfuerzo
+        # (b ~ 0.005, R0 típico 15, cR más suave)
+        ops.uniaxialMaterial("Steel02", compiled.steel_tag,
+                             s.fy, s.E0, max(s.b, 0.001), 15.0, 0.925, 0.15)
+    else:   # steel02 default
+        ops.uniaxialMaterial("Steel02", compiled.steel_tag,
+                             s.fy, s.E0, s.b, s.R0, s.cR1, s.cR2)
+
+    # Wrapper MinMax común: falla por rotura del acero
     ops.uniaxialMaterial("MinMax", compiled.steel_wrapped_tag,
                          compiled.steel_tag,
                          "-min", -s.eps_rupture, "-max", s.eps_rupture)

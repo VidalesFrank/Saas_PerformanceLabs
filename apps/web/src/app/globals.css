@@ -15,6 +15,14 @@
   --color-danger: #c81e3a;
 
   --color-canvas-bg: #f0f2f6;
+
+  --accent: var(--color-accent);
+  --accent-strong: var(--color-accent-strong);
+  --foreground: var(--color-text);
+  --muted: var(--color-text-muted);
+  --border: var(--color-border);
+  --surface: var(--color-surface);
+  --surface-alt: var(--color-surface-2);
 }
 
 :root[data-theme="dark"] {
@@ -32,6 +40,14 @@
   --color-danger: #ef4444;
 
   --color-canvas-bg: #0a1120;
+
+  --accent: var(--color-accent);
+  --accent-strong: var(--color-accent-strong);
+  --foreground: var(--color-text);
+  --muted: var(--color-text-muted);
+  --border: var(--color-border);
+  --surface: var(--color-surface);
+  --surface-alt: var(--color-surface-2);
 }
 
 

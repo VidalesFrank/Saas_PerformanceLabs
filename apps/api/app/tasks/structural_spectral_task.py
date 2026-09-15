@@ -23,7 +23,7 @@ import numpy as np
 
 from app.tasks.celery_app import celery_app
 from app.tasks.structural_helpers import (
-    get_db_session, mark_running, mark_success, mark_failed,
+    get_db_session, mark_running, mark_success, mark_failed, compute_input_hash,
 )
 
 
@@ -181,6 +181,9 @@ def run_spectral(
             "max_drift_y_pct": round(max_drift_y, 4),
             "drift_ok":       drift_ok_x and drift_ok_y,
             "combination_method": raw["combination_method"],
+            "input_hash": compute_input_hash(
+                canonical_path, project.parameters_json, extra_params, "spectral",
+            ),
         }
         mark_success(db, job_id, spectral_path, summary=summary)
         return {"status": "success", **summary}

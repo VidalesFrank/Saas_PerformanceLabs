@@ -18,7 +18,7 @@ const BASE = `${API_URL}/api/v1/ground-motion`
 
 function authHeader(): Record<string, string> {
   if (typeof window === 'undefined') return {}
-  const token = localStorage.getItem('access_token')
+  const token = localStorage.getItem('pl_token')
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
 

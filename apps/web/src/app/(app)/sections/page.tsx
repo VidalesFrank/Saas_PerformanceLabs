@@ -112,9 +112,16 @@ export default function SectionsPage() {
               Diseña secciones transversales y ejecuta análisis P-M, M-φ y P-M-M.
             </p>
           </div>
-          <Button onClick={() => setShowTemplates(true)} disabled={creating}>
-            {creating ? "Creando…" : "+ Nueva sección"}
-          </Button>
+          <div className="flex gap-2">
+            <Link href="/sections/design">
+              <Button variant="secondary" className="whitespace-nowrap">
+                ⚙ Diseño paramétrico
+              </Button>
+            </Link>
+            <Button onClick={() => setShowTemplates(true)} disabled={creating}>
+              {creating ? "Creando…" : "+ Nueva sección"}
+            </Button>
+          </div>
         </div>
 
         {/* Barra de búsqueda */}

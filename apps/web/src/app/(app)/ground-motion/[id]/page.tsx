@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import Script from 'next/script'
 import { AppHeader } from '@/components/app-header'
 import { useRequireAuth } from '@/lib/use-require-auth'
 import {
@@ -48,9 +47,29 @@ export default function GroundMotionDetailPage() {
   const [fftData, setFftData]     = useState<FFTResult | null>(null)
   const [isLoading, setIsLoading] = useState<Record<string, boolean>>({})
   const [error, setError]         = useState<string | null>(null)
-  const [plotlyReady, setPlotlyReady] = useState(false)
+  const [plotlyReady, setPlotlyReady] = useState(
+    typeof window !== 'undefined' && !!(window as unknown as { Plotly?: unknown }).Plotly
+  )
 
   const G = 9.80665
+
+  // ── Cargar Plotly desde CDN (inyección manual — el <Script beforeInteractive>
+  // de next/script no dispara onLoad dentro de páginas cliente del App Router) ──
+
+  useEffect(() => {
+    if ((window as unknown as { Plotly?: unknown }).Plotly) { setPlotlyReady(true); return }
+    const existing = document.querySelector('script[data-plotly-cdn]') as HTMLScriptElement | null
+    if (existing) {
+      existing.addEventListener('load', () => setPlotlyReady(true))
+      return
+    }
+    const s = document.createElement('script')
+    s.src = 'https://cdn.plot.ly/plotly-2.35.2.min.js'
+    s.async = true
+    s.setAttribute('data-plotly-cdn', '1')
+    s.onload = () => setPlotlyReady(true)
+    document.head.appendChild(s)
+  }, [])
 
   // ── Cargar registro ───────────────────────────────────────────────────────
 
@@ -122,12 +141,6 @@ export default function GroundMotionDetailPage() {
 
   return (
     <>
-      <Script
-        src="https://cdn.plot.ly/plotly-2.35.2.min.js"
-        strategy="beforeInteractive"
-        onLoad={() => setPlotlyReady(true)}
-      />
-
       <div className="flex flex-col h-screen">
         <AppHeader crumb="Análisis de Movimiento del Suelo" />
 
@@ -323,7 +336,7 @@ export default function GroundMotionDetailPage() {
             {tab === 'spectrum' && (
               <div>
                 <h2 className="text-lg font-semibold mb-4">Espectro de Respuesta Elástico</h2>
-                {plotlyReady && <SpectrumPanel recordId={id} component="" />}
+                {plotlyReady && <SpectrumPanel recordId={id} component="" dt={record!.dt ?? undefined} />}
               </div>
             )}
 
@@ -334,7 +347,7 @@ export default function GroundMotionDetailPage() {
                 <p className="text-xs text-[var(--muted)] mb-4">
                   Espectros de ductilidad constante — SDOF EPP, Newmark-β — μ = 1.5, 2, 3, 4, 6
                 </p>
-                {plotlyReady && <InelasticSpectrumPanel recordId={id} component="" />}
+                {plotlyReady && <InelasticSpectrumPanel recordId={id} component="" dt={record!.dt ?? undefined} />}
               </div>
             )}
           </main>
