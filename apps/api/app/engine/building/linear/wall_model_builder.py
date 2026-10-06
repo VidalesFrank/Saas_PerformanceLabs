@@ -88,6 +88,17 @@ class WallModelBuilder:
 
     # ── API pública ───────────────────────────────────────────────────────────
 
+    def extract_pier_geometry_only(self) -> dict[tuple, dict]:
+        """
+        Devuelve `pier_geom` (dict (pier, story) → {lw, tw, hw, fc_mpa, ...})
+        SIN construir el modelo OpenSees. Útil para auto-diseño post-hoc
+        cuando ya no se necesita correr análisis.
+        """
+        self._load_stories()
+        self._load_joint_xy()
+        self._extract_pier_geometry()
+        return self._pier_geom
+
     def build(self) -> dict:
         """
         Construye el modelo OpenSees y retorna el diccionario de información

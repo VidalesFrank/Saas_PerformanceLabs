@@ -20,6 +20,24 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
+from .mander import (
+    confinement_to_dict,
+    default_confinement,
+    mander_rect_confinement,
+)
+
+
+# Diámetros nominales ASTM / NSR-10 (mm) — duplicado local para evitar depender
+# del designer en el pipeline no lineal.
+_BAR_DIAM_MM: dict[str, float] = {
+    "#3":  9.5,  "#4": 12.7,  "#5": 15.9,  "#6": 19.1,  "#7": 22.2,
+    "#8": 25.4,  "#9": 28.7,  "#10": 32.3, "#11": 35.8,
+}
+
+
+def _bar_diam(label: str, default: float = 15.9) -> float:
+    return _BAR_DIAM_MM.get(str(label).strip(), default)
+
 
 def _compute_digest(*objs: Any) -> str:
     h = hashlib.sha256()
@@ -291,6 +309,10 @@ class NLSpecBuilder:
                 fid, design, user_ovr, b, h, L, fpc
             )
 
+            # Mander: confinamiento en zona de rótula (s_confined) y zona central
+            # (s_general). Las columnas típicamente plastifican en los extremos.
+            confinement = self._column_confinement(reinf, b, h, fpc, has_design)
+
             result[str(fid)] = {
                 "node_i":          str(fd.get("joint_i", "")),
                 "node_j":          str(fd.get("joint_j", "")),
@@ -306,10 +328,79 @@ class NLSpecBuilder:
                     "cover_m": 0.040,
                 },
                 "reinforcement": reinf,
+                "confinement":   confinement,
                 "has_design":    has_design,
             }
 
         return result
+
+    def _column_confinement(
+        self,
+        reinf:       dict,
+        b_m:         float,
+        h_m:         float,
+        fc_MPa:      float,
+        has_design:  bool,
+        cover_m:     float = 0.040,
+        fy_tie_MPa:  float = 420.0,
+    ) -> dict:
+        """
+        Calcula el confinamiento Mander para la zona de rótula (extremos) y la
+        zona central de la columna, a partir del armado del diseño.
+
+        Si no hay diseño (defaults), usa K=1.3 de respaldo.
+        """
+        if not has_design:
+            d_end = default_confinement(fc_MPa)
+            d_mid = default_confinement(fc_MPa)
+            return {
+                "end": confinement_to_dict(d_end),
+                "mid": confinement_to_dict(d_mid),
+            }
+
+        long_r = reinf.get("longitudinal", {})
+        tran   = reinf.get("transverse", {})
+
+        n_bars    = int(long_r.get("n_bars", 8))
+        db_long   = _bar_diam(long_r.get("bar_label", "#5"))
+        db_tie    = _bar_diam(tran.get("tie_bar_label", "#3"), default=9.5)
+        n_legs_b  = int(tran.get("n_legs_b", 2))
+        n_legs_h  = int(tran.get("n_legs_h", 2))
+        s_conf    = float(tran.get("s_confined_mm", 100.0))
+        s_general = float(tran.get("s_general_mm", 200.0))
+
+        end = mander_rect_confinement(
+            b_m         = b_m,
+            h_m         = h_m,
+            cover_m     = cover_m,
+            fc_MPa      = fc_MPa,
+            fy_tie_MPa  = fy_tie_MPa,
+            db_tie_mm   = db_tie,
+            s_mm        = s_conf,
+            n_legs_b    = n_legs_b,
+            n_legs_h    = n_legs_h,
+            n_long_bars = n_bars,
+            db_long_mm  = db_long,
+            source      = "designed",
+        )
+        mid = mander_rect_confinement(
+            b_m         = b_m,
+            h_m         = h_m,
+            cover_m     = cover_m,
+            fc_MPa      = fc_MPa,
+            fy_tie_MPa  = fy_tie_MPa,
+            db_tie_mm   = db_tie,
+            s_mm        = s_general,
+            n_legs_b    = n_legs_b,
+            n_legs_h    = n_legs_h,
+            n_long_bars = n_bars,
+            db_long_mm  = db_long,
+            source      = "designed",
+        )
+        return {
+            "end": confinement_to_dict(end),
+            "mid": confinement_to_dict(mid),
+        }
 
     def _column_reinforcement(
         self,
@@ -423,6 +514,8 @@ class NLSpecBuilder:
                 fid, design, user_ovr, b, h, L, fpc
             )
 
+            confinement = self._beam_confinement(reinf, b, h, fpc, has_design)
+
             result[str(fid)] = {
                 "node_i":          str(fd.get("joint_i", "")),
                 "node_j":          str(fd.get("joint_j", "")),
@@ -439,10 +532,102 @@ class NLSpecBuilder:
                     "cover_m": 0.040,
                 },
                 "reinforcement": reinf,
+                "confinement":   confinement,
                 "has_design":    has_design,
             }
 
         return result
+
+    def _beam_confinement(
+        self,
+        reinf:       dict,
+        b_m:         float,
+        h_m:         float,
+        fc_MPa:      float,
+        has_design:  bool,
+        cover_m:     float = 0.040,
+        fy_tie_MPa:  float = 420.0,
+    ) -> dict:
+        """
+        Confinamiento Mander para vigas: zona de rótula en extremos
+        (s_confined, L=2h) y zona central (s_central).
+
+        Para el conteo de barras perimetrales se suma top+bot de la zona end_i
+        (zona crítica donde se forma la rótula plástica negativa).
+        """
+        if not has_design:
+            d_end = default_confinement(fc_MPa)
+            d_mid = default_confinement(fc_MPa)
+            return {
+                "end": confinement_to_dict(d_end),
+                "mid": confinement_to_dict(d_mid),
+            }
+
+        shear  = reinf.get("shear", {})
+        zones  = reinf.get("zones", {})
+        end_i  = zones.get("end_i", {})
+        mid_z  = zones.get("mid",   {})
+
+        top_i = end_i.get("top", {})
+        bot_i = end_i.get("bot", {})
+        top_m = mid_z.get("top", {})
+        bot_m = mid_z.get("bot", {})
+
+        # Total de barras perimetrales (top + bot). Promedio ponderado del
+        # diámetro para asumir un db_long representativo.
+        n_top = int(top_i.get("n_bars", 2))
+        n_bot = int(bot_i.get("n_bars", 2))
+        n_bars_end = max(n_top + n_bot, 4)
+        n_top_m = int(top_m.get("n_bars", 2))
+        n_bot_m = int(bot_m.get("n_bars", 2))
+        n_bars_mid = max(n_top_m + n_bot_m, 4)
+
+        db_top = _bar_diam(top_i.get("bar_label", "#5"))
+        db_bot = _bar_diam(bot_i.get("bar_label", "#5"))
+        db_long = (n_top * db_top + n_bot * db_bot) / max(n_top + n_bot, 1)
+
+        db_tie    = _bar_diam(shear.get("tie_bar_label", "#3"), default=9.5)
+        n_legs    = int(shear.get("n_legs", 2))
+        # En vigas los estribos típicamente tienen 2 ramas en cada dirección
+        # (estribo cerrado simple). Si hay más de 2 legs reportados, se asumen
+        # ramas intermedias (grapas) distribuidas en ambas direcciones.
+        n_legs_b = n_legs                 # ramas verticales (atan h)
+        n_legs_h = max(2, n_legs // 2)    # ramas horizontales (atan b)
+        s_conf   = float(shear.get("s_confined_mm", 100.0))
+        s_mid    = float(shear.get("s_central_mm",   200.0))
+
+        end = mander_rect_confinement(
+            b_m         = b_m,
+            h_m         = h_m,
+            cover_m     = cover_m,
+            fc_MPa      = fc_MPa,
+            fy_tie_MPa  = fy_tie_MPa,
+            db_tie_mm   = db_tie,
+            s_mm        = s_conf,
+            n_legs_b    = n_legs_b,
+            n_legs_h    = n_legs_h,
+            n_long_bars = n_bars_end,
+            db_long_mm  = db_long,
+            source      = "designed",
+        )
+        mid = mander_rect_confinement(
+            b_m         = b_m,
+            h_m         = h_m,
+            cover_m     = cover_m,
+            fc_MPa      = fc_MPa,
+            fy_tie_MPa  = fy_tie_MPa,
+            db_tie_mm   = db_tie,
+            s_mm        = s_mid,
+            n_legs_b    = n_legs_b,
+            n_legs_h    = n_legs_h,
+            n_long_bars = n_bars_mid,
+            db_long_mm  = db_long,
+            source      = "designed",
+        )
+        return {
+            "end": confinement_to_dict(end),
+            "mid": confinement_to_dict(mid),
+        }
 
     def _beam_reinforcement(
         self,

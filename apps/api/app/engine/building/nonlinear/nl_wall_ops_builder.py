@@ -25,11 +25,12 @@ _K_SHELLS      = 'TABLE:  "OBJECTS AND ELEMENTS - SHELLS"'
 _K_SH_WALL     = 'TABLE:  "SHELL SECTIONS - WALL"'
 _K_SH_ASSIGN   = 'TABLE:  "SHELL ASSIGNMENTS - SECTIONS"'
 
-_NODE_WALL_OFFSET = 20_000_000
-_NODE_CM_OFFSET   = 10_000_000
-_ELE_WALL_OFFSET  = 50_000_000
-_MAT_START        = 1_000_000
-_NU               = 0.2      # Poisson del concreto
+_NODE_WALL_OFFSET   = 20_000_000
+_NODE_CM_OFFSET     = 10_000_000
+_ELE_WALL_OFFSET    = 50_000_000
+_ELE_INFILL_OFFSET  = 60_000_000     # puntales equivalentes de infill
+_MAT_START          = 1_000_000
+_NU                 = 0.2            # Poisson del concreto
 
 
 def _f(val, default: float = 0.0) -> float:
@@ -46,7 +47,7 @@ def _s(val, default: str = "") -> str:
     return str(val).strip()
 
 
-class NLBuildingOPSBuilder:
+class NLWallOPSBuilder:
     """
     Modelo no lineal MVLEM_3D de edificio de muros para pushover.
 
@@ -94,6 +95,11 @@ class NLBuildingOPSBuilder:
         self._mat_cfd:   dict[float, int] = {}  # fc_mpa*K → Concrete02 confinado
         self._mat_stl:   dict[float, int] = {}  # fy_mpa → Steel02
         self._mat_shr:   dict[int,   int] = {}  # round(Ks) → Elastic shear
+        self._mat_mas:   dict[str,   int] = {}  # masonry cache_key → Concrete01
+
+        # Metadata de infills creados (para debug / historia)
+        self._infill_specs: list[dict] = []
+        self._ele_infill_ctr = _ELE_INFILL_OFFSET
 
         self._ops = None
 
@@ -123,6 +129,7 @@ class NLBuildingOPSBuilder:
         self._create_pier_nodes()
         self._fix_base_nodes()
         self._create_mvlem_elements()
+        self._create_infills()
         self._create_cm_nodes()
         self._apply_diaphragms()
 
@@ -165,6 +172,7 @@ class NLBuildingOPSBuilder:
             "total_height":  total_h,
             "pier_elements": self._ele_map,
             "pier_lines":    pier_lines,
+            "infills":       self._infill_specs,
         }
 
     def run_gravity(
@@ -561,6 +569,44 @@ class NLBuildingOPSBuilder:
             self._mat_shr[k] = tag
         return self._mat_shr[k]
 
+    def _get_masonry(self, mat_def: dict) -> int:
+        """
+        Crea (o retorna cached) un Concrete01 uniaxial para un material de
+        mampostería definido por dict {id, fm_mpa, brick_type, Em_mpa}.
+
+        Convención de signos: compresión negativa. Sin resistencia a tracción,
+        lo cual reproduce correctamente el puntal solo-compresión del panel.
+
+        Cálculo de Em cuando no viene explícito:
+          - VP: Em = 775 · fm  (Guerrero et al. 2022)
+          - HP: Em = 622 · fm  (Borah et al. 2021)
+          - otros: requiere Em_mpa > 0.
+        """
+        from app.engine.building.masonry import (
+            MasonryMaterialDef,
+            masonry_concrete01_params,
+        )
+
+        m = MasonryMaterialDef(
+            name       = str(mat_def.get("id") or mat_def.get("name") or "masonry"),
+            fm_mpa     = float(mat_def.get("fm_mpa", 0.0)),
+            brick_type = str(mat_def.get("brick_type", "VP")),
+            Em_mpa     = (float(mat_def["Em_mpa"])
+                          if mat_def.get("Em_mpa") not in (None, 0, 0.0) else None),
+        )
+        key = m.cache_key
+        if key not in self._mat_mas:
+            tag = self._next_mat()
+            fpc, e0, fpcu, eu = masonry_concrete01_params(m)
+            # Escalar a kPa (el resto del builder trabaja en kPa)
+            self._ops.uniaxialMaterial(
+                "Concrete01", tag,
+                fpc * 1000.0, e0,
+                fpcu * 1000.0, eu,
+            )
+            self._mat_mas[key] = tag
+        return self._mat_mas[key]
+
     # ── Nodos ─────────────────────────────────────────────────────────────────
 
     def _create_pier_nodes(self) -> None:
@@ -682,6 +728,106 @@ class NLBuildingOPSBuilder:
                 "-Poisson",     _NU,
             )
             self._ele_map[(pier, story)] = self._ele_ctr
+
+    # ── Infills (puntales equivalentes) ───────────────────────────────────────
+
+    def _create_infills(self) -> None:
+        """
+        Crea los puntales equivalentes de mampostería a partir de la sección
+        "infills" del canonical_model. Cada infill genera dos elementos Truss
+        cruzados entre las 4 esquinas del pier/story asociado.
+
+        Solo se procesan infills cuyo (pier, story) tiene 4 nodos disponibles
+        en self._node_map (es decir, el pier debe estar en self._pier_geom).
+        """
+        infills = self._m.get("infills", {}) or {}
+        masonry_mats = self._m.get("masonryMaterials", {}) or {}
+        if not infills or not masonry_mats:
+            return
+
+        from app.engine.building.masonry import strut_geometry
+
+        ops = self._ops
+        created = 0
+        skipped: list[dict] = []
+
+        for panel_id, panel in infills.items():
+            pier   = panel.get("pier", "")
+            story  = panel.get("story", "")
+            mat_id = panel.get("masonry_material_id", "")
+            geom = self._pier_geom.get((pier, story))
+            mat_def = masonry_mats.get(mat_id)
+
+            if not geom:
+                skipped.append({"id": panel_id, "reason": f"pier/story sin geometría ({pier}/{story})"})
+                continue
+            if not mat_def:
+                skipped.append({"id": panel_id, "reason": f"material '{mat_id}' no existe"})
+                continue
+
+            idx = geom["story_idx"]
+            base_left  = self._node_map.get((pier, idx - 1, 0))
+            base_right = self._node_map.get((pier, idx - 1, 1))
+            top_left   = self._node_map.get((pier, idx,     0))
+            top_right  = self._node_map.get((pier, idx,     1))
+            if not all([base_left, base_right, top_left, top_right]):
+                skipped.append({"id": panel_id, "reason": "faltan nodos de esquina"})
+                continue
+
+            L_panel = float(geom["lw"])
+            H_panel = float(geom["hw"])
+            try:
+                sg = strut_geometry(
+                    L_panel_m     = L_panel,
+                    H_panel_m     = H_panel,
+                    thickness_m   = float(panel.get("thickness_m", 0.12)),
+                    width_ratio   = float(panel.get("width_ratio", 0.25)),
+                    opening_ratio = float(panel.get("opening_ratio", 0.0)),
+                )
+            except ValueError as e:
+                skipped.append({"id": panel_id, "reason": f"geometría inválida: {e}"})
+                continue
+
+            A_eff = sg["area_effective_m2"]
+            if A_eff <= 1e-6:
+                skipped.append({"id": panel_id, "reason": "área efectiva ~0 (opening_ratio muy alto)"})
+                continue
+
+            mat_tag = self._get_masonry(mat_def)
+
+            # Dos diagonales cruzadas (bidireccional): BL-TR y BR-TL.
+            # Cada una solo trabaja a compresión (Concrete01 sin tensión).
+            for i_node, j_node, tag_diag in (
+                (base_left,  top_right, "BL-TR"),
+                (base_right, top_left,  "BR-TL"),
+            ):
+                self._ele_infill_ctr += 1
+                ele_tag = self._ele_infill_ctr
+                ops.element("Truss", ele_tag, i_node, j_node, A_eff, mat_tag)
+                self._infill_specs.append({
+                    "panel_id":         panel_id,
+                    "pier":             pier,
+                    "story":            story,
+                    "diagonal":         tag_diag,
+                    "element_tag":      ele_tag,
+                    "i_node":           i_node,
+                    "j_node":           j_node,
+                    "material_tag":     mat_tag,
+                    "L_panel_m":        round(L_panel, 3),
+                    "H_panel_m":        round(H_panel, 3),
+                    "diagonal_m":       round(sg["diagonal_m"], 3),
+                    "eff_width_m":      round(sg["effective_width_m"], 3),
+                    "lambda_openings":  round(sg["lambda_openings"], 3),
+                    "area_effective_m2": round(A_eff, 5),
+                })
+                created += 1
+
+        if created:
+            print(f"[NLBuildingOPSBuilder] Infills: {created} puntales creados "
+                  f"({created // 2} paneles).")
+        if skipped:
+            print(f"[NLBuildingOPSBuilder] Infills: {len(skipped)} paneles omitidos: "
+                  f"{skipped[:3]}{'...' if len(skipped) > 3 else ''}")
 
     # ── Nodos CM y diafragmas ─────────────────────────────────────────────────
 

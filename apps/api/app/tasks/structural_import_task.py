@@ -59,6 +59,7 @@ def _load_raw_data(xlsx_path: str) -> tuple[dict, list[str]]:
         'Shell Assignments - Pier Spandr':  'TABLE:  "SHELL ASSIGNMENTS - PIER SPANDR"',
         'Concrete Column Rebar Data':       'TABLE:  "CONCRETE COLUMN REBAR DATA"',
         'Concrete Beam Rebar Data':         'TABLE:  "CONCRETE BEAM REBAR DATA"',
+        'Grid Definitions':                 'TABLE:  "GRID DEFINITIONS"',
     }
 
     xl = pd.ExcelFile(xlsx_path)
@@ -73,6 +74,20 @@ def _load_raw_data(xlsx_path: str) -> tuple[dict, list[str]]:
         df = pd.read_excel(xl, sheet_name=sheet, skiprows=1, header=0)
         units_row = df.iloc[0] if len(df) > 0 else pd.Series(dtype=object)
         df = df.drop(index=0).reset_index(drop=True)
+
+        # Normalizar columnas de identidad (labels y referencias a joints) a str
+        # sin sufijo '.0'. Sin esto, pandas re-interpreta "24" como 24.0 (float)
+        # y el builder falla al hacer lookup por key contra joints que son str.
+        _id_cols = (
+            "Element Label", "Object Label", "Unique Name", "Label",
+            "Joint I", "Joint J", "Joint 1", "Joint 2", "Joint 3", "Joint 4",
+        )
+        for col in _id_cols:
+            if col in df.columns:
+                df[col] = df[col].map(
+                    lambda v: "" if v is None or (isinstance(v, float) and pd.isna(v))
+                    else (str(v)[:-2] if isinstance(v, float) and v.is_integer() else str(v).strip())
+                )
 
         # Normalizar Frame Sections: E17 exporta cm²/cm⁴, el adaptador E23 ya da m²/m⁴.
         # Se lee la fila de unidades para saber qué conversión aplicar.

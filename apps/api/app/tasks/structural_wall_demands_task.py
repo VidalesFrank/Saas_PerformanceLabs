@@ -131,6 +131,11 @@ def run_wall_demands(
         os.makedirs(res_dir, exist_ok=True)
         res_path = os.path.join(res_dir, "wall_demands.json")
 
+        # Serializable pier_geom (tuple keys → "pier|story", drop nothing)
+        pier_geom_ser = {
+            f"{p}|{s}": g for (p, s), g in binfo["pier_geom"].items()
+        }
+
         payload = {
             "status":        "success",
             "job_id":        job_id,
@@ -139,6 +144,7 @@ def run_wall_demands(
             "story_forces":  result["story_forces"],
             "gravity_axials": result["gravity_axials"],
             "pier_demands":  result["pier_demands"],
+            "pier_geom":     pier_geom_ser,
             "pier_count":    len(binfo["pier_geom"]),
             "story_count":   len(binfo["stories_order"]) - 1,
             "gravity_control": ctrl,

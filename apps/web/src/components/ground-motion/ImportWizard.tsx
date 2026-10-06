@@ -25,11 +25,12 @@ const QUANTITY_OPTIONS: { value: ColumnQuantity; label: string }[] = [
 ]
 
 const ACC_UNITS: { value: AccUnit; label: string }[] = [
-  { value: 'g',     label: 'g  (gravedad estándar)' },
-  { value: 'm/s²',  label: 'm/s²  (SI)' },
-  { value: 'cm/s²', label: 'cm/s²' },
-  { value: 'Gal',   label: 'Gal  (= cm/s²)' },
-  { value: 'mm/s²', label: 'mm/s²' },
+  { value: 'g',      label: 'g  (gravedad estándar)' },
+  { value: 'm/s²',   label: 'm/s²  (SI)' },
+  { value: 'cm/s²',  label: 'cm/s²' },
+  { value: 'Gal',    label: 'Gal  (= cm/s²)' },
+  { value: 'mm/s²',  label: 'mm/s²' },
+  { value: 'counts', label: 'counts  (crudo del ADC — miniSEED)' },
 ]
 
 const COMPONENT_OPTIONS = ['', 'H1', 'H2', 'V', 'NS', 'EW', 'X', 'Y', 'Z']
@@ -67,15 +68,30 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
     try {
       const d = await detectFileStructure(f)
       setDetected(d)
+      // miniSEED trae la unidad sugerida y el componente en header_metadata;
+      // para TXT/CSV el default 'g' se mantiene y el usuario ajusta.
+      const suggestedUnit = (d.header_metadata?.suggested_unit as AccUnit | undefined) ?? 'g'
+      const suggestedChannel = (d.header_metadata?.channel as string | undefined) ?? ''
+      const inferredComponent = suggestedChannel
+        ? (suggestedChannel.slice(-1).toUpperCase() === 'E' ? 'EW'
+          : suggestedChannel.slice(-1).toUpperCase() === 'N' ? 'NS'
+          : suggestedChannel.slice(-1).toUpperCase() === 'Z' ? 'V' : '')
+        : ''
       // Inicializar mappings por defecto
       const initial: ColumnMappingIn[] = d.columns.map((c) => ({
         col_index: c.index,
         quantity:  d.n_cols === 1 ? 'acceleration' : (c.is_monotonic_increasing ? 'time' : 'acceleration'),
-        unit:      'g',
-        component: '',
+        unit:      suggestedUnit,
+        component: inferredComponent,
         name:      c.header,
       }))
       setMappings(initial)
+      // Δt del header SEED (autodescriptivo) — evita que el usuario lo ingrese
+      const suggestedDt = d.header_metadata?.dt as number | undefined
+      if (typeof suggestedDt === 'number' && suggestedDt > 0) {
+        setDt(String(suggestedDt))
+        setUseDt(true)
+      }
       setFlatten(d.wrapped_series_hint)
       setStep(2)
     } catch (err: unknown) {
@@ -218,14 +234,14 @@ export default function ImportWizard({ onSuccess, onCancel }: Props) {
                 <p className="font-medium text-[var(--foreground)]">Arrastra tu acelerograma aquí</p>
                 <p className="text-sm text-[var(--muted)] mt-1">o haz clic para buscar</p>
               </div>
-              <p className="text-xs text-[var(--muted)]">TXT · CSV · XLS · XLSX</p>
+              <p className="text-xs text-[var(--muted)]">TXT · CSV · XLS · XLSX · AT2 · VT2 · DT2</p>
             </div>
 
             <input
               ref={fileInputRef}
               type="file"
               className="hidden"
-              accept=".txt,.csv,.xls,.xlsx"
+              accept=".txt,.csv,.xls,.xlsx,.at2,.AT2,.vt2,.VT2,.dt2,.DT2"
               onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f) }}
             />
 

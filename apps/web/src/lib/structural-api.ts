@@ -27,6 +27,10 @@ import type {
   AssignSectionResult,
   NLSpecStatusResult,
   NLSpecGenerateResult,
+  GridDefinition,
+  MasonryMaterial,
+  MasonryBrickType,
+  InfillPanel,
 } from "./structural-types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -198,6 +202,33 @@ export const structuralAnalysisApi = {
     req<import("./structural-types").NLPushoverVariantResult>(
       `/analysis/${projectId}/design-variants/${variantId}/result`,
     ),
+
+  // ── Pushover no lineal de pórticos (F2-F6) ──────────────────────────────
+
+  /** Resultado consolidado del pushover de pórticos (JSON). */
+  getNLFramePushover: (projectId: string) =>
+    req<import("./structural-types").NLFramePushoverResult>(
+      `/analysis/${projectId}/nl-frame-pushover`,
+    ),
+
+  /** Historia submuestreada para animación 3D + daño por rótula. */
+  nlFramePushoverHistory: (projectId: string, direction: string, maxFrames = 60) =>
+    req<import("./structural-types").NLFramePushoverHistory>(
+      `/analysis/${projectId}/nl-frame-pushover/${direction}/history?max_frames=${maxFrames}`,
+    ),
+
+  /** Respuesta local (curvatura-paso) de un extremo i|j de un elemento. */
+  nlFrameElementResponse: (
+    projectId: string, direction: string, fid: string, end: "i" | "j" = "i",
+  ) =>
+    req<import("./structural-types").FrameElementResponse>(
+      `/analysis/${projectId}/nl-frame-pushover/${direction}/element-response` +
+      `?fid=${encodeURIComponent(fid)}&end=${end}`,
+    ),
+
+  /** URL del XLSX con resumen + curvas + rótulas + metadata. */
+  nlFramePushoverXlsxUrl: (projectId: string) =>
+    `${BASE}/analysis/${projectId}/nl-frame-pushover/export/xlsx`,
 };
 
 // ── Editor del modelo estructural ────────────────────────────────────────────
@@ -266,6 +297,131 @@ export const structuralEditorApi = {
     req<{ ok: boolean; restored: number }>(
       `/${projectId}/model/frames/restore-sections`,
       { method: "POST", body: JSON.stringify({ assignments }) },
+    ),
+
+  // ── Grid definido por el usuario ─────────────────────────────────────────
+  upsertGrid: (projectId: string, grid: GridDefinition) =>
+    req<{ ok: boolean; grid: GridDefinition }>(
+      `/${projectId}/model/grid`,
+      { method: "PUT", body: JSON.stringify(grid) },
+    ),
+
+  // ── Materiales de mampostería ────────────────────────────────────────────
+  createMasonryMaterial: (
+    projectId: string,
+    payload: { id: string; name: string; fm_mpa: number; brick_type: MasonryBrickType; Em_mpa?: number | null },
+  ) =>
+    req<{ ok: boolean; id: string; data: MasonryMaterial }>(
+      `/${projectId}/model/masonry-materials`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  updateMasonryMaterial: (
+    projectId: string, materialId: string,
+    payload: { name: string; fm_mpa: number; brick_type: MasonryBrickType; Em_mpa?: number | null },
+  ) =>
+    req<{ ok: boolean; id: string; data: MasonryMaterial }>(
+      `/${projectId}/model/masonry-materials/${encodeURIComponent(materialId)}`,
+      { method: "PUT", body: JSON.stringify(payload) },
+    ),
+
+  deleteMasonryMaterial: (projectId: string, materialId: string) =>
+    req<{ ok: boolean; deleted: string }>(
+      `/${projectId}/model/masonry-materials/${encodeURIComponent(materialId)}`,
+      { method: "DELETE" },
+    ),
+
+  // ── Infills (paneles de mampostería) ─────────────────────────────────────
+  createInfill: (
+    projectId: string,
+    payload: { id: string; column_i_fid?: string; column_j_fid?: string;
+               pier?: string; story: string; thickness_m: number;
+               masonry_material_id: string; opening_ratio?: number; width_ratio?: number },
+  ) =>
+    req<{ ok: boolean; id: string; data: InfillPanel }>(
+      `/${projectId}/model/infills`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  updateInfill: (
+    projectId: string, infillId: string,
+    payload: { column_i_fid?: string; column_j_fid?: string; pier?: string;
+               story: string; thickness_m: number;
+               masonry_material_id: string; opening_ratio: number; width_ratio: number },
+  ) =>
+    req<{ ok: boolean; id: string; data: InfillPanel }>(
+      `/${projectId}/model/infills/${encodeURIComponent(infillId)}`,
+      { method: "PUT", body: JSON.stringify(payload) },
+    ),
+
+  deleteInfill: (projectId: string, infillId: string) =>
+    req<{ ok: boolean; deleted: string }>(
+      `/${projectId}/model/infills/${encodeURIComponent(infillId)}`,
+      { method: "DELETE" },
+    ),
+
+  replicateInfill: (
+    projectId: string,
+    payload: { source_infill_id: string; target_stories: string[];
+               xy_tol_m?: number; id_prefix?: string | null },
+  ) =>
+    req<{
+      ok: boolean; source: string;
+      created: InfillPanel[]; skipped: { story: string; reason: string }[];
+      n_created: number; n_skipped: number;
+    }>(
+      `/${projectId}/model/infills/replicate`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  // ── Joints / Frames / Shells (soporte de dibujo directo) ─────────────────
+  createJoint: (
+    projectId: string,
+    payload: { id: string; x: number; y: number; z: number; story?: string;
+               is_restrained?: boolean; restraints?: number[] | null },
+  ) =>
+    req<{ ok: boolean; id: string; data: Record<string, unknown> }>(
+      `/${projectId}/model/joints`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  deleteJoint: (projectId: string, jointId: string) =>
+    req<{ ok: boolean; deleted: string }>(
+      `/${projectId}/model/joints/${encodeURIComponent(jointId)}`,
+      { method: "DELETE" },
+    ),
+
+  createFrame: (
+    projectId: string,
+    payload: { id: string; joint_i: string; joint_j: string; section: string;
+               element_type: "column" | "beam"; story?: string },
+  ) =>
+    req<{ ok: boolean; id: string; data: Record<string, unknown> }>(
+      `/${projectId}/model/frames`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  deleteFrame: (projectId: string, frameId: string) =>
+    req<{ ok: boolean; deleted: string }>(
+      `/${projectId}/model/frames/${encodeURIComponent(frameId)}`,
+      { method: "DELETE" },
+    ),
+
+  createShell: (
+    projectId: string,
+    payload: { id: string; joints: string[]; section?: string;
+               element_type: "wall" | "slab"; thickness_m: number;
+               pier?: string; story?: string },
+  ) =>
+    req<{ ok: boolean; id: string; data: Record<string, unknown> }>(
+      `/${projectId}/model/shells`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  deleteShell: (projectId: string, shellId: string) =>
+    req<{ ok: boolean; deleted: string }>(
+      `/${projectId}/model/shells/${encodeURIComponent(shellId)}`,
+      { method: "DELETE" },
     ),
 };
 

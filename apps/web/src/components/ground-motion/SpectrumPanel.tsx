@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { SpectrumMultiXiResult } from '@/lib/ground-motion-types'
-import { computeSpectrum, spectrumAtPeriod } from '@/lib/ground-motion-api'
+import { computeSpectrum, exportSpectrum, spectrumAtPeriod, triggerDownload } from '@/lib/ground-motion-api'
 import { GM_PALETTE, baseLayout, gmPlotConfig, useGmTheme } from '@/lib/gm-plotly-theme'
 import { AccuracyBanner, ChartCard, EmptyState, ErrorBanner, FooterNote, SectionHeader, SegmentedControl } from './_visual'
 
@@ -41,6 +41,7 @@ export default function SpectrumPanel({ recordId, component = '', dt }: Props) {
   const [Tinspect, setTinspect]   = useState('1.0')
   const [inspectData, setInspect] = useState<Record<string, number> | null>(null)
   const [scale, setScale]         = useState<'linear' | 'log'>('log')
+  const [exportingFmt, setExportingFmt] = useState<'xlsx' | 'txt' | null>(null)
   const [TMin, setTMin]           = useState<string>(() => {
     // Default a max(0.01, 20·Δt) para respetar dt/T ≤ 0.05
     if (dt && dt > 0) return Math.max(0.01, 20 * dt).toFixed(3)
@@ -70,6 +71,24 @@ export default function SpectrumPanel({ recordId, component = '', dt }: Props) {
       setError(e instanceof Error ? e.message : 'Error calculando espectro.')
     } finally {
       setIsLoading(false)
+    }
+  }
+
+  const exportFile = async (fmt: 'xlsx' | 'txt') => {
+    setExportingFmt(fmt); setError(null)
+    try {
+      const { blob, filename } = await exportSpectrum(recordId, {
+        component,
+        xi_list: [0.02, 0.05, 0.10, 0.20],
+        T_min: tMinNum,
+        T_max: tMaxNum,
+        n_points: parseInt(nPoints) || 150,
+      }, fmt)
+      triggerDownload(blob, filename)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : `Error exportando ${fmt.toUpperCase()}.`)
+    } finally {
+      setExportingFmt(null)
     }
   }
 
@@ -231,7 +250,29 @@ export default function SpectrumPanel({ recordId, component = '', dt }: Props) {
           </button>
 
           {result && (
-            <div className="ml-auto">
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                onClick={() => exportFile('xlsx')}
+                disabled={exportingFmt !== null}
+                title="Descargar Sa, Sd, Sv en Excel (una hoja por magnitud, columnas por amortiguamiento)"
+                className="px-3 py-2 bg-[var(--surface-alt)] border border-[var(--border)] rounded-lg
+                           text-xs font-semibold text-[var(--foreground)]
+                           hover:border-[var(--accent)]/40 hover:bg-[var(--surface)] transition-colors
+                           disabled:opacity-50"
+              >
+                {exportingFmt === 'xlsx' ? 'Exportando…' : 'Exportar Excel'}
+              </button>
+              <button
+                onClick={() => exportFile('txt')}
+                disabled={exportingFmt !== null}
+                title="Descargar Sa, Sd, Sv en TXT tabular con encabezado"
+                className="px-3 py-2 bg-[var(--surface-alt)] border border-[var(--border)] rounded-lg
+                           text-xs font-semibold text-[var(--foreground)]
+                           hover:border-[var(--accent)]/40 hover:bg-[var(--surface)] transition-colors
+                           disabled:opacity-50"
+              >
+                {exportingFmt === 'txt' ? 'Exportando…' : 'Exportar TXT'}
+              </button>
               <SegmentedControl<'linear' | 'log'>
                 value={scale} onChange={setScale}
                 options={[{ value: 'linear', label: 'lineal' }, { value: 'log', label: 'log' }]}

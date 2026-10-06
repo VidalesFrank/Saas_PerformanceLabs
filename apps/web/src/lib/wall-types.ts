@@ -203,6 +203,168 @@ export function regionLabel(region: MacroFiberRegion): string {
   }[region] ?? region;
 }
 
+// ── Detail (aggregated view — GET /walls/{label}/detail) ─────────────────────
+
+export interface WallDetailGeometry {
+  total_length_m:   number;
+  boundary_left_m:  number;
+  web_m:            number;
+  boundary_right_m: number;
+  thickness_m:      number;
+}
+
+export interface WallDetailFormulationInfo {
+  value:         WallFormulation;
+  label:         string;
+  description:   string;
+  uses_rc_panel: boolean;
+}
+
+export interface WallDetailOpenSees {
+  ele_tag:        number;
+  mat_tags:       number[];
+  material_lines: string[];
+  element_line:   string;
+  node_ids:       { i: string; j: string; k: string; l: string };
+  node_tags:      { i: number; j: number; k: number; l: number };
+}
+
+export interface RegistryConcreteEntry {
+  tag: number; type: string; name: string; fpc_mpa: number; fpcu_mpa: number;
+  eps_c0: number; eps_cu: number; ft_mpa: number; Ets: number; E_mpa: number;
+  confined: boolean;
+}
+export interface RegistrySteelEntry {
+  tag: number; type: string; name: string; fy_mpa: number; E_mpa: number;
+  b: number; R0: number; cR1: number; cR2: number;
+}
+export interface RegistryFsamEntry {
+  tag: number; type: string; rho_vertical: number; rho_horizontal: number;
+  tag_steel_h: number; tag_steel_v: number; tag_concrete: number;
+  nu: number; alfadow: number; cache_key: string;
+}
+export interface WallMaterialsRegistry {
+  concrete_materials: RegistryConcreteEntry[];
+  steel_materials:    RegistrySteelEntry[];
+  fsam_materials:     RegistryFsamEntry[];
+  total_tags:         number;
+}
+
+export interface WallDetailDemandRow {
+  label:      string;
+  Pu_kN:      number;
+  Vu_kN:      number;
+  Mu_kNm:     number;
+  is_seismic: boolean;
+}
+
+export interface WallDetailPhysicalGeom {
+  lw_m:   number;
+  tw_m:   number;
+  hw_m:   number;
+  fc_mpa: number;
+  pier:   string;
+  story:  string;
+}
+
+export interface WallDetailResponse {
+  label:              string;
+  shell:              Record<string, unknown>;
+  node_coords:        Record<string, { x: number; y: number; z: number } | null>;
+  physical_geom:      WallDetailPhysicalGeom | null;
+  has_analytical:     boolean;
+  analytical:         WallAnalyticalModel | null;
+  formulation_info:   WallDetailFormulationInfo | null;
+  geometry:           WallDetailGeometry | null;
+  opensees:           WallDetailOpenSees | null;
+  materials_registry: WallMaterialsRegistry | null;
+  design_result:      WallDesignResult | null;
+  design_demands:     WallDetailDemandRow[] | null;
+}
+
+// ── Auto-design-all ──────────────────────────────────────────────────────────
+
+export interface AutoDesignAllRequest {
+  ductility?:  WallDuctility;
+  cover_mm?:   number;
+  fyt_mpa?:    number;
+  delta_u_hw?: number;
+}
+
+export interface AutoDesignAllResponse {
+  designed_count: number;
+  failed_count:   number;
+  total_walls:    number;
+  designed:       string[];
+  failed:         { label: string; reason: string }[];
+  ductility:      WallDuctility;
+}
+
+// ── Design + Build pipeline (Fase B) ──────────────────────────────────────────
+
+export interface DesignAndBuildAllRequest {
+  ductility?:  WallDuctility;
+  cover_mm?:   number;
+  fyt_mpa?:    number;
+  delta_u_hw?: number;
+  width_max_m?: number;                    // ancho máx macrofibra (default 0.30 m)
+  n_fibers?:    number;                    // si > 0, ignora width_max_m
+  formulation?: WallFormulation;
+  c_rot?:       number;
+  thick_mod?:   number;
+  poisson?:     number;
+}
+
+export interface DesignAndBuildAllResponse {
+  designed_count: number;
+  built_count:    number;
+  failed_count:   number;
+  total_walls:    number;
+  designed:       string[];
+  built:          string[];
+  failed:         { label: string; reason: string; designed_ok?: boolean }[];
+  ductility:      WallDuctility;
+  formulation:    WallFormulation;
+  n_fibers_mode:  string;
+}
+
+// ── Redesign single wall ─────────────────────────────────────────────────────
+
+export interface WallManualReinf {
+  be_left:  { n_bars: number; db_mm: number; cover_mm: number; tie_db_mm: number; tie_spacing_mm: number; length_m: number };
+  web:      { vert_db_mm: number; vert_spacing_mm: number; horiz_db_mm: number; horiz_spacing_mm: number; n_curtains: number };
+  be_right: { n_bars: number; db_mm: number; cover_mm: number; tie_db_mm: number; tie_spacing_mm: number; length_m: number };
+  symmetric: boolean;
+}
+
+export interface WallRedesignRequest {
+  ductility?:    WallDuctility;
+  cover_mm?:     number;
+  fyt_mpa?:      number;
+  delta_u_hw?:   number;
+  manual_reinf?: WallManualReinf;
+}
+
+export interface WallDesignMeta {
+  pier:       string;
+  story:      string;
+  axis:       "X" | "Y" | "inclined";
+  ductility:  WallDuctility;
+  fc_mpa:     number;
+  fy_mpa:     number;
+  fyt_mpa:    number;
+  cover_mm:   number;
+  mode?:      WallDesignMode;
+  geometry:   { lw_m: number; tw_m: number; hw_m: number };
+  demands:    WallDetailDemandRow[];
+}
+
+export interface WallDesignPersisted {
+  label:  string;
+  result: WallDesignResult;
+  meta:   WallDesignMeta | null;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Módulo 5 — WallProject (análisis independiente de muros RC 3D)
 // ════════════════════════════════════════════════════════════════════════════

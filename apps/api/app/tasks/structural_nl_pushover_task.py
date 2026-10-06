@@ -116,7 +116,7 @@ def run_nl_pushover(
         print(f"[nl_pushover] raw_data cargado desde {os.path.basename(xlsx_path)}")
 
         # ── Importar builder ──────────────────────────────────────────────────
-        from app.engine.building.nonlinear.nl_building_ops_builder import NLBuildingOPSBuilder
+        from app.engine.building.nonlinear.nl_wall_ops_builder import NLWallOPSBuilder
 
         os.makedirs(res_dir, exist_ok=True)
 
@@ -127,7 +127,7 @@ def run_nl_pushover(
             part_path = Path(res_dir) / f"nl_pushover_{direction.replace('-', 'm')}_partial.json"
             hist_path = Path(res_dir) / f"nl_pushover_{direction.replace('-', 'm')}_history.npz"
 
-            builder = NLBuildingOPSBuilder(
+            builder = NLWallOPSBuilder(
                 model       = model,
                 raw_data    = raw_data,
                 design_rows = design_rows,

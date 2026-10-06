@@ -52,6 +52,7 @@ class JobOut(BaseModel):
     project_id: str
     created_at: str
     finished_at: str | None
+    progress: dict | None = None
 
     @classmethod
     def from_orm(cls, j: StructuralJob) -> "JobOut":
@@ -65,6 +66,12 @@ class JobOut(BaseModel):
                 raw = json.loads(raw)
             except (ValueError, TypeError):
                 raw = None
+        progress = getattr(j, "progress_json", None)
+        if isinstance(progress, str):
+            try:
+                progress = json.loads(progress)
+            except (ValueError, TypeError):
+                progress = None
         return cls(
             id=j.id,
             celery_task_id=j.celery_task_id,
@@ -76,6 +83,7 @@ class JobOut(BaseModel):
             project_id=j.project_id,
             created_at=j.created_at.isoformat(),
             finished_at=j.finished_at.isoformat() if j.finished_at else None,
+            progress=progress,
         )
 
 
@@ -267,6 +275,23 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
                 detail="Ejecuta el diseño de muros RC antes del pushover no lineal.",
             )
 
+    elif payload.analysis_type == StructuralAnalysisType.frame_pushover:
+        if not project.canonical_model_path:
+            raise HTTPException(
+                status_code=400,
+                detail="El modelo debe estar importado antes del pushover de pórticos.",
+            )
+        # El spec no lineal se genera on-the-fly si no existe; el diseño de
+        # columnas/vigas es recomendado pero no obligatorio (fallback a
+        # defaults NSR-10 ρ=1% + estribos mínimos).
+        work_dir_fp = os.path.dirname(os.path.dirname(project.canonical_model_path))
+        has_col_design  = os.path.exists(os.path.join(work_dir_fp, "results", "design_columns_detail.json"))
+        has_beam_design = os.path.exists(os.path.join(work_dir_fp, "results", "beam_design_detail.json"))
+        if not (has_col_design or has_beam_design):
+            # Permitir pero advertir vía header o log — por ahora dejamos pasar
+            # y el NLSpecBuilder usará defaults mínimos.
+            pass
+
     # ── Cache por hash: si el último job success del mismo tipo tiene los
     #    mismos inputs (canonical + parameters + extra_params), reutilízalo
     #    en vez de re-lanzar Celery. Ahorra 1-190s por corrida.
@@ -309,6 +334,7 @@ def launch_analysis(payload: LaunchRequest, user: CurrentUser, db: DB):
             StructuralAnalysisType.wall_design:     "app.tasks.structural_wall_design_task.run_wall_design",
             StructuralAnalysisType.nl_pushover:     "app.tasks.structural_nl_pushover_task.run_nl_pushover",
             StructuralAnalysisType.variant_pushover: "app.tasks.structural_variant_pushover_task.run_variant_pushover",
+            StructuralAnalysisType.frame_pushover:  "app.tasks.structural_frame_pushover_task.run_frame_pushover",
         }
 
         kwargs: dict = {
@@ -983,6 +1009,266 @@ def get_design_variant_result(
 
     with open(result_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+# ── Pushover No Lineal de Pórticos (Módulo 1 — F2-F6) ────────────────────────
+
+@router.get("/{project_id}/nl-frame-pushover")
+def get_nl_frame_pushover(project_id: str, user: CurrentUser, db: DB):
+    """Retorna los resultados del pushover no lineal de pórticos."""
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir    = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    result_path = os.path.join(work_dir, "results", "nl_frame_pushover_results.json")
+    if not os.path.exists(result_path):
+        raise HTTPException(status_code=404, detail="No hay resultados de pushover de pórticos aún")
+    with open(result_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.get("/{project_id}/nl-frame-pushover/{direction}/history")
+def get_nl_frame_pushover_history(
+    project_id: str,
+    direction:  str,
+    user:       CurrentUser,
+    db:         DB,
+    max_frames: int = 60,
+):
+    """
+    Historia submuestreada de la deformada del pushover de pórticos para una
+    dirección (X o Y).
+
+    Response:
+      - direction, total_height_m
+      - frames: [{step, drift_pct, base_shear_kN, disp: {tag: [ux,uy,uz]}}]
+      - element_lines: metadata de columnas/vigas (fid, kind, node_i, node_j,
+                        b_m, h_m, L_m, lp_m, story)
+      - hinge_damage: lista por extremo con nivel ASCE 41 (none/io/ls/cp/collapse)
+      - story_drifts: por piso
+    """
+    import numpy as np
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    npz_path = os.path.join(
+        work_dir, "results",
+        f"nl_frame_pushover_{direction.replace('-', 'm')}_history.npz",
+    )
+    res_path = os.path.join(work_dir, "results", "nl_frame_pushover_results.json")
+
+    if not os.path.exists(npz_path):
+        raise HTTPException(status_code=404, detail=f"No hay historia NPZ para dirección {direction}")
+    if not os.path.exists(res_path):
+        raise HTTPException(status_code=404, detail="No hay resultados de pushover de pórticos")
+
+    with open(res_path, "r", encoding="utf-8") as f:
+        results = json.load(f)
+    dir_key    = "pushover_X" if direction.upper().lstrip("-") == "X" else "pushover_Y"
+    dir_result = results.get(dir_key)
+    if not dir_result:
+        raise HTTPException(status_code=404, detail=f"Dirección {direction} no encontrada")
+
+    data = np.load(npz_path, allow_pickle=False)
+    disp_joint = data["disp_joint"]    # (n_frames, n_joint, 6)
+    joint_tags = data["joint_tags"].tolist()
+
+    n_captured = int(disp_joint.shape[0])
+    if n_captured == 0:
+        raise HTTPException(status_code=404, detail="Historia vacía")
+
+    if n_captured > max_frames:
+        idx = np.linspace(0, n_captured - 1, max_frames, dtype=int)
+    else:
+        idx = np.arange(n_captured)
+
+    steps_pushover = dir_result.get("steps", [])
+    hist_meta      = dir_result.get("history", {})
+    stride         = int(hist_meta.get("stride", 1))
+
+    frames_out = []
+    for fi in idx:
+        step_num = min(len(steps_pushover), int((fi + 1) * stride))
+        s = steps_pushover[step_num - 1] if 0 < step_num <= len(steps_pushover) else {}
+        disp_map: dict[str, list[float]] = {}
+        for j, tag in enumerate(joint_tags):
+            u = disp_joint[fi, j]
+            disp_map[str(int(tag))] = [float(u[0]), float(u[1]), float(u[2])]
+        frames_out.append({
+            "frame":         int(fi),
+            "step":          step_num,
+            "drift_pct":     s.get("drift_pct", 0.0),
+            "base_shear_kN": s.get("base_shear_kN", 0.0),
+            "disp":          disp_map,
+        })
+
+    # Nodos (coords de referencia) para la geometría indeformada en el frontend
+    # Se leen del canonical para no depender del NPZ.
+    with open(project.canonical_model_path, encoding="utf-8") as f:
+        canonical = json.load(f)
+    joints_ref: dict[str, list[float]] = {}
+    for lbl, jd in canonical.get("joints", {}).items():
+        try:
+            tag = str(int(float(lbl)))
+        except (TypeError, ValueError):
+            tag = str(lbl)
+        joints_ref[tag] = [float(jd.get("x", 0)), float(jd.get("y", 0)), float(jd.get("z", 0))]
+
+    damage = dir_result.get("damage", {})
+    return {
+        "direction":        direction,
+        "total_height_m":   dir_result.get("total_height", 0.0),
+        "target_drift_pct": dir_result.get("target_drift_pct", 2.0),
+        "pattern_type":     dir_result.get("pattern_type", "triangular"),
+        "n_frames":         len(frames_out),
+        "n_captured":       n_captured,
+        "n_total_steps":    dir_result.get("total_steps", 0),
+        "stride":           stride,
+        "frames":           frames_out,
+        "joints_ref":       joints_ref,
+        "element_lines":    dir_result.get("element_lines", []),
+        "infill_lines":     dir_result.get("infill_lines", []),
+        "hinge_damage":     damage.get("hinges", []),
+        "damage_by_element": damage.get("by_element", {}),
+        "summary":          dir_result.get("summary", {}),
+    }
+
+
+@router.get("/{project_id}/nl-frame-pushover/{direction}/element-response")
+def get_nl_frame_element_response(
+    project_id: str,
+    direction:  str,
+    user:       CurrentUser,
+    db:         DB,
+    fid:        str,
+    end:        str = "i",
+):
+    """
+    Respuesta local de un extremo (i/j) de un elemento (columna o viga)
+    durante el pushover: curva M-φ aproximada a partir de las
+    sectionDeformations capturadas en el NPZ.
+
+    Query:
+      - fid : frame_id del elemento
+      - end : "i" | "j" (extremo del elemento)
+    """
+    import numpy as np
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    npz_path = os.path.join(
+        work_dir, "results",
+        f"nl_frame_pushover_{direction.replace('-', 'm')}_history.npz",
+    )
+    res_path = os.path.join(work_dir, "results", "nl_frame_pushover_results.json")
+    if not os.path.exists(npz_path) or not os.path.exists(res_path):
+        raise HTTPException(status_code=404, detail="Historia del pushover no disponible")
+
+    with open(res_path, "r", encoding="utf-8") as f:
+        results = json.load(f)
+    dir_key    = "pushover_X" if direction.upper().lstrip("-") == "X" else "pushover_Y"
+    dir_result = results.get(dir_key)
+    if not dir_result:
+        raise HTTPException(status_code=404, detail=f"Dirección {direction} no encontrada")
+
+    # Localiza el elemento en element_lines
+    ele_lines = dir_result.get("element_lines", [])
+    el = next((e for e in ele_lines if str(e.get("fid")) == str(fid)), None)
+    if not el:
+        raise HTTPException(status_code=404, detail=f"Elemento {fid} no encontrado")
+
+    kind    = el["kind"]
+    ele_tag = int(el["ele_tag"])
+    lp      = float(el.get("lp_m", 0.2))
+
+    data = np.load(npz_path, allow_pickle=False)
+    arr_key  = "col_sect_def" if kind == "column" else "bm_sect_def"
+    tag_key  = "col_tags"      if kind == "column" else "bm_tags"
+    if arr_key not in data.files:
+        raise HTTPException(status_code=404, detail="Historia sin deformaciones de sección")
+    arr  = data[arr_key]
+    tags = data[tag_key].tolist()
+    if ele_tag not in tags:
+        raise HTTPException(status_code=404, detail=f"ele_tag {ele_tag} no en NPZ")
+    idx = tags.index(ele_tag)
+    slab = arr[:, idx, :]
+    if slab.shape[1] < 6:
+        raise HTTPException(status_code=500, detail="Formato inesperado de deformaciones")
+
+    # Elegir columnas por extremo
+    base = 0 if end.lower() == "i" else 3
+    eps_hist = slab[:, base + 0]
+    kz_hist  = slab[:, base + 1]
+    ky_hist  = slab[:, base + 2]
+    kappa    = np.maximum(np.abs(kz_hist), np.abs(ky_hist))
+
+    # Mapea curvatura ↔ paso del pushover
+    steps_pushover = dir_result.get("steps", [])
+    hist_meta = dir_result.get("history", {})
+    stride    = int(hist_meta.get("stride", 1))
+
+    curve: list[dict] = []
+    for i, k_val in enumerate(kappa):
+        step_num = min(len(steps_pushover), int((i + 1) * stride))
+        s = steps_pushover[step_num - 1] if 0 < step_num <= len(steps_pushover) else {}
+        curve.append({
+            "step":        step_num,
+            "kappa_1_per_m": float(k_val),
+            "eps_axial":   float(eps_hist[i]),
+            "drift_pct":   s.get("drift_pct", 0.0),
+            "base_shear_kN": s.get("base_shear_kN", 0.0),
+        })
+
+    # Daño del extremo (si ya se computó)
+    hinges = dir_result.get("damage", {}).get("hinges", [])
+    hinge = next((h for h in hinges if h["fid"] == str(fid) and h["end"] == end.lower()), None)
+
+    return {
+        "fid":        str(fid),
+        "end":        end.lower(),
+        "kind":       kind,
+        "story":      el.get("story", ""),
+        "lp_m":       lp,
+        "b_m":        el.get("b_m"),
+        "h_m":        el.get("h_m"),
+        "L_m":        el.get("L_m"),
+        "curve":      curve,
+        "hinge":      hinge,
+    }
+
+
+@router.get("/{project_id}/nl-frame-pushover/export/xlsx")
+def export_nl_frame_pushover_xlsx(project_id: str, user: CurrentUser, db: DB):
+    """Descarga XLSX con resumen + curvas + rótulas + metadata."""
+    from fastapi.responses import Response
+    from app.services.frame_pushover_export import build_xlsx_bytes
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(status_code=404, detail="Modelo canónico no disponible")
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    res_path = os.path.join(work_dir, "results", "nl_frame_pushover_results.json")
+    if not os.path.exists(res_path):
+        raise HTTPException(status_code=404, detail="No hay resultados de pushover de pórticos")
+
+    with open(res_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    content = build_xlsx_bytes(data)
+    filename = f"pushover_porticos_{project.name.replace(' ', '_')}.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.delete("/jobs/{job_id}/cancel", status_code=200)

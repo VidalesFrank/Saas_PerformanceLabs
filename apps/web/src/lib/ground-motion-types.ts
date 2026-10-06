@@ -27,7 +27,7 @@ export interface DetectedStructure {
   n_cols: number
   has_header: boolean
   delimiter: string
-  header_metadata: Record<string, number | string>
+  header_metadata: Record<string, number | string | boolean>
   n_skipped_rows: number
   warnings: string[]
   preview_rows: (number | null)[][]
@@ -41,7 +41,7 @@ export interface DetectedStructure {
 // ── Mapeo de columnas (wizard step 2) ─────────────────────────────────────
 
 export type ColumnQuantity = 'acceleration' | 'time' | 'velocity' | 'displacement' | 'ignore'
-export type AccUnit = 'g' | 'm/s²' | 'cm/s²' | 'Gal' | 'mm/s²'
+export type AccUnit = 'g' | 'm/s²' | 'cm/s²' | 'Gal' | 'mm/s²' | 'counts'
 export type TimeUnit = 's' | 'ms'
 
 export interface ColumnMappingIn {
@@ -86,12 +86,17 @@ export interface GMJob {
 
 export interface TimeseriesData {
   t: number[]
-  a_ms2: number[]
+  a_ms2: number[]              // contiene valores en la unidad indicada por a_unit (usualmente m/s²; 'counts' si sin calibrar)
   a_raw: number[]
-  a_unit_original: string
+  a_unit_original: string      // unidad original del archivo (g, counts, cm/s², ...)
+  a_unit: string               // unidad REAL de a_ms2/v_ms/d_m — 'm/s²' o 'counts'
+  pga_unit: string             // unidad del PGA (usualmente igual a a_unit)
+  needs_calibration: boolean   // true cuando a_unit === 'counts' → falta calibrar el sensor
   component: string
   dt: number
   n_samples: number
+  n_returned: number           // puntos devueltos (n_samples si no hubo downsampling)
+  downsampled: boolean         // true si la señal fue decimada con LTTB para el gráfico
   duration: number
   fs: number
   nyquist: number

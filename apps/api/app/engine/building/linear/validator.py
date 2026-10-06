@@ -319,8 +319,12 @@ class DataValidator:
 
             short = []
             for _, row in frames_df.iterrows():
-                ji = int(pd.to_numeric(row.get("Joint I", np.nan), errors="coerce") or 0)
-                jj = int(pd.to_numeric(row.get("Joint J", np.nan), errors="coerce") or 0)
+                ji_val = pd.to_numeric(row.get("Joint I", np.nan), errors="coerce")
+                jj_val = pd.to_numeric(row.get("Joint J", np.nan), errors="coerce")
+                if pd.isna(ji_val) or pd.isna(jj_val):
+                    continue
+                ji = int(ji_val)
+                jj = int(jj_val)
                 if ji in coord_map and jj in coord_map:
                     xi, yi, zi = coord_map[ji]
                     xj, yj, zj = coord_map[jj]

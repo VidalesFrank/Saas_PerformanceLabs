@@ -17,14 +17,17 @@ Endpoints:
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import re
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -37,9 +40,13 @@ from app.engine.ground_motion.io.detector import detect_structure
 from app.engine.ground_motion.io.parser import (
     ColumnMapping,
     build_record,
+    load_record_auto,
     record_from_storage_dict,
     record_to_storage_dict,
+    save_record_binary,
 )
+from app.engine.ground_motion.io.miniseed import apply_calibration
+from app.engine.ground_motion.processing.downsample import lttb_indices
 from app.engine.ground_motion.processing.integration import compute_all, compute_all_corrected
 from app.engine.ground_motion.processing.baseline import (
     apply_baseline_correction,
@@ -70,22 +77,16 @@ def _gm_dir(record_id: str) -> str:
 
 
 def _load_record_data(record: GroundMotionRecord):
-    """Carga el JSON del registro desde disco y retorna un GroundMotionRecord."""
+    """Carga el registro desde disco (autodetecta formato v1 JSON / v2 binario)."""
     if not record.raw_data_path or not os.path.exists(record.raw_data_path):
         raise HTTPException(404, "Datos del registro no encontrados en disco.")
-    with open(record.raw_data_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return record_from_storage_dict(data)
+    return load_record_auto(record.raw_data_path)
 
 
 def _save_record_data(record_db: GroundMotionRecord, gm_rec) -> str:
-    """Serializa el GroundMotionRecord a JSON y lo guarda en disco."""
+    """Serializa el registro en formato binario (record_meta.json + arrays/*.npy)."""
     gm_rec.id = record_db.id
-    data = record_to_storage_dict(gm_rec)
-    path = os.path.join(_gm_dir(record_db.id), "record_data.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    return path
+    return save_record_binary(gm_rec, _gm_dir(record_db.id))
 
 
 # ── Esquemas Pydantic ─────────────────────────────────────────────────────────
@@ -96,6 +97,24 @@ class ColumnMappingIn(BaseModel):
     unit: str           # 'g', 'm/s²', 's', 'cm/s', etc.
     component: str = ""
     name: str = ""
+
+
+class CalibrationSpec(BaseModel):
+    """Calibración opcional de counts crudos a m/s² físicos (solo miniSEED).
+
+    Dos modos mutuamente excluyentes:
+      - 'sensitivity':   requiere sensitivity_counts_per_g (~500 000 para redes SGC)
+      - 'pga_reference': requiere pga_reference_ms2 (normaliza para que |a|_max
+                         coincida con ese valor tras remover DC)
+
+    Si el request no incluye este bloque, los canales se guardan tal como
+    vienen — típicamente en 'counts' para miniSEED — y se pueden calibrar
+    después vía POST /records/{id}/recalibrate.
+    """
+    mode: str = Field(..., description="'sensitivity' | 'pga_reference'")
+    sensitivity_counts_per_g: float | None = None
+    pga_reference_ms2: float | None = None
+    component: str = Field("", description="Componente específico a calibrar (vacío = todos)")
 
 
 class CreateRecordRequest(BaseModel):
@@ -110,6 +129,10 @@ class CreateRecordRequest(BaseModel):
             "columnas por línea (formato PEER/NGA — ver detect().wrapped_series_hint). "
             "Las columnas mapeadas se concatenan fila-mayor en un único canal."
         ),
+    )
+    calibration: CalibrationSpec | None = Field(
+        None,
+        description="Calibración opcional counts→m/s² para archivos miniSEED (ver CalibrationSpec).",
     )
 
 
@@ -251,6 +274,40 @@ async def create_record(
     except Exception as exc:
         raise HTTPException(500, f"Error importando el registro: {exc}\n{traceback.format_exc()}")
 
+    # Calibración opcional inline (típico para miniSEED counts → m/s²)
+    if req.calibration is not None:
+        try:
+            apply_calibration(
+                gm_rec,
+                mode=req.calibration.mode,
+                sensitivity_counts_per_g=req.calibration.sensitivity_counts_per_g,
+                pga_reference_ms2=req.calibration.pga_reference_ms2,
+                component=req.calibration.component,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, f"Calibración inválida: {exc}")
+    else:
+        # Auto-calibración por defecto para canales en counts sin calibración
+        # explícita: sensibilidad típica de dataloggers 24-bit de acelerógrafos
+        # fuerte-movimiento (verificado contra dataset MADOS: 501k–510k counts/g).
+        # El usuario puede recalibrar después via /records/{id}/recalibrate con
+        # el valor exacto del datasheet.
+        _needs_autocal = any(
+            ch.quantity == "acceleration" and ch.original_unit == "counts"
+            for ch in gm_rec.channels
+        )
+        if _needs_autocal:
+            _DEFAULT_SENSITIVITY = 500_000.0
+            apply_calibration(
+                gm_rec,
+                mode="sensitivity",
+                sensitivity_counts_per_g=_DEFAULT_SENSITIVITY,
+            )
+            gm_rec.metadata.setdefault("calibration_note",
+                f"Auto-calibrado con sensibilidad default {_DEFAULT_SENSITIVITY:.0f} counts/g. "
+                f"Usa /recalibrate para ajustar con la sensibilidad exacta del sensor."
+            )
+
     # Crear registro en BD
     acc_ch = gm_rec.get_acceleration_channel()
     record_db = GroundMotionRecord(
@@ -331,28 +388,97 @@ def delete_record(
 def get_timeseries(
     record_id: str,
     component: str = "",
+    max_points: int = 20000,
+    full: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> dict:
-    """Retorna la historia de tiempo (a, v, d) con integración numérica."""
+    """Retorna la historia de tiempo (a, v, d) con integración numérica.
+
+    Query params:
+      component:  H1|H2|V|NS|EW|X|Y|Z (vacío → primer canal de aceleración).
+      max_points: máximo de puntos a devolver en las series para el gráfico
+                  (default 20 000). Si n_samples <= max_points o full=true,
+                  se devuelve la señal completa.
+      full:       true → ignora max_points y devuelve la señal cruda (útil
+                  para exportar o análisis del cliente; puede ser MUY grande).
+
+    Los valores agregados (PGA, PGV, PGD, t_pga) SIEMPRE se calculan sobre
+    la señal completa — el downsampling es únicamente para visualización.
+    """
     record_db = _get_record_or_404(record_id, current_user.id, db)
     gm_rec    = _load_record_data(record_db)
 
-    ts = gm_rec.timeseries_to_dict(component)
-    if not ts:
+    acc_ch = gm_rec.get_acceleration_channel(component)
+    if acc_ch is None:
         raise HTTPException(404, "No se encontró canal de aceleración para el componente indicado.")
 
-    acc_ms2 = np.array(ts["a_ms2"])
-    dt = record_db.dt or gm_rec.dt
+    # Trabajar con arrays directos (sin roundtrip a listas Python)
+    a_full     = acc_ch.effective_values_si()
+    a_raw_full = acc_ch.raw_values
+    dt         = record_db.dt or gm_rec.dt
+    n          = int(len(a_full))
+    t_full     = gm_rec.time if len(gm_rec.time) == n else np.arange(n) * dt
 
-    vel, disp = compute_all_corrected(acc_ms2, dt)
+    # Integración numérica: SIEMPRE sobre la señal completa (los picos se
+    # calculan aquí; luego decimamos solo lo que se manda al gráfico).
+    vel_full, disp_full = compute_all_corrected(a_full, dt)
 
-    ts["v_ms"]  = vel.tolist()
-    ts["d_m"]   = disp.tolist()
-    ts["pgv_ms"] = float(np.max(np.abs(vel)))
-    ts["pgd_m"]  = float(np.max(np.abs(disp)))
+    # PGA se define como max|a - baseline| (Boore & Bommer 2005). Quitar el DC
+    # es especialmente importante para registros calibrados desde counts, donde
+    # el offset del ADC ~5000 counts introduce un sesgo de ~0.1 m/s².
+    a_dc = float(a_full.mean())
+    a_centered = a_full - a_dc
+    pga_ms2 = float(np.max(np.abs(a_centered)))
+    pgv_ms  = float(np.max(np.abs(vel_full)))
+    pgd_m   = float(np.max(np.abs(disp_full)))
+    idx_pga = int(np.argmax(np.abs(a_centered)))
+    t_pga   = float(t_full[idx_pga])
 
-    return ts
+    # Downsampling visual (LTTB) si la señal excede max_points
+    downsampled = False
+    if not full and n > max_points and max_points >= 3:
+        idx = lttb_indices(t_full, a_full, max_points)
+        t_out       = t_full[idx]
+        a_out       = a_full[idx]
+        a_raw_out   = a_raw_full[idx] if len(a_raw_full) == n else a_raw_full
+        v_out       = vel_full[idx]
+        d_out       = disp_full[idx]
+        downsampled = True
+    else:
+        t_out, a_out, a_raw_out = t_full, a_full, a_raw_full
+        v_out, d_out            = vel_full, disp_full
+
+    # si_unit == 'counts' significa que no se aplicó calibración a m/s². El
+    # frontend debe mostrar la unidad real y avisar que hay que calibrar.
+    a_unit = acc_ch.si_unit or "m/s²"
+    needs_calibration = (a_unit == "counts")
+
+    return {
+        "t":                t_out.tolist(),
+        "a_ms2":            a_out.tolist(),        # nombre histórico; contiene la unidad indicada en a_unit
+        "a_raw":            a_raw_out.tolist(),
+        "v_ms":             v_out.tolist(),
+        "d_m":              d_out.tolist(),
+        "a_unit_original":  acc_ch.original_unit,
+        "a_unit":           a_unit,                 # unidad REAL de a_ms2 / v_ms / d_m
+        "pga_unit":         a_unit,
+        "needs_calibration": needs_calibration,
+        "component":        acc_ch.component,
+        "dt":               dt,
+        "n_samples":        n,
+        "n_returned":       int(len(t_out)),
+        "downsampled":      downsampled,
+        "duration":         gm_rec.duration,
+        "fs":               gm_rec.fs,
+        "nyquist":          gm_rec.nyquist,
+        "pga_ms2":          pga_ms2,
+        "pga_pos_ms2":      float(np.max(a_centered)),
+        "pga_neg_ms2":      float(np.min(a_centered)),
+        "t_pga":            t_pga,
+        "pgv_ms":           pgv_ms,
+        "pgd_m":            pgd_m,
+    }
 
 
 # ── Endpoint: procesar señal ──────────────────────────────────────────────────
@@ -437,6 +563,50 @@ def process_signal(
         "v_ms": vel.tolist(),
         "d_m": disp.tolist(),
     }
+
+
+# ── Endpoint: recalibración (counts → m/s²) ──────────────────────────────────
+
+@router.post("/records/{record_id}/recalibrate")
+def recalibrate_record(
+    record_id: str,
+    spec: CalibrationSpec,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Aplica calibración a los canales de aceleración de un registro ya importado.
+
+    Reescala values_si desde raw_values usando sensibilidad del sensor (counts/g)
+    o normalizando por un PGA de referencia (m/s²). Actualiza el JSON en disco,
+    invalida processed_values (el usuario reprocesa después si quiere) y refresca
+    el resumen en BD (acc_unit_original queda en 'm/s²').
+
+    Idempotente: siempre parte de raw_values, no de calibraciones anteriores.
+    """
+    record_db = _get_record_or_404(record_id, current_user.id, db)
+    gm_rec = _load_record_data(record_db)
+
+    try:
+        result = apply_calibration(
+            gm_rec,
+            mode=spec.mode,
+            sensitivity_counts_per_g=spec.sensitivity_counts_per_g,
+            pga_reference_ms2=spec.pga_reference_ms2,
+            component=spec.component,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    # Refrescar acc_unit_original si todos los canales quedaron en m/s²
+    acc_ch = gm_rec.get_acceleration_channel()
+    if acc_ch is not None:
+        record_db.acc_unit_original = acc_ch.original_unit  # se mantiene 'counts' como origen
+
+    _save_record_data(record_db, gm_rec)
+    record_db.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return result
 
 
 # ── Endpoint: intensity measures ──────────────────────────────────────────────
@@ -565,6 +735,183 @@ def spectrum_at_period_endpoint(
     acc_ms2 = acc_ch.effective_values_si()
     result  = spectrum_at_period(acc_ms2, gm_rec.dt, req.T, req.xi)
     return result
+
+
+# ── Endpoint: exportar espectros elásticos (Excel / TXT) ─────────────────────
+
+_G = 9.80665  # m/s² → g
+
+_XI_HEADER = {
+    0.02: "ξ=2%",
+    0.05: "ξ=5%",
+    0.10: "ξ=10%",
+    0.20: "ξ=20%",
+}
+
+
+def _xi_label(xi: float) -> str:
+    """Etiqueta corta para amortiguamiento; cae en genérico si no es estándar."""
+    return _XI_HEADER.get(round(xi, 4), f"ξ={xi * 100:g}%")
+
+
+def _safe_filename(name: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "registro").strip()) or "registro"
+    return stem[:80]
+
+
+def _spectrum_export_meta(record_db, gm_rec, req: "SpectrumRequest") -> list[tuple[str, Any]]:
+    return [
+        ("Registro",           record_db.name or ""),
+        ("Componente",         req.component or "default"),
+        ("Archivo origen",     record_db.source_file or ""),
+        ("dt (s)",             gm_rec.dt),
+        ("Muestras (npts)",    gm_rec.n_samples),
+        ("Duración (s)",       gm_rec.duration),
+        ("T mín (s)",          req.T_min),
+        ("T máx (s)",          req.T_max),
+        ("Puntos del espectro", req.n_points),
+        ("Amortiguamientos ξ", ", ".join(f"{xi * 100:g}%" for xi in req.xi_list)),
+        ("Método",             "Newmark-β (β = 1/4, γ = 1/2, aceleración promedio constante)"),
+        ("Unidades",           "T [s] · Sa [g] · Sd [cm] · Sv [cm/s]"),
+        ("Generado",           datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+    ]
+
+
+def _build_spectrum_xlsx(record_db, gm_rec, req: "SpectrumRequest", result: dict) -> bytes:
+    """Genera un XLSX con hojas Resumen, Sa (g), Sd (cm), Sv (cm/s)."""
+    import xlsxwriter
+
+    buf = io.BytesIO()
+    wb = xlsxwriter.Workbook(buf, {"in_memory": True})
+
+    title_fmt   = wb.add_format({"bold": True, "font_size": 14, "font_color": "#0f172a"})
+    label_fmt   = wb.add_format({"bold": True, "bg_color": "#f1f5f9", "border": 1, "border_color": "#e2e8f0"})
+    value_fmt   = wb.add_format({"border": 1, "border_color": "#e2e8f0"})
+    header_fmt  = wb.add_format({
+        "bold": True, "bg_color": "#0f172a", "font_color": "#ffffff",
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#0f172a",
+    })
+    period_fmt  = wb.add_format({"num_format": "0.000", "align": "right", "border": 1, "border_color": "#e2e8f0"})
+    number_fmt  = wb.add_format({"num_format": "0.00000", "align": "right", "border": 1, "border_color": "#e2e8f0"})
+
+    # ── Hoja Resumen ──────────────────────────────────────────────────────────
+    ws = wb.add_worksheet("Resumen")
+    ws.set_column(0, 0, 26)
+    ws.set_column(1, 1, 60)
+    ws.write(0, 0, "Espectros de respuesta elásticos", title_fmt)
+    ws.write(1, 0, "PerformanceLabs — Análisis de Movimiento del Suelo")
+    for i, (k, v) in enumerate(_spectrum_export_meta(record_db, gm_rec, req), start=3):
+        ws.write(i, 0, k, label_fmt)
+        ws.write(i, 1, v, value_fmt)
+
+    T = result["T"]
+    xi_keys = sorted(result["spectra"].keys(), key=lambda s: float(s))
+
+    def _write_sheet(sheet_name: str, key: str, factor: float, unit: str) -> None:
+        s = wb.add_worksheet(sheet_name)
+        s.set_column(0, 0, 12)
+        s.set_column(1, len(xi_keys), 16)
+        s.freeze_panes(1, 1)
+        s.write(0, 0, "T (s)", header_fmt)
+        for j, xi_str in enumerate(xi_keys, start=1):
+            xi = float(xi_str)
+            s.write(0, j, f"{key} {_xi_label(xi)} ({unit})", header_fmt)
+        for i, t_val in enumerate(T, start=1):
+            s.write_number(i, 0, float(t_val), period_fmt)
+            for j, xi_str in enumerate(xi_keys, start=1):
+                y = result["spectra"][xi_str][key][i - 1]
+                s.write_number(i, j, float(y) * factor, number_fmt)
+
+    _write_sheet("Sa (g)",    "Sa", 1.0 / _G, "g")
+    _write_sheet("Sd (cm)",   "Sd", 100.0,    "cm")
+    _write_sheet("Sv (cm-s)", "Sv", 100.0,    "cm/s")
+
+    wb.close()
+    return buf.getvalue()
+
+
+def _build_spectrum_txt(record_db, gm_rec, req: "SpectrumRequest", result: dict) -> bytes:
+    """TXT tabular único con encabezado explicativo y columnas Sa/Sd/Sv por ξ."""
+    T = result["T"]
+    xi_keys = sorted(result["spectra"].keys(), key=lambda s: float(s))
+    xi_labels = [_xi_label(float(k)) for k in xi_keys]
+
+    lines: list[str] = []
+    lines.append("# Espectros de respuesta elásticos — PerformanceLabs")
+    for k, v in _spectrum_export_meta(record_db, gm_rec, req):
+        lines.append(f"# {k}: {v}")
+    lines.append("#")
+    lines.append("# Columnas (separadas por espacios):")
+    header = ["T(s)"]
+    for lbl in xi_labels:
+        header.append(f"Sa_{lbl}(g)")
+    for lbl in xi_labels:
+        header.append(f"Sd_{lbl}(cm)")
+    for lbl in xi_labels:
+        header.append(f"Sv_{lbl}(cm/s)")
+    lines.append("#   " + "  ".join(f"{h:>14s}" for h in header))
+
+    for i, t_val in enumerate(T):
+        row = [f"{float(t_val):14.6f}"]
+        for xi_str in xi_keys:
+            row.append(f"{float(result['spectra'][xi_str]['Sa'][i]) / _G:14.6f}")
+        for xi_str in xi_keys:
+            row.append(f"{float(result['spectra'][xi_str]['Sd'][i]) * 100.0:14.6f}")
+        for xi_str in xi_keys:
+            row.append(f"{float(result['spectra'][xi_str]['Sv'][i]) * 100.0:14.6f}")
+        lines.append("    " + "  ".join(row))
+
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+@router.post("/records/{record_id}/spectrum/export")
+def export_spectrum_endpoint(
+    record_id: str,
+    req: "SpectrumRequest",
+    format: str = "xlsx",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Exporta los espectros elásticos Sa, Sd, Sv a Excel (.xlsx) o TXT.
+
+    Recalcula multi-ξ con los mismos parámetros del panel y arma el archivo
+    en memoria. Sa se entrega en g, Sd en cm, Sv en cm/s.
+    """
+    fmt = (format or "xlsx").lower()
+    if fmt not in ("xlsx", "txt"):
+        raise HTTPException(400, "Formato inválido. Usa 'xlsx' o 'txt'.")
+
+    record_db = _get_record_or_404(record_id, current_user.id, db)
+    gm_rec    = _load_record_data(record_db)
+
+    acc_ch = gm_rec.get_acceleration_channel(req.component)
+    if acc_ch is None:
+        raise HTTPException(404, "Canal de aceleración no encontrado.")
+
+    acc_ms2 = acc_ch.effective_values_si()
+    T_array = default_period_array(req.T_min, req.T_max, req.n_points)
+    # Forzamos multi-ξ para incluir todos los amortiguamientos que muestra el panel.
+    result = response_spectrum_multi_xi(acc_ms2, gm_rec.dt, T_array, req.xi_list)
+
+    stem = _safe_filename(record_db.name)
+    comp = f"_{_safe_filename(req.component)}" if req.component else ""
+
+    if fmt == "xlsx":
+        data = _build_spectrum_xlsx(record_db, gm_rec, req, result)
+        filename = f"{stem}{comp}_espectros.xlsx"
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    data = _build_spectrum_txt(record_db, gm_rec, req, result)
+    filename = f"{stem}{comp}_espectros.txt"
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ── Endpoint: espectro de respuesta inelástica ───────────────────────────────

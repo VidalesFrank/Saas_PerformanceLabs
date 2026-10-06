@@ -169,10 +169,47 @@ class SpectralAnalyzer:
                 continue
             M_walls += t * width * hwall * GAMMA_kN_m3 / G_m_s2   # tonnes
 
-        M_total = M_slab + M_walls
+        # Masa de columnas y vigas (autopeso de frames). ETABS puede o no incluir
+        # el peso propio del concreto de frames en la tabla "Mass Summary" según el
+        # Mass Source. Para evitar underestimation (edificios de pórticos puros
+        # llegaban a W = 50% del valor real), lo añadimos explícitamente.
+        frames_dict = self._model.get("frames", {})
+        sections_dict = self._model.get("sections", {})
+        M_cols = 0.0
+        M_beams = 0.0
+        for fid, fd in frames_dict.items():
+            sec_name = fd.get("section")
+            if not sec_name:
+                continue
+            sec = sections_dict.get(sec_name, {})
+            A_m2 = float(sec.get("A_m2", 0.0))
+            if A_m2 <= 0:
+                b = float(sec.get("b_m", 0.0)); h = float(sec.get("h_m", 0.0))
+                A_m2 = b * h
+            if A_m2 <= 1e-6:
+                continue
+            ji = joints_dict.get(str(fd.get("joint_i", "")), {})
+            jj = joints_dict.get(str(fd.get("joint_j", "")), {})
+            dx = float(jj.get("x", 0.0)) - float(ji.get("x", 0.0))
+            dy = float(jj.get("y", 0.0)) - float(ji.get("y", 0.0))
+            dz = float(jj.get("z", 0.0)) - float(ji.get("z", 0.0))
+            L  = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if L < 1e-6:
+                continue
+            m = L * A_m2 * GAMMA_kN_m3 / G_m_s2  # tonnes
+            if fd.get("element_type") == "column":
+                M_cols += m
+            else:
+                M_beams += m
+
+        M_total = M_slab + M_walls + M_cols + M_beams
         W_total = M_total * G_m_s2  # kN
 
-        print(f"[spectral] M_slab={M_slab:.2f}t  M_walls={M_walls:.2f}t  W_total={W_total:.1f}kN")
+        print(
+            f"[spectral] M_slab={M_slab:.2f}t  M_walls={M_walls:.2f}t  "
+            f"M_cols={M_cols:.2f}t  M_beams={M_beams:.2f}t  "
+            f"M_total={M_total:.2f}t  W_total={W_total:.1f}kN"
+        )
 
         # ── 4. Formas modales en nodos CM ──────────────────────────────────────
         # shape_x[j, i] = componente X de la forma modal del modo i en el piso j
@@ -212,8 +249,21 @@ class SpectralAnalyzer:
             Vb_modal_x_elastic[i] = ux_pct * W_total * Sa_el
             Vb_modal_y_elastic[i] = uy_pct * W_total * Sa_el
 
-        print(f"[spectral] T1x={periods[0]:.4f}s  Ux1={modes_table[0].get('Ux_pct',0):.1f}%  "
-              f"Vb1x_diseno={Vb_modal_x[0]:.1f}kN  Vb1x_deriva={Vb_modal_x_elastic[0]:.1f}kN")
+        T1 = periods[0]
+        Sa1_el = _sa_at_period(T1, puntos)
+        print(
+            f"[spectral] NSR-10: Aa={Aa:.3f}  Av={Av:.3f}  suelo={soil_type}  "
+            f"R={R:.2f}  I={I:.2f}  xi={xi:.3f}"
+        )
+        print(
+            f"[spectral] T1={T1:.4f}s  Sa_elastico={Sa1_el:.4f}g  "
+            f"Sa_diseno=Sa_el*I/R={Sa1_el*I/R:.4f}g"
+        )
+        print(
+            f"[spectral] Ux1={modes_table[0].get('Ux_pct',0):.1f}%  "
+            f"Uy1={modes_table[0].get('Uy_pct',0):.1f}%  "
+            f"Vb1x_diseno={Vb_modal_x[0]:.1f}kN  Vb1x_elastico={Vb_modal_x_elastic[0]:.1f}kN"
+        )
 
         # ── 6. Fuerzas por piso y modo ─────────────────────────────────────────
         masses_x = np.array([story_masses[s]["mass_x"] for s in ordered_stories])

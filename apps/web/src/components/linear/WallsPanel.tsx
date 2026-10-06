@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useEffect, useCallback } from "react";
 import type {
   WallListItem,
@@ -8,9 +9,10 @@ import type {
   WallFormulation,
   WallAnalyticalModel,
   BulkAssignResponse,
+  WallDetailResponse,
 } from "@/lib/wall-types";
 import { WALL_FORMULATIONS } from "@/lib/wall-types";
-import { fetchWalls, fetchWallHealth, bulkAssignFormulation, fetchWall } from "@/lib/wall-api";
+import { fetchWalls, fetchWallHealth, bulkAssignFormulation, fetchWallDetail } from "@/lib/wall-api";
 import WallAnalyticalPanel from "./WallAnalyticalPanel";
 
 interface Props {
@@ -52,6 +54,7 @@ export default function WallsPanel({ projectId, materials, steelTypes }: Props) 
   const [selected, setSelected]   = useState<WallListItem | null>(null);
   const [detailShell, setDetailShell] = useState<Record<string, unknown> | null>(null);
   const [detailModel, setDetailModel] = useState<WallAnalyticalModel | null>(null);
+  const [detailFull, setDetailFull]   = useState<WallDetailResponse | null>(null);
   const [view, setView]           = useState<ViewMode>("list");
   const [openingLabel, setOpeningLabel] = useState<string | null>(null);
 
@@ -89,10 +92,11 @@ export default function WallsPanel({ projectId, materials, steelTypes }: Props) 
     setOpeningLabel(wall.label);
     setError(null);
     try {
-      const detail = await fetchWall(projectId, wall.label);
+      const detail = await fetchWallDetail(projectId, wall.label);
       setSelected(wall);
       setDetailShell(detail.shell as Record<string, unknown>);
       setDetailModel(detail.analytical);
+      setDetailFull(detail);
       setView("detail");
     } catch (err) {
       setError(`Failed to load wall "${wall.label}": ${String(err)}`);
@@ -164,6 +168,7 @@ export default function WallsPanel({ projectId, materials, steelTypes }: Props) 
             projectId={projectId}
             wallLabel={selected.label}
             wallShell={detailShell}
+            wallDetail={detailFull}
             initial={detailModel}
             materials={materials}
             steelTypes={steelTypes}
@@ -362,13 +367,24 @@ export default function WallsPanel({ projectId, materials, steelTypes }: Props) 
                       </span>
                     </td>
                     <td className="px-3 py-2">
-                      <button
-                        onClick={() => openWall(wall)}
-                        disabled={openingLabel === wall.label}
-                        className="text-[var(--primary)] hover:underline text-xs disabled:opacity-50 whitespace-nowrap"
-                      >
-                        {openingLabel === wall.label ? "Loading…" : "Configure →"}
-                      </button>
+                      <div className="flex items-center gap-3 whitespace-nowrap">
+                        <button
+                          onClick={() => openWall(wall)}
+                          disabled={openingLabel === wall.label}
+                          className="text-[var(--primary)] hover:underline text-xs disabled:opacity-50"
+                        >
+                          {openingLabel === wall.label ? "Loading…" : "Configure →"}
+                        </button>
+                        {wall.has_analytical && (
+                          <Link
+                            href={`/projects/${projectId}/walls/${encodeURIComponent(wall.label)}`}
+                            className="text-[var(--text-secondary)] hover:text-[var(--primary)] hover:underline text-xs"
+                            title="Ver detalle premium de la sección"
+                          >
+                            Ver detalle
+                          </Link>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 );

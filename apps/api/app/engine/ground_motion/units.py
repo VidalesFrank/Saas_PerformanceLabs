@@ -28,6 +28,13 @@ ACC_TO_MS2: dict[str, float] = {
     "in/s²":  0.0254,
 }
 
+# Unidad especial: 'counts' significa que los valores son salidas crudas del ADC
+# (típicas de miniSEED int32 sin respuesta instrumental aplicada). No hay factor
+# de conversión intrínseco — requiere calibración explícita (sensibilidad del
+# sensor o normalización por PGA conocido). El importador conserva los counts
+# sin multiplicar por G_STD; el usuario aplica la calibración después.
+COUNTS_UNIT = "counts"
+
 # Unidades de velocidad → m/s
 VEL_TO_MS: dict[str, float] = {
     "m/s":   1.0,

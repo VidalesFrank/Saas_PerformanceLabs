@@ -71,26 +71,36 @@ def is_demand_inside(
 ) -> bool:
     """
     Verifica si el punto de demanda (Pu, Mu) queda dentro del diagrama φPn-φMn.
-    Usa interpolación lineal segmentada de la envolvente.
+
+    El diagrama es una curva CERRADA generada por barrido de `c`: comienza en
+    tensión pura (M=0, P<0), sube hasta el balance (M máximo) y baja hasta
+    compresión pura (M=0, P>0). Para un `Pu` dado, hay varios segmentos que
+    lo cruzan; el `M_cap` es el MÁXIMO M interpolado sobre esos segmentos.
+
+    Ordenar los puntos por P y luego interpolar es incorrecto: mezcla puntos
+    de la rama superior con los ceros de tensión/compresión pura y subestima
+    la capacidad, forzando al auto-diseño a escalar refuerzo innecesariamente.
     """
-    # Para cada nivel P, busca el Mn máximo en la envolvente reducida
-    pts = list(zip(diagram.phiPn_kN, diagram.phiMn_kNm))
-    # Ordena por P (de menor a mayor)
-    pts.sort(key=lambda p: p[0])
-
-    # Busca el momento máximo a nivel Pu por interpolación
-    phi_P_vals = [p[0] for p in pts]
-    phi_M_vals = [p[1] for p in pts]
-
-    if Pu_kN < phi_P_vals[0] or Pu_kN > phi_P_vals[-1]:
+    Pn_list = list(diagram.phiPn_kN)
+    Mn_list = list(diagram.phiMn_kNm)
+    n = len(Pn_list)
+    if n < 2:
         return False
 
-    # Interpolación lineal
-    for i in range(len(pts) - 1):
-        P0, M0 = pts[i]
-        P1, M1 = pts[i + 1]
-        if P0 <= Pu_kN <= P1:
-            t = (Pu_kN - P0) / (P1 - P0) if P1 != P0 else 0.0
-            M_cap = M0 + t * (M1 - M0)
-            return Mu_kNm <= M_cap
-    return False
+    M_cap = -1.0
+    for i in range(n - 1):
+        P0, M0 = Pn_list[i], Mn_list[i]
+        P1, M1 = Pn_list[i + 1], Mn_list[i + 1]
+        lo, hi = (P0, P1) if P0 <= P1 else (P1, P0)
+        if lo <= Pu_kN <= hi:
+            if P1 == P0:
+                M_at = max(M0, M1)
+            else:
+                t = (Pu_kN - P0) / (P1 - P0)
+                M_at = M0 + t * (M1 - M0)
+            if M_at > M_cap:
+                M_cap = M_at
+
+    if M_cap < 0:
+        return False
+    return Mu_kNm <= M_cap

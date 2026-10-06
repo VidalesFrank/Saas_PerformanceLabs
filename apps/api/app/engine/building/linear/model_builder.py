@@ -32,6 +32,7 @@ _K_SH_SLAB    = 'TABLE:  "SHELL SECTIONS - SLAB"'
 _K_SH_WALL    = 'TABLE:  "SHELL SECTIONS - WALL"'
 _K_SH_LOADS   = 'TABLE:  "SHELL LOADS - UNIFORM"'
 _K_MASS       = 'TABLE:  "MASS SUMMARY BY DIAPHRAGM"'
+_K_GRID       = 'TABLE:  "GRID DEFINITIONS"'
 
 
 def _to_float(val, default: float = 0.0) -> float:
@@ -155,6 +156,7 @@ class CanonicalModelBuilder:
         # incorrectly include wall/column mass that ETABS explicitly excludes.
         load_patterns = self._extract_load_patterns()
         shell_loads   = self._build_shell_loads()
+        grid          = self._build_grid(stories)
 
         total_h = 0.0
         if stories:
@@ -183,6 +185,7 @@ class CanonicalModelBuilder:
             "shells":     shells,
             "shell_loads": shell_loads,
             "masses":     masses,
+            "grid":       grid,
             "analysis_results": {
                 "modal":    None,
                 "spectral": None,
@@ -700,6 +703,57 @@ class CanonicalModelBuilder:
         print(f"[model_builder] Peso propio sumado: {sum(added.values()):.1f} t total "
               f"({sum(added.values())/max(len(added),1):.1f} t/piso promedio)")
         return masses
+
+    # ── Grid de ejes ─────────────────────────────────────────────────────────
+
+    def _build_grid(self, stories: dict) -> dict:
+        """
+        Construye el bloque grid del canonical desde 'Grid Definitions' (adapter).
+
+        Estructura:
+            {
+              "axes_x": [{"name": "A", "coord_m": 0.0}, ...],
+              "axes_y": [{"name": "3", "coord_m": 0.0}, ...],
+              "stories": [{"name": "Base", "height_m": 0.0}, ...]   # base → cubierta
+            }
+
+        Los stories se derivan del dict interno (ya en orden ascendente de
+        elevation_m) para que el GridEditor tenga contexto de pisos sin doble
+        edición. Si no hay tabla de grid, se retorna {} (queda vacío y el
+        usuario define el grid manualmente en el editor).
+        """
+        df = self._rd.get(_K_GRID)
+        stories_list = [
+            {"name": name, "height_m": data.get("height_m", 0.0)}
+            for name, data in sorted(stories.items(), key=lambda kv: kv[1]["elevation_m"])
+        ]
+
+        if not isinstance(df, pd.DataFrame) or len(df) == 0:
+            if stories_list:
+                return {"axes_x": [], "axes_y": [], "stories": stories_list}
+            return {}
+
+        axes_x: dict[str, float] = {}
+        axes_y: dict[str, float] = {}
+        for _, row in df.iterrows():
+            axis  = _safe_str(row.get("Axis", "")).upper()
+            label = _safe_str(row.get("Label", ""))
+            coord = _to_float(row.get("Coord_m"))
+            if not label or axis not in ("X", "Y"):
+                continue
+            (axes_x if axis == "X" else axes_y)[label] = round(coord, 4)
+
+        def _sorted(d: dict[str, float]) -> list[dict]:
+            return [
+                {"name": name, "coord_m": coord}
+                for name, coord in sorted(d.items(), key=lambda kv: (kv[1], kv[0]))
+            ]
+
+        return {
+            "axes_x":  _sorted(axes_x),
+            "axes_y":  _sorted(axes_y),
+            "stories": stories_list,
+        }
 
     # ── Patrones de carga ────────────────────────────────────────────────────
 

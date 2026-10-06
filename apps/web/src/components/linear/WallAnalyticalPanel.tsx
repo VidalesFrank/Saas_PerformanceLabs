@@ -8,6 +8,7 @@ import type {
   AutoDiscretizeRequest,
   BoundaryZoneIn,
   WebZoneIn,
+  WallDetailResponse,
 } from "@/lib/wall-types";
 import {
   autoDiscretize,
@@ -20,15 +21,25 @@ import WallFormulationSelector from "./WallFormulationSelector";
 import MacrofiberPreview from "./MacrofiberPreview";
 import MacrofiberDetailPanel from "./MacrofiberDetailPanel";
 
+// Diámetro (mm) → notación comercial. Catálogo colombiano = #2 a #10 (sin #9, #11).
+const BAR_MAP: ReadonlyArray<[number, string]> = [
+  [6.4,"#2"],[9.5,"#3"],[12.7,"#4"],[15.9,"#5"],[19.1,"#6"],[22.2,"#7"],[25.4,"#8"],[32.3,"#10"],
+];
+function barNameShort(db_mm: number): string {
+  const hit = BAR_MAP.find(([d]) => Math.abs(d - db_mm) <= 0.5);
+  return hit ? hit[1] : `⌀${db_mm.toFixed(1)}`;
+}
+
 interface Props {
-  projectId:  string;
-  wallLabel:  string;
-  wallShell:  Record<string, unknown>;
-  initial?:   WallAnalyticalModel | null;
-  materials:  string[];
-  steelTypes: string[];
-  onSaved?:   (model: WallAnalyticalModel) => void;
-  onDeleted?: () => void;
+  projectId:   string;
+  wallLabel:   string;
+  wallShell:   Record<string, unknown>;
+  wallDetail?: WallDetailResponse | null;
+  initial?:    WallAnalyticalModel | null;
+  materials:   string[];
+  steelTypes:  string[];
+  onSaved?:    (model: WallAnalyticalModel) => void;
+  onDeleted?:  () => void;
 }
 
 type Tab = "formulation" | "discretization" | "parameters" | "validate" | "preview";
@@ -41,7 +52,7 @@ function wallLengthFromShell(shell: Record<string, unknown>): number {
 }
 
 export default function WallAnalyticalPanel({
-  projectId, wallLabel, wallShell, initial,
+  projectId, wallLabel, wallShell, wallDetail, initial,
   materials, steelTypes, onSaved, onDeleted,
 }: Props) {
   const [tab, setTab]           = useState<Tab>("formulation");
@@ -62,8 +73,24 @@ export default function WallAnalyticalPanel({
     setTimeout(() => setSuccessMsg(null), 2500);
   };
 
-  const wallThickness = (wallShell.thickness_m as number) ?? 0.20;
-  const wallLength    = wallLengthFromShell(wallShell);
+  // ── Auto-populate priority: wallDetail (physical + design) > wallShell ───
+  const pg  = wallDetail?.physical_geom;
+  const dr  = wallDetail?.design_result;
+  const drR = dr?.reinforcement;
+
+  const wallThickness = pg?.tw_m ?? (wallShell.thickness_m as number) ?? 0.20;
+  const wallLength    = pg?.lw_m ?? wallLengthFromShell(wallShell);
+
+  // Boundaries from design (if any)
+  const beL_m = drR?.be_left?.length_m ?? 0;
+  const beR_m = drR?.be_right?.length_m ?? 0;
+  const hasDesignBoundaries = beL_m > 0 || beR_m > 0;
+
+  // Rebar ratios from design (as fractions, not %)
+  const initWebRhoV  = dr?.shear?.rho_v_prov ?? 0.0035;
+  const initWebRhoH  = dr?.shear?.rho_t_prov ?? 0.004;
+  const initBeRhoV_L = drR ? (drR.be_left.As_mm2  / (drR.be_left.length_m  * wallThickness * 1e6)) : 0.022;
+  const initBeRhoV_R = drR ? (drR.be_right.As_mm2 / (drR.be_right.length_m * wallThickness * 1e6)) : 0.022;
 
   const [autoForm, setAutoForm] = useState<AutoDiscretizeRequest>({
     wall_length_m:    wallLength,
@@ -77,21 +104,23 @@ export default function WallAnalyticalPanel({
     c_rot: 0.4, thick_mod: 0.63, poisson: 0.25, density_t_m3: 2.4,
     web: {
       thickness_m:    wallThickness,
-      rho_vertical:   0.0035,
-      rho_horizontal: 0.004,
+      rho_vertical:   initWebRhoV,
+      rho_horizontal: initWebRhoH,
       concrete_name:  materials[0] ?? "",
       steel_v_name:   steelTypes[0] ?? "",
       steel_h_name:   steelTypes[0] ?? "",
     },
   });
 
-  const [hasBoundaries, setHasBoundaries] = useState(false);
+  const [hasBoundaries, setHasBoundaries] = useState(hasDesignBoundaries);
   const [leftBoundary, setLeftBoundary] = useState<BoundaryZoneIn>({
-    width_m: 0.3, rho_vertical: 0.022,
+    width_m: beL_m > 0 ? beL_m : 0.3,
+    rho_vertical: initBeRhoV_L,
     concrete_name: materials[0] ?? "", steel_v_name: steelTypes[0] ?? "",
   });
   const [rightBoundary, setRightBoundary] = useState<BoundaryZoneIn>({
-    width_m: 0.3, rho_vertical: 0.022,
+    width_m: beR_m > 0 ? beR_m : 0.3,
+    rho_vertical: initBeRhoV_R,
     concrete_name: materials[0] ?? "", steel_v_name: steelTypes[0] ?? "",
   });
 
@@ -278,6 +307,23 @@ export default function WallAnalyticalPanel({
         {/* ── FORMULATION ─────────────────────────────────────────────────────── */}
         {tab === "formulation" && (
           <div className="space-y-5">
+            {(pg || dr) && (
+              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-[11px] space-y-0.5">
+                <div className="flex items-center gap-2 text-emerald-500 font-semibold">
+                  <span>✓</span>
+                  <span>Datos precargados del modelo{dr ? " + auto-diseño" : ""}</span>
+                </div>
+                <div className="text-[var(--text-muted)]">
+                  {pg && (
+                    <>Pier <span className="font-mono">{pg.pier}</span> · Story <span className="font-mono">{pg.story}</span> · lw={pg.lw_m.toFixed(3)}m · tw={pg.tw_m.toFixed(3)}m · hw={pg.hw_m.toFixed(3)}m · fc={pg.fc_mpa.toFixed(1)}MPa</>
+                  )}
+                  {dr && (dr.reinforcement.be_left.n_bars > 0
+                    ? <> · Refuerzo NSR-10 {dr.ductility}: BE {(dr.reinforcement.be_left.length_m * 1000).toFixed(0)}/{(dr.reinforcement.be_right.length_m * 1000).toFixed(0)}mm, {dr.reinforcement.be_left.n_bars}{barNameShort(dr.reinforcement.be_left.db_mm)}</>
+                    : <> · Refuerzo NSR-10 {dr.ductility}: distribuido (sin EBE)</>)}
+                </div>
+              </div>
+            )}
+
             <WallFormulationSelector
               value={formulation}
               onChange={(f) => {
@@ -290,7 +336,7 @@ export default function WallAnalyticalPanel({
             <div className="grid grid-cols-2 gap-3">
               <Field
                 label="Wall Length (m)"
-                hint={wallLength > 0 ? `ETABS: ${wallLength.toFixed(3)} m` : "Enter manually"}
+                hint={pg ? `Modelo: ${pg.lw_m.toFixed(3)} m (pier ${pg.pier})` : wallLength > 0 ? `ETABS: ${wallLength.toFixed(3)} m` : "Enter manually"}
               >
                 <input
                   type="number" step="0.01" min="0.01"
@@ -301,7 +347,7 @@ export default function WallAnalyticalPanel({
               </Field>
               <Field
                 label="Wall Thickness (m)"
-                hint={wallThickness > 0 ? `ETABS: ${wallThickness.toFixed(3)} m` : undefined}
+                hint={pg ? `Modelo: ${pg.tw_m.toFixed(3)} m` : wallThickness > 0 ? `ETABS: ${wallThickness.toFixed(3)} m` : undefined}
               >
                 <input
                   type="number" step="0.005" min="0.05"

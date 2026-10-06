@@ -22,12 +22,18 @@ import BeamDetailPanel from "@/components/linear/BeamDetailPanel";
 import WallsPanel from "@/components/linear/WallsPanel";
 import WallDemandsPanel from "@/components/linear/WallDemandsPanel";
 import WallDesignPanel    from "@/components/linear/WallDesignPanel";
-import NLPushoverPanel   from "@/components/linear/NLPushoverPanel";
+import NLPushoverPanel      from "@/components/linear/NLPushoverPanel";
+import NLFramePushoverPanel from "@/components/linear/NLFramePushoverPanel";
 import ModelMaterialsPanel from "@/components/linear/ModelMaterialsPanel";
 import ModelSectionsPanel from "@/components/linear/ModelSectionsPanel";
+import GridEditor from "@/components/linear/GridEditor";
+import MasonryMaterialsPanel from "@/components/linear/MasonryMaterialsPanel";
+import InfillsSplitView from "@/components/linear/InfillsSplitView";
 import { NonlinearSpecPanel } from "@/components/linear/NonlinearSpecPanel";
 import { ApiError } from "@/lib/api";
 import { structuralProjectsApi, structuralAnalysisApi, structuralDesignApi, structuralEditorApi } from "@/lib/structural-api";
+import { autoDesignAllWalls, designAndBuildAllWalls } from "@/lib/wall-api";
+import type { AutoDesignAllResponse, DesignAndBuildAllResponse } from "@/lib/wall-types";
 import type {
   StructuralProject,
   StructuralJob,
@@ -59,10 +65,14 @@ type SectionId =
   | "materiales"
   | "secciones"
   | "muros"
+  | "grid"
+  | "mamposteria"
+  | "infills"
   | "sismico"
   | "wall-demands"
   | "wall-design"
   | "nl-pushover"
+  | "frame-pushover"
   | "diseno"
   | "no-lineal";
 
@@ -90,33 +100,37 @@ function buildNav(hasSpectral: boolean, isValidated: boolean): NavGroup[] {
     {
       groupLabel: "Definir",
       items: [
-        { id: "materiales", label: "Materiales", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
-        { id: "secciones",  label: "Secciones",  locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "materiales",  label: "Materiales", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "secciones",   label: "Secciones",  locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "grid",        label: "Grid del edificio" },
+        { id: "mamposteria", label: "Mampostería",           locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "infills",     label: "Infills (paneles mamp.)", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
       ],
     },
     {
-      groupLabel: "Asignar",
+      groupLabel: "Análisis de fuerzas",
       items: [
-        { id: "muros", label: "Muros", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
-      ],
-    },
-    {
-      groupLabel: "Análisis",
-      items: [
-        { id: "sismico", label: "Sísmico + Modal + Espectral", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
-        { id: "wall-demands",  label: "Demandas Muros",          locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
-        { id: "wall-design",   label: "Diseño Muros RC",          locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
-        { id: "nl-pushover",   label: "Pushover No Lineal",       locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "sismico",      label: "Sísmico + Modal + Espectral", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "wall-demands", label: "Demandas Muros",              locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
       ],
     },
     {
       groupLabel: "Diseño",
       items: [
-        { id: "diseno", label: "Columnas + Vigas", locked: !hasSpectral, lockReason: !hasSpectral ? "Requiere análisis espectral" : undefined },
+        { id: "wall-design", label: "Diseño Muros RC",   locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "diseno",      label: "Columnas + Vigas",  locked: !hasSpectral, lockReason: !hasSpectral ? "Requiere análisis espectral" : undefined },
       ],
     },
     {
-      groupLabel: "No Lineal",
+      groupLabel: "Modelo no lineal",
+      items: [
+        { id: "muros",          label: "Asignar Muros (MVLEM_3D)",    locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "nl-pushover",    label: "Pushover No Lineal (Muros)",  locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "frame-pushover", label: "Pushover No Lineal (Pórticos)",locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+      ],
+    },
+    {
+      groupLabel: "Exportar",
       items: [
         { id: "no-lineal", label: "Exportar a Módulo 3", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
       ],
@@ -196,6 +210,20 @@ export default function StructuralProjectPage() {
   // Estado de lanzamiento de job
   const [launching, setLaunching] = useState<string | null>(null);
 
+  // Auto-diseño integrado (endpoint síncrono para vista premium por muro)
+  const [autoDesignBusy, setAutoDesignBusy]     = useState(false);
+  const [autoDesignResult, setAutoDesignResult] = useState<AutoDesignAllResponse | null>(null);
+  const [autoDesignError, setAutoDesignError]   = useState<string | null>(null);
+
+  // Diseño instantáneo completo (Fase B — diseña + arma MVLEM en un solo paso)
+  const [instantBusy, setInstantBusy]     = useState(false);
+  const [instantResult, setInstantResult] = useState<DesignAndBuildAllResponse | null>(null);
+  const [instantError, setInstantError]   = useState<string | null>(null);
+  const [instantWidthMax, setInstantWidthMax] = useState(0.30);
+  const [instantDuctility, setInstantDuctility] = useState<"DES" | "DMO">("DES");
+  const [instantFormulation, setInstantFormulation] =
+    useState<"MVLEM_3D" | "SFI_MVLEM_3D" | "E_SFI_MVLEM_3D">("E_SFI_MVLEM_3D");
+
   // Resultado de validación cargado
   const [validationResult, setValidationResult]     = useState<ValidationResult | null>(null);
   const [loadingValidation, setLoadingValidation]   = useState(false);
@@ -237,7 +265,8 @@ export default function StructuralProjectPage() {
 
   // Carga lazy de fullModelData: Muros, Materiales y Secciones lo necesitan
   useEffect(() => {
-    const needsModel = activeSection === "muros" || activeSection === "materiales" || activeSection === "secciones";
+    const needsModel = activeSection === "muros" || activeSection === "materiales" || activeSection === "secciones"
+      || activeSection === "grid" || activeSection === "mamposteria" || activeSection === "infills";
     if (needsModel && !fullModelData && project?.canonical_model_path) {
       structuralEditorApi.modelData(project.id).then(setFullModelData).catch(() => {});
     }
@@ -247,6 +276,20 @@ export default function StructuralProjectPage() {
     if (project) {
       structuralEditorApi.modelData(project.id).then(setFullModelData).catch(() => {});
     }
+  }
+
+  // Handler unificado para cambios de modelo desde el dibujo 2D: refresca
+  // tanto la geometría (para el visor) como el modelData completo.
+  async function handleDrawnChange() {
+    if (!project) return;
+    try {
+      const [geo, model] = await Promise.all([
+        structuralProjectsApi.modelGeometry(project.id),
+        structuralEditorApi.modelData(project.id),
+      ]);
+      setModelGeometry(geo);
+      setFullModelData(model);
+    } catch { /* silencioso */ }
   }
 
   // Polling ref
@@ -711,7 +754,7 @@ export default function StructuralProjectPage() {
 
         {/* MAIN CONTENT */}
         <main className={
-          activeSection === "vista-3d" && isEditorMode
+          (activeSection === "vista-3d" && isEditorMode) || activeSection === "infills"
             ? "flex-1 min-h-0 overflow-hidden flex flex-col"
             : "flex-1 overflow-y-auto"
         }>
@@ -1008,9 +1051,12 @@ export default function StructuralProjectPage() {
                       <ModelViewSwitcher
                         geometry={modelGeometry}
                         sections={fullModelData?.sections}
+                        grid={fullModelData?.grid}
+                        masonryMaterials={fullModelData?.masonryMaterials}
+                        infills={fullModelData?.infills}
+                        projectId={project?.id}
+                        onModelChanged={handleDrawnChange}
                         onSwitchTo2D={() => {
-                          // Lazy-load: la vista 2D quiere dimensiones reales
-                          // de columnas/vigas. Si aún no está cargado, dispara.
                           if (!fullModelData && project?.canonical_model_path) {
                             structuralEditorApi.modelData(project.id).then(setFullModelData).catch(() => {});
                           }
@@ -1519,6 +1565,54 @@ export default function StructuralProjectPage() {
             </div>
           )}
 
+          {/* ── Grid del edificio ─────────────────────────────────────────────── */}
+          {activeSection === "grid" && project && (
+            <div className="mx-auto max-w-4xl px-6 py-8 flex flex-col gap-4">
+              <div>
+                <h1 className="text-xl font-semibold text-[var(--text)]">Grid del edificio</h1>
+                <p className="text-sm text-[var(--text-muted)] mt-1">
+                  Define ejes X, Y y pisos. Se usan como snap para dibujar directamente en las vistas 2D y de elevación.
+                </p>
+              </div>
+              <GridEditor
+                projectId={project.id}
+                initial={fullModelData?.grid}
+                onSaved={handleDrawnChange}
+              />
+            </div>
+          )}
+
+          {/* ── Materiales de mampostería ─────────────────────────────────────── */}
+          {activeSection === "mamposteria" && project && (
+            <div className="mx-auto max-w-4xl px-6 py-8 flex flex-col gap-4">
+              <div>
+                <h1 className="text-xl font-semibold text-[var(--text)]">Mampostería</h1>
+                <p className="text-sm text-[var(--text-muted)] mt-1">
+                  Biblioteca de materiales de mampostería (fm, Em, tipo VP/HP/custom). Se usan para los infills.
+                </p>
+              </div>
+              {fullModelData ? (
+                <MasonryMaterialsPanel
+                  projectId={project.id}
+                  materials={fullModelData.masonryMaterials ?? {}}
+                  onChange={handleDrawnChange}
+                />
+              ) : (
+                <p className="text-sm text-[var(--text-muted)] animate-pulse">Cargando modelo...</p>
+              )}
+            </div>
+          )}
+
+          {/* ── Infills ──────────────────────────────────────────────────────── */}
+          {activeSection === "infills" && project && (
+            <InfillsSplitView
+              projectId={project.id}
+              fullModelData={fullModelData}
+              modelGeometry={modelGeometry}
+              onChange={handleDrawnChange}
+            />
+          )}
+
           {/* ── Muros ────────────────────────────────────────────────────────── */}
           {activeSection === "muros" && (
             <div className="flex flex-col gap-0 h-full" style={{ minHeight: "500px" }}>
@@ -1599,6 +1693,149 @@ export default function StructuralProjectPage() {
                 </p>
               </div>
 
+              {/* ─── HERO: Diseño Instantáneo Completo (Fase B) ─── */}
+              <div
+                className="rounded-xl border p-6 space-y-4"
+                style={{
+                  background: "linear-gradient(135deg, rgba(59,125,216,.08), rgba(74,158,92,.08))",
+                  borderColor: "rgba(59,125,216,.30)",
+                }}
+              >
+                <div className="flex items-start justify-between flex-wrap gap-3">
+                  <div>
+                    <div className="text-[10.5px] font-bold uppercase tracking-[.1em] text-[var(--text-muted)]">
+                      ⚡ Pipeline instantáneo
+                    </div>
+                    <h2 className="mt-0.5 text-lg font-semibold text-[var(--text)]">
+                      Diseño instantáneo completo
+                    </h2>
+                    <p className="mt-1 text-xs text-[var(--text-muted)] max-w-xl">
+                      En un solo paso: diseña refuerzo NSR-10 (BE + web + confinamiento) para todos los muros
+                      con demandas y arma el modelo MVLEM_3D no lineal con las macrofibras del refuerzo
+                      real (cuantías correctas, boundaries confinados). Todo listo para pushover.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  <label className="text-[11px]">
+                    <span className="text-[var(--text-muted)]">Ductilidad</span>
+                    <select
+                      value={instantDuctility}
+                      onChange={e => setInstantDuctility(e.target.value as "DES" | "DMO")}
+                      className="mt-0.5 w-full rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs"
+                    >
+                      <option value="DES">DES · Especial</option>
+                      <option value="DMO">DMO · Moderada</option>
+                    </select>
+                  </label>
+                  <label className="text-[11px]">
+                    <span className="text-[var(--text-muted)]">Ancho máx macrofibra (m)</span>
+                    <input
+                      type="number"
+                      step="0.05" min="0.10" max="1.0"
+                      value={instantWidthMax}
+                      onChange={e => setInstantWidthMax(parseFloat(e.target.value) || 0.30)}
+                      className="mt-0.5 w-full rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 font-mono text-xs"
+                    />
+                  </label>
+                  <label className="text-[11px]">
+                    <span className="text-[var(--text-muted)]">Formulación</span>
+                    <select
+                      value={instantFormulation}
+                      onChange={e => setInstantFormulation(
+                        e.target.value as "MVLEM_3D" | "SFI_MVLEM_3D" | "E_SFI_MVLEM_3D"
+                      )}
+                      className="mt-0.5 w-full rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 font-mono text-xs"
+                    >
+                      <option value="E_SFI_MVLEM_3D">E-SFI-MVLEM-3D · recomendado</option>
+                      <option value="SFI_MVLEM_3D">SFI-MVLEM-3D · corte-flexión completo</option>
+                      <option value="MVLEM_3D">MVLEM_3D · sólo flexión (H/L &gt; 3)</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div className="flex items-center gap-3 flex-wrap">
+                  <Button
+                    disabled={instantBusy || !hasWallDemands}
+                    onClick={async () => {
+                      if (!confirm(
+                        `Se diseñará el refuerzo y armará el modelo no lineal ` +
+                        `para TODOS los muros con demandas.\n\nDuctilidad: ${instantDuctility}\n` +
+                        `Ancho máx macrofibra: ${instantWidthMax} m\n` +
+                        `Formulación: ${instantFormulation.replace(/_/g, "-")}\n\n¿Continuar?`,
+                      )) return;
+                      setInstantBusy(true);
+                      setInstantError(null);
+                      try {
+                        const r = await designAndBuildAllWalls(params.id!, {
+                          ductility:   instantDuctility,
+                          width_max_m: instantWidthMax,
+                          formulation: instantFormulation,
+                        });
+                        setInstantResult(r);
+                      } catch (e) {
+                        setInstantError(e instanceof ApiError ? e.message : String(e));
+                      } finally {
+                        setInstantBusy(false);
+                      }
+                    }}
+                    title={!hasWallDemands ? "Ejecuta primero el análisis de demandas de muros" : undefined}
+                  >
+                    {instantBusy ? "Procesando…" : "⚡ Diseñar y armar modelo no lineal"}
+                  </Button>
+                  {instantResult && (
+                    <div className="text-xs flex flex-wrap items-center gap-3">
+                      <span className="rounded-md bg-emerald-500/10 px-2 py-1 font-mono text-emerald-500">
+                        ✓ {instantResult.designed_count}/{instantResult.total_walls} diseñados
+                      </span>
+                      <span className="rounded-md bg-sky-500/10 px-2 py-1 font-mono text-sky-500">
+                        ✓ {instantResult.built_count} armados MVLEM
+                      </span>
+                      {instantResult.failed_count > 0 && (
+                        <span className="rounded-md bg-red-500/10 px-2 py-1 font-mono text-red-500">
+                          ✗ {instantResult.failed_count} fallaron
+                        </span>
+                      )}
+                      <span className="text-[var(--text-muted)]">
+                        {instantResult.ductility} · {instantResult.n_fibers_mode}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                {instantError && (
+                  <div className="rounded-md bg-red-500/10 border border-red-500/20 px-3 py-2 text-xs text-red-500">
+                    {instantError}
+                  </div>
+                )}
+                {instantResult && instantResult.failed_count > 0 && (
+                  <details className="text-xs">
+                    <summary className="cursor-pointer text-[var(--text-muted)]">
+                      Ver muros con falla ({instantResult.failed_count})
+                    </summary>
+                    <ul className="mt-1 space-y-0.5 pl-4 list-disc">
+                      {instantResult.failed.slice(0, 20).map((f, i) => (
+                        <li key={i}>
+                          <span className="font-mono">{f.label}</span> — <span className="text-[var(--text-muted)]">{f.reason}</span>
+                          {f.designed_ok && <span className="ml-1 text-emerald-500">(diseño OK)</span>}
+                        </li>
+                      ))}
+                      {instantResult.failed.length > 20 && (
+                        <li className="text-[var(--text-muted)]">…y {instantResult.failed.length - 20} más</li>
+                      )}
+                    </ul>
+                  </details>
+                )}
+                {instantResult && instantResult.built_count > 0 && (
+                  <div className="rounded-md bg-emerald-500/5 border border-emerald-500/20 px-3 py-2 text-xs">
+                    Los muros ya tienen refuerzo diseñado + modelo MVLEM_3D con macrofibras.
+                    Puedes verlos en <span className="font-mono">Modelo no lineal → Asignar Muros → &ldquo;Ver detalle&rdquo;</span>,
+                    o pasar directo a <span className="font-mono">Pushover No Lineal</span>.
+                  </div>
+                )}
+              </div>
+
               <Card>
                 <CardBody className="flex items-center justify-between gap-4">
                   <div>
@@ -1635,6 +1872,77 @@ export default function StructuralProjectPage() {
               {lastJobByType("wall_design") && (
                 <JobStatusBadge status={lastJobByType("wall_design")!.status} />
               )}
+
+              {/* Auto-diseño integrado — popula la vista de detalle premium por muro */}
+              <Card>
+                <CardHeader>
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">Vista integrada por muro</div>
+                  <div className="text-base font-semibold text-[var(--text)]">Refuerzo indexado por shell + editor por pier</div>
+                </CardHeader>
+                <CardBody className="flex flex-col gap-3">
+                  <p className="text-xs text-[var(--text-muted)]">
+                    Corre el auto-diseño y lo guarda por cada muro del modelo (indexado por shell label).
+                    Alimenta la vista premium en <span className="font-mono">/projects/{`{id}`}/walls/{`{label}`}</span> —
+                    permite ver la sección con barras superpuestas, editar refuerzo por pier y verificar checks NSR-10 individualmente.
+                  </p>
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <Button
+                      disabled={autoDesignBusy || !hasWallDemands}
+                      onClick={async () => {
+                        if (!confirm("¿Correr auto-diseño síncrono sobre todos los muros? Puede tardar algunos segundos.")) return;
+                        setAutoDesignBusy(true);
+                        setAutoDesignError(null);
+                        try {
+                          const r = await autoDesignAllWalls(params.id!, {});
+                          setAutoDesignResult(r);
+                        } catch (e) {
+                          setAutoDesignError(e instanceof ApiError ? e.message : String(e));
+                        } finally {
+                          setAutoDesignBusy(false);
+                        }
+                      }}
+                      title={!hasWallDemands ? "Ejecuta primero el análisis de demandas de muros" : undefined}
+                    >
+                      {autoDesignBusy ? "Diseñando…" : "⚙ Auto-diseño integrado"}
+                    </Button>
+                    {autoDesignResult && (
+                      <div className="text-xs">
+                        <span className="font-mono font-semibold text-emerald-500">{autoDesignResult.designed_count}</span>
+                        <span className="text-[var(--text-muted)]">/{autoDesignResult.total_walls} muros diseñados</span>
+                        {autoDesignResult.failed_count > 0 && (
+                          <> · <span className="text-red-500">{autoDesignResult.failed_count} fallaron</span></>
+                        )}
+                        <span className="text-[var(--text-muted)]"> · ductilidad {autoDesignResult.ductility}</span>
+                      </div>
+                    )}
+                  </div>
+                  {autoDesignError && (
+                    <div className="rounded-md bg-red-500/10 border border-red-500/20 px-3 py-2 text-xs text-red-500">
+                      {autoDesignError}
+                    </div>
+                  )}
+                  {autoDesignResult && autoDesignResult.failed_count > 0 && (
+                    <details className="text-xs">
+                      <summary className="cursor-pointer text-[var(--text-muted)]">Ver muros con falla ({autoDesignResult.failed_count})</summary>
+                      <ul className="mt-1 space-y-0.5 pl-4 list-disc">
+                        {autoDesignResult.failed.slice(0, 20).map((f, i) => (
+                          <li key={i}>
+                            <span className="font-mono">{f.label}</span> — <span className="text-[var(--text-muted)]">{f.reason}</span>
+                          </li>
+                        ))}
+                        {autoDesignResult.failed.length > 20 && (
+                          <li className="text-[var(--text-muted)]">…y {autoDesignResult.failed.length - 20} más</li>
+                        )}
+                      </ul>
+                    </details>
+                  )}
+                  {autoDesignResult && autoDesignResult.designed.length > 0 && (
+                    <div className="rounded-md bg-emerald-500/5 border border-emerald-500/20 px-3 py-2 text-xs">
+                      Abre &ldquo;Asignar Muros&rdquo; en el sidebar y presiona &ldquo;Ver detalle&rdquo; en cualquier muro para inspeccionar la sección + refuerzo propuesto + checks.
+                    </div>
+                  )}
+                </CardBody>
+              </Card>
             </div>
           )}
 
@@ -1689,6 +1997,24 @@ export default function StructuralProjectPage() {
                   </CardBody>
                 </Card>
               )}
+            </div>
+          )}
+
+          {/* ── Pushover No Lineal de Pórticos (F2-F6) ────────────────────── */}
+          {activeSection === "frame-pushover" && (
+            <div className="mx-auto max-w-6xl px-6 py-8 flex flex-col gap-6">
+              <div>
+                <h2 className="text-xl font-bold text-[var(--text)] mb-1">
+                  Pushover No Lineal de Pórticos
+                </h2>
+                <p className="text-xs text-[var(--text-muted)]">
+                  Modelo con fibras Concrete02 (confinado Mander + no confinado) +
+                  Steel02, HingeRadau en extremos, patrón de carga seleccionable
+                  (triangular / uniforme / modal). Coloreo de rótulas según
+                  ASCE 41-17: IO (verde) → LS (amarillo) → CP (naranja) → Colapso (rojo).
+                </p>
+              </div>
+              <NLFramePushoverPanel projectId={project.id} />
             </div>
           )}
 

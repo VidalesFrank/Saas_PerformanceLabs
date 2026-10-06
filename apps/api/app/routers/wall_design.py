@@ -16,7 +16,9 @@ from app.engine.building.walls.wall_design_schemas import (
     BoundaryZoneReinf,
     WebZoneReinf,
     BAR_DB,
+    curtains_for_tw,
 )
+from app.engine.building.walls.auto_design import WallNotDesignableError
 
 router = APIRouter(prefix="/api/v1/wall-design", tags=["wall-design"])
 
@@ -45,7 +47,7 @@ class WebZoneIn(BaseModel):
     vert_spacing_mm: float = 250.0
     horiz_db_mm: float = 12.7
     horiz_spacing_mm: float = 250.0
-    n_curtains: int = 2
+    n_curtains: Optional[int] = None  # None → se resuelve por tw en el server
 
 
 class ManualReinfIn(BaseModel):
@@ -78,7 +80,7 @@ class WallDesignRequest(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _to_bz_reinf(bz: BoundaryZoneIn) -> BoundaryZoneReinf:
+def _to_bz_reinf(bz: BoundaryZoneIn, tw_m: float) -> BoundaryZoneReinf:
     return BoundaryZoneReinf(
         n_bars=bz.n_bars,
         db_mm=bz.db_mm,
@@ -86,16 +88,18 @@ def _to_bz_reinf(bz: BoundaryZoneIn) -> BoundaryZoneReinf:
         tie_db_mm=bz.tie_db_mm,
         tie_spacing_mm=bz.tie_spacing_mm,
         length_m=bz.length_m,
+        n_curtains=curtains_for_tw(tw_m),
     )
 
 
-def _to_web_reinf(w: WebZoneIn) -> WebZoneReinf:
+def _to_web_reinf(w: WebZoneIn, tw_m: float) -> WebZoneReinf:
+    # Ignora w.n_curtains del cliente: regla geométrica manda.
     return WebZoneReinf(
         vert_db_mm=w.vert_db_mm,
         vert_spacing_mm=w.vert_spacing_mm,
         horiz_db_mm=w.horiz_db_mm,
         horiz_spacing_mm=w.horiz_spacing_mm,
-        n_curtains=w.n_curtains,
+        n_curtains=curtains_for_tw(tw_m),
     )
 
 
@@ -123,9 +127,9 @@ def compute_design(
         if req.mode == "manual" and req.manual_reinf:
             mr = req.manual_reinf
             manual_reinf = WallReinforcement(
-                be_left=_to_bz_reinf(mr.be_left),
-                web=_to_web_reinf(mr.web),
-                be_right=_to_bz_reinf(mr.be_right),
+                be_left=_to_bz_reinf(mr.be_left, req.tw_m),
+                web=_to_web_reinf(mr.web, req.tw_m),
+                be_right=_to_bz_reinf(mr.be_right, req.tw_m),
                 symmetric=mr.symmetric,
             )
 
@@ -145,6 +149,8 @@ def compute_design(
         )
         return result
 
+    except WallNotDesignableError as e:
+        raise HTTPException(status_code=422, detail=f"Muro no diseñable en automático — {e}")
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:

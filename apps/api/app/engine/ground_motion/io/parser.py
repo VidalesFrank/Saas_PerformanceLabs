@@ -7,6 +7,8 @@ y produce un GroundMotionRecord normalizado con todos los canales en SI.
 from __future__ import annotations
 
 import io
+import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -303,6 +305,23 @@ def build_record(
     Returns:
         GroundMotionRecord normalizado.
     """
+    # ── miniSEED (formato binario autodescriptivo) ────────────────────────────
+    # No usa column_mappings ni dt del wizard: todo viene del header SEED.
+    # La unidad se toma del primer mapping activo (por defecto 'g') para
+    # respetar la asunción que el usuario declaró en el frontend.
+    ext = Path(filename).suffix.lower()
+    if ext in (".msd", ".mseed", ".seed"):
+        from .miniseed import build_record_from_miniseed
+        active = [m for m in column_mappings if m.quantity != "ignore"]
+        unit = active[0].unit if active else "g"
+        return build_record_from_miniseed(
+            filename=filename,
+            content=content,
+            record_name=record_name or Path(filename).stem,
+            metadata=metadata,
+            unit=unit,
+        )
+
     rows, header_meta = _read_numeric_lines(content, filename)
 
     if not rows:
@@ -511,3 +530,191 @@ def record_from_storage_dict(data: dict) -> GroundMotionRecord:
         processing_log=proc_log,
         created_at=data.get("created_at", ""),
     )
+
+
+# ── Storage binario (.npy) ───────────────────────────────────────────────────
+# Formato: <dir>/record_meta.json + <dir>/arrays/{time,ch{N}_raw,ch{N}_si,ch{N}_proc}.npy
+#
+# El JSON solo tiene metadata (str, int, float, listas cortas). Los arrays
+# grandes (n_samples ~ 21M para 24h a 250Hz) se guardan como .npy binario:
+# ~30x más rápido de escribir que JSON y ~4x menos espacio en disco.
+#
+# El loader detecta automáticamente el formato: si el path apunta a un archivo
+# .json, es el formato viejo (todo inline). Si apunta a un directorio o a
+# record_meta.json, es el formato binario nuevo.
+
+_META_FILENAME    = "record_meta.json"
+_ARRAYS_SUBDIR    = "arrays"
+
+
+def save_record_binary(record: GroundMotionRecord, dir_path: str) -> str:
+    """Guarda un GroundMotionRecord como JSON de metadata + .npy binarios.
+
+    Args:
+        record:   el registro a guardar.
+        dir_path: directorio de destino (se crea si no existe).
+
+    Returns:
+        Ruta al archivo record_meta.json (usable como raw_data_path en la BD).
+    """
+    os.makedirs(dir_path, exist_ok=True)
+    arrays_dir = os.path.join(dir_path, _ARRAYS_SUBDIR)
+    os.makedirs(arrays_dir, exist_ok=True)
+
+    # Guardar vector de tiempo como .npy si es significativo (>1000 pts)
+    time_ref: str | None = None
+    if len(record.time) > 0:
+        np.save(os.path.join(arrays_dir, "time.npy"), record.time)
+        time_ref = "time.npy"
+
+    channels_meta: list[dict] = []
+    for i, ch in enumerate(record.channels):
+        raw_ref = f"ch{i}_raw.npy"
+        si_ref  = f"ch{i}_si.npy"
+        np.save(os.path.join(arrays_dir, raw_ref), ch.raw_values)
+        np.save(os.path.join(arrays_dir, si_ref),  ch.values_si)
+
+        proc_ref: str | None = None
+        if ch.processed_values is not None:
+            proc_ref = f"ch{i}_proc.npy"
+            np.save(os.path.join(arrays_dir, proc_ref), ch.processed_values)
+
+        channels_meta.append({
+            "name":              ch.name,
+            "quantity":          ch.quantity,
+            "component":         ch.component,
+            "original_unit":     ch.original_unit,
+            "si_unit":           ch.si_unit,
+            "raw_ref":           raw_ref,
+            "si_ref":            si_ref,
+            "processed_ref":     proc_ref,
+            "processing_history": [
+                {"operation": s.operation, "params": s.params,
+                 "timestamp": s.timestamp, "description": s.description}
+                for s in ch.processing_history
+            ],
+        })
+
+    meta = {
+        "format_version": "2",           # v1 = JSON inline; v2 = arrays en .npy
+        "id":             record.id,
+        "name":           record.name,
+        "source_file":    record.source_file,
+        "source_format":  record.source_format,
+        "dt":             record.dt,
+        "n_samples":      record.n_samples,
+        "duration":       record.duration,
+        "fs":             record.fs,
+        "nyquist":        record.nyquist,
+        "time_ref":       time_ref,
+        "channels":       channels_meta,
+        "metadata":       record.metadata,
+        "processing_log": [
+            {"operation": s.operation, "params": s.params,
+             "timestamp": s.timestamp, "description": s.description}
+            for s in record.processing_log
+        ],
+        "created_at":     record.created_at,
+    }
+
+    meta_path = os.path.join(dir_path, _META_FILENAME)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+    return meta_path
+
+
+def load_record_binary(meta_path: str) -> GroundMotionRecord:
+    """Reconstituye un GroundMotionRecord desde el formato binario v2.
+
+    Args:
+        meta_path: ruta a record_meta.json (o al directorio que lo contiene).
+
+    Returns:
+        GroundMotionRecord con arrays cargados de disco.
+    """
+    from ..record import ProcessingStep
+
+    if os.path.isdir(meta_path):
+        meta_path = os.path.join(meta_path, _META_FILENAME)
+    dir_path = os.path.dirname(meta_path)
+    arrays_dir = os.path.join(dir_path, _ARRAYS_SUBDIR)
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    time_arr = (
+        np.load(os.path.join(arrays_dir, meta["time_ref"]))
+        if meta.get("time_ref") else np.array([])
+    )
+
+    channels: list[SignalChannel] = []
+    for ch_meta in meta.get("channels", []):
+        raw = np.load(os.path.join(arrays_dir, ch_meta["raw_ref"]))
+        si  = np.load(os.path.join(arrays_dir, ch_meta["si_ref"]))
+        proc = (
+            np.load(os.path.join(arrays_dir, ch_meta["processed_ref"]))
+            if ch_meta.get("processed_ref") else None
+        )
+        proc_hist = [
+            ProcessingStep(
+                operation=s["operation"], params=s["params"],
+                timestamp=s.get("timestamp", ""), description=s.get("description", ""),
+            )
+            for s in ch_meta.get("processing_history", [])
+        ]
+        channels.append(SignalChannel(
+            name=ch_meta["name"],
+            quantity=ch_meta["quantity"],
+            component=ch_meta.get("component", ""),
+            original_unit=ch_meta.get("original_unit", ""),
+            si_unit=ch_meta.get("si_unit", ""),
+            raw_values=raw,
+            values_si=si,
+            processed_values=proc,
+            processing_history=proc_hist,
+        ))
+
+    proc_log = [
+        ProcessingStep(
+            operation=s["operation"], params=s["params"],
+            timestamp=s.get("timestamp", ""), description=s.get("description", ""),
+        )
+        for s in meta.get("processing_log", [])
+    ]
+
+    return GroundMotionRecord(
+        id=meta.get("id", ""),
+        name=meta.get("name", ""),
+        source_file=meta.get("source_file", ""),
+        source_format=meta.get("source_format", ""),
+        dt=meta["dt"],
+        n_samples=meta["n_samples"],
+        duration=meta["duration"],
+        fs=meta["fs"],
+        nyquist=meta["nyquist"],
+        time=time_arr,
+        channels=channels,
+        metadata=meta.get("metadata", {}),
+        processing_log=proc_log,
+        created_at=meta.get("created_at", ""),
+    )
+
+
+def load_record_auto(path: str) -> GroundMotionRecord:
+    """Carga un GroundMotionRecord detectando el formato de storage.
+
+    - Si `path` es un directorio o termina en `record_meta.json` → v2 binario.
+    - Cualquier otro archivo `.json` → v1 inline (formato legacy).
+
+    Este helper permite que el router migre a v2 sin romper registros
+    existentes: los archivos viejos siguen abriendo, los nuevos usan .npy.
+    """
+    if os.path.isdir(path) or path.endswith(_META_FILENAME):
+        return load_record_binary(path)
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # Si es v2 con paths, tratarlo como binario (ubicando el dir del meta)
+    if data.get("format_version") == "2":
+        return load_record_binary(path)
+    return record_from_storage_dict(data)

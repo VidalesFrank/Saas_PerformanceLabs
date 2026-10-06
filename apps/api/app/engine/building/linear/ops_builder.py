@@ -229,22 +229,29 @@ class LinearOPSBuilder:
             if A <= 0 or E <= 0:
                 continue
 
-            # Beams articulados (RELEASE=PINNED o element_type=beam): no se crean como elementos
-            # de barra — no aportan rigidez lateral (igual que ETABS con beams pinned).
-            # Sus joints quedan como nodos flotantes en el diafragma (Uz,Rx,Ry fijados).
-            # Solo se crean elementos para vigas con continuidad de momento (columnas/dinteles).
+            # Vigas / columnas articuladas explícitamente (RELEASE=PINNED en ETABS):
+            # no se crean como elementos de barra porque no transmiten momento.
+            # NO articular por element_type=beam: por default las vigas en ETABS
+            # tienen continuidad de momento (moment frame) y son las que aportan
+            # rigidez lateral por efecto pórtico. Articularlas produce un modelo
+            # de columnas cantiléver con T1 gigante.
             release = fd.get("release", "")
-            is_pinned = (release.upper() == "PINNED" or
-                         fd.get("element_type", "").lower() == "beam")
-            if is_pinned:
+            if release.upper() == "PINNED":
                 continue
 
             ele_tag = ele_idx + 1
             ops.element("elasticBeamColumn", ele_tag, ni, nj, A, E, G, J, Iy, Iz, transf)
 
-            # Track joints connected to valid frame elements (non-floating nodes)
-            self._valid_frame_joints.add(fd["joint_i"])
-            self._valid_frame_joints.add(fd["joint_j"])
+            # Track joints connected to a VERTICAL frame element (columna). Estos
+            # joints reciben K axial en Uz + K flexional en Rx/Ry → no son
+            # "flotantes" para el diafragma. Vigas horizontales NO aportan a Uz
+            # y sus joints pueden seguir necesitando fix(0,0,1,1,1,0) si no
+            # tienen columna conectada. El criterio es dz dominante sobre dxy.
+            dxy = math.sqrt(dx * dx + dy * dy)
+            is_vertical = abs(dz) > dxy
+            if is_vertical:
+                self._valid_frame_joints.add(fd["joint_i"])
+                self._valid_frame_joints.add(fd["joint_j"])
 
     # ── Elementos shell (muros) ───────────────────────────────────────────────
 
@@ -426,15 +433,107 @@ class LinearOPSBuilder:
                 result[cm_st] += mass_t
         return result
 
+    def _frame_mass_per_cm_story(self) -> dict[str, float]:
+        """
+        Masa de autopeso de columnas y vigas [t], agrupada por piso donde se
+        lumpa al CM.
+          - Columna (vertical): mitad al CM del nivel superior, mitad al inferior.
+          - Viga (horizontal):  masa al CM del nivel donde está.
+
+        Esta masa NO viene en la tabla MASS SUMMARY de ETABS cuando el Mass
+        Source está en "From Loads" sin incluir self-weight. Sin añadirla,
+        edificios de pórticos puros reportan W ~50% del valor real y T1 muy
+        subestimado.
+        """
+        GAMMA_kN_m3 = 24.0
+        G_m_s2      = 9.81
+        frames   = self._m.get("frames",   {})
+        sections = self._m.get("sections", {})
+        joints   = self._m.get("joints",   {})
+        masses   = self._m.get("masses",   {})
+
+        # Elevaciones de los CMs ordenados ascendentemente
+        story_z = {str(md.get("story", "")): float(md.get("z_m", 0.0))
+                   for md in masses.values() if md.get("story")}
+        ordered = sorted(story_z, key=lambda s: story_z[s])
+
+        def _cm_at_or_above(z: float) -> str | None:
+            """Primer CM con z > z_dado + tolerancia."""
+            for s in ordered:
+                if story_z[s] > z + 1e-3:
+                    return s
+            return None
+
+        def _cm_closest(z: float) -> str | None:
+            if not ordered:
+                return None
+            return min(ordered, key=lambda s: abs(story_z[s] - z))
+
+        result: dict[str, float] = {s: 0.0 for s in ordered}
+        for fid, fd in frames.items():
+            sec_name = fd.get("section")
+            if not sec_name:
+                continue
+            sec = sections.get(sec_name, {})
+            A_m2 = float(sec.get("A_m2", 0.0))
+            if A_m2 <= 1e-6:
+                b = float(sec.get("b_m", 0.0)); h = float(sec.get("h_m", 0.0))
+                A_m2 = b * h
+            if A_m2 <= 1e-6:
+                continue
+            ji = joints.get(str(fd.get("joint_i", "")), {})
+            jj = joints.get(str(fd.get("joint_j", "")), {})
+            dx = float(jj.get("x", 0.0)) - float(ji.get("x", 0.0))
+            dy = float(jj.get("y", 0.0)) - float(ji.get("y", 0.0))
+            dz = float(jj.get("z", 0.0)) - float(ji.get("z", 0.0))
+            L  = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if L < 1e-6:
+                continue
+            m_t = L * A_m2 * GAMMA_kN_m3 / G_m_s2   # tonnes
+
+            is_column = (fd.get("element_type") == "column") or (abs(dz) > math.sqrt(dx*dx + dy*dy))
+            if is_column:
+                # Mitad al CM superior, mitad al inferior
+                z_bot = min(float(ji.get("z", 0.0)), float(jj.get("z", 0.0)))
+                z_top = max(float(ji.get("z", 0.0)), float(jj.get("z", 0.0)))
+                s_up  = _cm_at_or_above(z_bot)
+                s_dn  = _cm_closest(z_bot)  # el nivel donde arranca (base o CM inferior)
+                if s_up and s_up in result:
+                    result[s_up] += m_t * 0.5
+                if s_dn and s_dn in result and s_dn != s_up:
+                    result[s_dn] += m_t * 0.5
+                elif not s_dn or s_dn == s_up:
+                    # Si no hay CM debajo (columna de base), todo al CM superior
+                    if s_up and s_up in result:
+                        result[s_up] += m_t * 0.5
+            else:
+                # Viga: toda la masa al CM del nivel donde está (joint_i)
+                z_bm = float(ji.get("z", 0.0))
+                s_bm = _cm_closest(z_bm)
+                if s_bm and s_bm in result:
+                    result[s_bm] += m_t
+        return result
+
     def _create_cm_nodes_and_masses(self, ops) -> dict:
         """
         Crea un nodo maestro en el CM de cada piso con la masa de diafragma.
-        Incluye peso propio de muros (igual que ETABS MASSSOURCE INCLUDEELEMENTS=Yes).
+        Incluye peso propio de muros + frames (igual que ETABS MASSSOURCE
+        INCLUDEELEMENTS=Yes) para no subestimar la masa inercial.
         Retorna: {story_name: {"tag": int, "z": float}}
         """
         masses   = self._m.get("masses", {})
         cm_nodes: dict[str, dict] = {}
-        wall_extra = self._wall_mass_per_cm_story()
+        wall_extra  = self._wall_mass_per_cm_story()
+        frame_extra = self._frame_mass_per_cm_story()
+
+        total_wall  = sum(wall_extra.values())
+        total_frame = sum(frame_extra.values())
+        total_slab  = sum(float(md.get("mass_x_t", 0.0)) for md in masses.values())
+        print(
+            f"[LinearOPSBuilder] masa agregada al CM — "
+            f"losas={total_slab:.2f}t  muros={total_wall:.2f}t  "
+            f"frames={total_frame:.2f}t  TOTAL={total_slab+total_wall+total_frame:.2f}t"
+        )
 
         for idx, (_, md) in enumerate(masses.items()):
             story = str(md.get("story", f"story_{idx}"))
@@ -449,7 +548,7 @@ class LinearOPSBuilder:
 
             ops.node(cm_tag, x, y, z)
 
-            extra = wall_extra.get(story, 0.0)
+            extra = wall_extra.get(story, 0.0) + frame_extra.get(story, 0.0)
             mx  = float(md.get("mass_x_t",    0.0)) + extra
             my  = float(md.get("mass_y_t",    0.0)) + extra
             mrz = float(md.get("mass_rz_tm2", 0.0))

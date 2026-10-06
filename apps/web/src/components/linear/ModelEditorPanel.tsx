@@ -1184,6 +1184,7 @@ export default function ModelEditorPanel({
                 sections={modelData?.sections}
                 height={640}
                 onElementClick={(info) => {
+                  if (info.type === "infill") return;   // infills se editan desde InfillsPanel
                   handleClickElement(info.id, {
                     id: info.id,
                     element_type: info.type,

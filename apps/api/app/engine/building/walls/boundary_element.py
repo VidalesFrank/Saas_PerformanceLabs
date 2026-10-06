@@ -13,8 +13,10 @@ from typing import Optional
 from .wall_design_schemas import BoundaryElementResult
 
 # Umbrales σ para requerir EBE
-SIGMA_THRESHOLD_DES = 0.20  # f'c (ACI 318-25 §18.10.6.3)
-SIGMA_THRESHOLD_DMO = 0.15  # f'c (NSR-10 C.21.4, más conservador)
+# DES: ACI 318-25 §18.10.6.3 / NSR-10 C.21.9.6.3  → 0.20·f'c
+# DMO: NSR-10 C.21.4.4.6  → 0.30·f'c (menor exigencia que DES)
+SIGMA_THRESHOLD_DES = 0.20
+SIGMA_THRESHOLD_DMO = 0.30
 
 
 def extreme_fiber_stress_mpa(
@@ -103,7 +105,7 @@ def check_boundary_element(
                 sigma,
                 ">" if required else "≤",
                 threshold,
-                "0.20" if ductility == "DES" else "0.15",
+                "0.20" if ductility == "DES" else "0.30",
             )
         ),
     )

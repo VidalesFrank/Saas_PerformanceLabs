@@ -3,26 +3,42 @@
 /**
  * Building2DPlanView — Vista en planta 2D por piso, SVG puro.
  *
- * Renderiza el layout XY de un piso específico usando SVG con coordenadas
- * del modelo directamente (sin inversión Y). Convención: X hacia la derecha,
- * Y hacia abajo (como SVG nativo). Se agregarán ejes claros para que el
- * usuario entienda la orientación.
+ * Además de renderizar el layout XY del piso, incluye un modo de DIBUJO que
+ * permite crear columnas, vigas, muros, losas e infills haciendo clic sobre
+ * la planta. Snap a intersecciones de grid (definido por el usuario) y a
+ * joints existentes con tolerancia dinámica según el zoom.
  *
  * Los muros consolidados por pier se dibujan con dimensiones REALES
  * amplificadas visualmente para que sean legibles.
  */
 import { useMemo, useRef, useState, useCallback, useEffect } from "react";
-import type { ModelGeometry, SectionData } from "@/lib/structural-types";
+import type {
+  ModelGeometry,
+  SectionData,
+  GridDefinition,
+  MasonryMaterial,
+  DrawingTool,
+} from "@/lib/structural-types";
+import { structuralEditorApi } from "@/lib/structural-api";
 
 interface Props {
   geometry: ModelGeometry;
   initialStory?: string;
   height?: number;
   sections?: Record<string, SectionData>;
-  onElementClick?: (info: { id: string; type: "slab" | "wall" | "beam" | "column"; label: string }) => void;
+  /** Definición de grid del usuario (ejes X/Y). Usado para snap y dibujo. */
+  grid?: GridDefinition;
+  /** Materiales de mampostería disponibles para infills. */
+  masonryMaterials?: Record<string, MasonryMaterial>;
+  /** Habilita modo dibujo. Si no viene projectId, solo lectura. */
+  projectId?: string;
+  /** Callback tras crear/eliminar elementos — la página debe recargar el modelo. */
+  onModelChanged?: () => void | Promise<void>;
+  onElementClick?: (info: { id: string; type: "slab" | "wall" | "beam" | "column" | "infill"; label: string }) => void;
 }
 
 interface HoverInfo { x: number; y: number; label: string; section?: string; extra?: string; }
+interface PendingPoint { x: number; y: number; jointId?: string }
 
 const COLORS = {
   slabFill:   "rgba(59, 130, 246, 0.10)",
@@ -36,8 +52,12 @@ const COLORS = {
   columnFill: "rgba(220, 38, 38, 0.80)",
   grid:       "rgba(148, 163, 184, 0.20)",
   gridBold:   "rgba(148, 163, 184, 0.45)",
+  gridUser:   "rgba(37, 99, 235, 0.35)",
   axisX:      "#dc2626",
   axisY:      "#059669",
+  ghost:      "#f59e0b",
+  ghostFill:  "rgba(245, 158, 11, 0.30)",
+  snap:       "#22c55e",
 };
 
 export default function Building2DPlanView({
@@ -45,8 +65,14 @@ export default function Building2DPlanView({
   initialStory,
   height = 640,
   sections,
+  grid,
+  masonryMaterials,
+  projectId,
+  onModelChanged,
   onElementClick,
 }: Props) {
+  const canEdit = !!projectId;
+
   const storiesOrdered = useMemo(() => {
     return Object.entries(geometry.stories)
       .map(([name, info]) => ({ name, z: info.elevation_m ?? 0 }))
@@ -65,13 +91,41 @@ export default function Building2DPlanView({
   const [showSlabs, setShowSlabs] = useState(true);
   const [showWalls, setShowWalls] = useState(true);
   const [showFrames, setShowFrames] = useState(true);
-  const [wallEmphasis, setWallEmphasis] = useState(true);   // muestra tw amplificado
+  const [wallEmphasis, setWallEmphasis] = useState(true);
   const [hover, setHover] = useState<HoverInfo | null>(null);
 
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
-  const dragRef = useRef<{ x: number; y: number; startPan: { x: number; y: number } } | null>(null);
+  const dragRef = useRef<{ x: number; y: number; startPan: { x: number; y: number }; moved: boolean } | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
+
+  // ── Estado de dibujo ───────────────────────────────────────────────────────
+  const [tool, setTool] = useState<DrawingTool>("select");
+  const [pending, setPending] = useState<PendingPoint[]>([]);
+  const [pointerXY, setPointerXY] = useState<{ x: number; y: number } | null>(null);
+  const [defaultSection, setDefaultSection] = useState<string>("");
+  const [defaultThickness, setDefaultThickness] = useState(0.20);
+  const [defaultMasonry, setDefaultMasonry] = useState<string>("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  // Auto-selecciona sección por defecto cuando cambian las secciones disponibles
+  useEffect(() => {
+    if (!sections) return;
+    const first = Object.keys(sections)[0] ?? "";
+    if (first && !defaultSection) setDefaultSection(first);
+  }, [sections, defaultSection]);
+  useEffect(() => {
+    if (!masonryMaterials) return;
+    const first = Object.keys(masonryMaterials)[0] ?? "";
+    if (first && !defaultMasonry) setDefaultMasonry(first);
+  }, [masonryMaterials, defaultMasonry]);
+
+  // Al cambiar de herramienta, cancela clicks pendientes.
+  useEffect(() => {
+    setPending([]);
+    setSaveError(null);
+  }, [tool, story]);
 
   // ── Filtros ────────────────────────────────────────────────────────────────
   const slabsInStory = useMemo(() =>
@@ -115,6 +169,19 @@ export default function Building2DPlanView({
     [geometry.frames, story],
   );
 
+  // Joints del piso actual — para snap
+  const jointsInStory = useMemo(() => {
+    const res: { id: string; x: number; y: number }[] = [];
+    const info = geometry.stories[story];
+    const zTarget = info?.elevation_m;
+    for (const [id, j] of Object.entries(geometry.joints)) {
+      if (zTarget !== undefined && Math.abs(j.z - zTarget) > 0.05) continue;
+      if (j.story && j.story !== story && zTarget === undefined) continue;
+      res.push({ id, x: j.x, y: j.y });
+    }
+    return res;
+  }, [geometry.joints, geometry.stories, story]);
+
   // ── Bounds del modelo ─────────────────────────────────────────────────────
   const bounds = useMemo(() => {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -130,36 +197,64 @@ export default function Building2DPlanView({
       const ji = geometry.joints[f.joint_i]; const jj = geometry.joints[f.joint_j];
       if (ji) consider(ji.x, ji.y); if (jj) consider(jj.x, jj.y);
     }
+    // Considera también ejes del grid del usuario
+    if (grid) {
+      for (const ax of grid.axes_x) consider(ax.coord_m, isFinite(minY) ? minY : ax.coord_m);
+      for (const ay of grid.axes_y) consider(isFinite(minX) ? minX : ay.coord_m, ay.coord_m);
+    }
     if (!isFinite(minX)) for (const j of Object.values(geometry.joints)) consider(j.x, j.y);
     if (!isFinite(minX)) return { minX: 0, minY: 0, maxX: 10, maxY: 10 };
     return { minX, minY, maxX, maxY };
-  }, [slabsInStory, wallsInStory, framesInStory, geometry.joints]);
+  }, [slabsInStory, wallsInStory, framesInStory, geometry.joints, grid]);
 
   const rawW = Math.max(bounds.maxX - bounds.minX, 1);
   const rawH = Math.max(bounds.maxY - bounds.minY, 1);
-  const PAD_M = Math.max(rawW, rawH) * 0.10;   // 10% del rango como padding
+  const PAD_M = Math.max(rawW, rawH) * 0.10;
 
-  // ── ViewBox: usamos coord modelo directamente. Como SVG y crece hacia
-  //     abajo, aplicamos transform "scale(1,-1)" al grupo raíz y compensamos
-  //     el translate para mantener el contenido en el viewbox.
   const vbW = (rawW + 2 * PAD_M) / zoom;
   const vbH = (rawH + 2 * PAD_M) / zoom;
   const vbX = bounds.minX - PAD_M + pan.x;
   const vbY = bounds.minY - PAD_M + pan.y;
   const viewBox = `${vbX} ${vbY} ${vbW} ${vbH}`;
 
-  // Con el transform scale(1,-1), lo que dibujamos en y' cae en -y' del SVG.
-  // Para que quede dentro del viewbox, necesitamos trasladar el eje Y del
-  // grupo por (2*centro_Y). Alternativa más simple: NO invertimos y aceptamos
-  // que Y crezca hacia abajo (SVG nativo). Esto es lo que hacemos aquí.
-  // Los textos y ejes se dibujan tal cual (Y hacia abajo).
-
-  // ── Grid ──────────────────────────────────────────────────────────────────
+  // ── Grid step automático ───────────────────────────────────────────────────
   const gridStep = useMemo(() => {
     const span = Math.max(rawW, rawH);
     if (span >= 40) return 5; if (span >= 20) return 2;
     if (span >= 8) return 1; return 0.5;
   }, [rawW, rawH]);
+
+  // ── Coordenadas mouse → modelo ────────────────────────────────────────────
+  const svgToModel = useCallback((clientX: number, clientY: number): { x: number; y: number } | null => {
+    if (!svgRef.current) return null;
+    const rect = svgRef.current.getBoundingClientRect();
+    const px = (clientX - rect.left) / rect.width;
+    const py = (clientY - rect.top) / rect.height;
+    return { x: vbX + px * vbW, y: vbY + py * vbH };
+  }, [vbX, vbY, vbW, vbH]);
+
+  // ── Snap: prioridad joint existente > intersección de grid ────────────────
+  const snapPoint = useCallback((mx: number, my: number): PendingPoint => {
+    const tol = Math.max(rawW, rawH) * 0.015 / zoom;   // ~1.5% del span, ajustado por zoom
+    // Joints existentes
+    let bestJoint: { id: string; x: number; y: number; d: number } | null = null;
+    for (const j of jointsInStory) {
+      const d = Math.hypot(j.x - mx, j.y - my);
+      if (d < tol && (!bestJoint || d < bestJoint.d)) {
+        bestJoint = { id: j.id, x: j.x, y: j.y, d };
+      }
+    }
+    if (bestJoint) return { x: bestJoint.x, y: bestJoint.y, jointId: bestJoint.id };
+    // Intersección de grid definido por el usuario
+    if (grid && (grid.axes_x.length || grid.axes_y.length)) {
+      const nx = nearestOr(mx, grid.axes_x.map((a) => a.coord_m), tol);
+      const ny = nearestOr(my, grid.axes_y.map((a) => a.coord_m), tol);
+      if (nx !== null || ny !== null) {
+        return { x: nx ?? mx, y: ny ?? my };
+      }
+    }
+    return { x: mx, y: my };
+  }, [jointsInStory, grid, rawW, rawH, zoom]);
 
   // ── Zoom/Pan handlers ────────────────────────────────────────────────────
   const onWheel = useCallback((e: React.WheelEvent<SVGSVGElement>) => {
@@ -169,22 +264,236 @@ export default function Building2DPlanView({
   }, []);
   const onMouseDown = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
     if (e.button !== 0) return;
-    dragRef.current = { x: e.clientX, y: e.clientY, startPan: { ...pan } };
+    dragRef.current = { x: e.clientX, y: e.clientY, startPan: { ...pan }, moved: false };
   }, [pan]);
   const onMouseMove = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+    const pt = svgToModel(e.clientX, e.clientY);
+    if (pt) setPointerXY(pt);
     if (!dragRef.current || !svgRef.current) return;
+    const dx = e.clientX - dragRef.current.x;
+    const dy = e.clientY - dragRef.current.y;
+    if (Math.hypot(dx, dy) > 4) dragRef.current.moved = true;
     const rect = svgRef.current.getBoundingClientRect();
     const scaleX = vbW / rect.width;
     const scaleY = vbH / rect.height;
     setPan({
-      x: dragRef.current.startPan.x - (e.clientX - dragRef.current.x) * scaleX,
-      y: dragRef.current.startPan.y - (e.clientY - dragRef.current.y) * scaleY,
+      x: dragRef.current.startPan.x - dx * scaleX,
+      y: dragRef.current.startPan.y - dy * scaleY,
     });
-  }, [vbW, vbH]);
+  }, [vbW, vbH, svgToModel]);
   const endDrag = useCallback(() => { dragRef.current = null; }, []);
   const resetView = useCallback(() => { setZoom(1); setPan({ x: 0, y: 0 }); }, []);
-
   useEffect(() => { resetView(); }, [story, resetView]);
+
+  // ── Handler de click en el SVG (drenaje según herramienta) ────────────────
+  const handleSvgClick = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+    // Ignora si fue un arrastre real (no un click puntual)
+    if (dragRef.current?.moved) return;
+    if (!canEdit || tool === "select") return;
+    const pt = svgToModel(e.clientX, e.clientY);
+    if (!pt) return;
+    const sp = snapPoint(pt.x, pt.y);
+    setPending((prev) => [...prev, sp]);
+  }, [tool, canEdit, svgToModel, snapPoint]);
+
+  // ── Ejecuta la acción cuando pending alcanza el conteo objetivo ───────────
+  useEffect(() => {
+    if (!canEdit || !projectId) return;
+    if (saving) return;
+    (async () => {
+      if (tool === "column" && pending.length >= 1) {
+        await createColumnAt(pending[0]);
+        setPending([]);
+      } else if (tool === "beam" && pending.length >= 2) {
+        await createFrameSpan(pending[0], pending[1], "beam");
+        setPending([]);
+      } else if (tool === "wall" && pending.length >= 2) {
+        await createWallSpan(pending[0], pending[1]);
+        setPending([]);
+      } else if (tool === "infill" && pending.length >= 2) {
+        await createInfillFromBay(pending[0], pending[1]);
+        setPending([]);
+      }
+    })();
+    // slab: se cierra explícitamente con doble-click, no aquí.
+  }, [pending, tool, canEdit, projectId, saving]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Doble-click cierra polígono para losa
+  const handleSvgDoubleClick = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+    if (!canEdit || tool !== "slab" || pending.length < 3) return;
+    e.preventDefault();
+    (async () => {
+      await createSlab(pending);
+      setPending([]);
+    })();
+  }, [canEdit, tool, pending]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Acciones de guardado ─────────────────────────────────────────────────
+  const ensureJoint = useCallback(async (p: PendingPoint, zForce?: number): Promise<string> => {
+    if (p.jointId) return p.jointId;
+    if (!projectId) throw new Error("Sin projectId");
+    const z = zForce ?? (geometry.stories[story]?.elevation_m ?? 0);
+    // Genera id único
+    let id = `J-${Math.round(p.x * 100)}-${Math.round(p.y * 100)}-${Math.round(z * 100)}`;
+    let n = 1;
+    while (geometry.joints[id]) { id = `J-${Math.round(p.x * 100)}-${Math.round(p.y * 100)}-${Math.round(z * 100)}-${n++}`; }
+    await structuralEditorApi.createJoint(projectId, {
+      id, x: p.x, y: p.y, z, story,
+      is_restrained: Math.abs(z) < 1e-3,   // z=0 → base restringida
+      restraints: Math.abs(z) < 1e-3 ? [1,1,1,1,1,1] : null,
+    });
+    return id;
+  }, [projectId, geometry.stories, geometry.joints, story]);
+
+  async function createColumnAt(p: PendingPoint) {
+    if (!projectId) return;
+    if (!defaultSection) { setSaveError("Selecciona una sección primero"); return; }
+    setSaving(true); setSaveError(null);
+    try {
+      const zTop = geometry.stories[story]?.elevation_m ?? 0;
+      const idxOrdered = storiesOrdered.indexOf(story);
+      const belowStory = idxOrdered > 0 ? storiesOrdered[idxOrdered - 1] : story;
+      const zBase = geometry.stories[belowStory]?.elevation_m ?? Math.max(0, zTop - 3);
+      const jTop = await ensureJoint(p, zTop);
+      const jBot = await ensureJoint(p, zBase);
+      const cid = `C-${Date.now().toString(36)}`;
+      await structuralEditorApi.createFrame(projectId, {
+        id: cid, joint_i: jBot, joint_j: jTop,
+        section: defaultSection, element_type: "column", story,
+      });
+      await onModelChanged?.();
+    } catch (e) {
+      setSaveError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function createFrameSpan(a: PendingPoint, b: PendingPoint, kind: "beam") {
+    if (!projectId) return;
+    if (!defaultSection) { setSaveError("Selecciona una sección primero"); return; }
+    setSaving(true); setSaveError(null);
+    try {
+      const ji = await ensureJoint(a);
+      const jj = await ensureJoint(b);
+      const fid = `${kind === "beam" ? "V" : "F"}-${Date.now().toString(36)}`;
+      await structuralEditorApi.createFrame(projectId, {
+        id: fid, joint_i: ji, joint_j: jj,
+        section: defaultSection, element_type: kind, story,
+      });
+      await onModelChanged?.();
+    } catch (e) {
+      setSaveError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function createWallSpan(a: PendingPoint, b: PendingPoint) {
+    if (!projectId) return;
+    setSaving(true); setSaveError(null);
+    try {
+      const zTop = geometry.stories[story]?.elevation_m ?? 0;
+      const idxOrdered = storiesOrdered.indexOf(story);
+      const belowStory = idxOrdered > 0 ? storiesOrdered[idxOrdered - 1] : story;
+      const zBase = geometry.stories[belowStory]?.elevation_m ?? Math.max(0, zTop - 3);
+      const j1 = await ensureJoint(a, zBase);   // base izq
+      const j2 = await ensureJoint(b, zBase);   // base der
+      const j3 = await ensureJoint(b, zTop);    // top der
+      const j4 = await ensureJoint(a, zTop);    // top izq
+      const pier = `M-${Date.now().toString(36).slice(-5).toUpperCase()}`;
+      await structuralEditorApi.createShell(projectId, {
+        id: pier,
+        joints: [j1, j2, j3, j4],
+        section: "",
+        element_type: "wall",
+        thickness_m: defaultThickness,
+        pier,
+        story,
+      });
+      await onModelChanged?.();
+    } catch (e) {
+      setSaveError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function createSlab(points: PendingPoint[]) {
+    if (!projectId) return;
+    setSaving(true); setSaveError(null);
+    try {
+      const jids: string[] = [];
+      for (const p of points) jids.push(await ensureJoint(p));
+      const sid = `L-${Date.now().toString(36).slice(-5).toUpperCase()}`;
+      await structuralEditorApi.createShell(projectId, {
+        id: sid,
+        joints: jids,
+        section: "",
+        element_type: "slab",
+        thickness_m: defaultThickness,
+        story,
+      });
+      await onModelChanged?.();
+    } catch (e) {
+      setSaveError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function createInfillFromBay(a: PendingPoint, b: PendingPoint) {
+    if (!projectId) return;
+    if (!defaultMasonry) { setSaveError("Crea un material de mampostería primero"); return; }
+    setSaving(true); setSaveError(null);
+    try {
+      // Snap de cada clic a la columna más cercana del story actual.
+      // Una columna está representada por su joint tope (joint_j) en el plano XY.
+      const colsHere: { fid: string; x: number; y: number }[] = [];
+      for (const [fid, fr] of Object.entries(geometry.frames ?? {})) {
+        if ((fr.element_type ?? "").toLowerCase() !== "column") continue;
+        if ((fr.story ?? "") !== story) continue;
+        const jTop = geometry.joints?.[fr.joint_j];
+        if (!jTop) continue;
+        colsHere.push({ fid, x: jTop.x, y: jTop.y });
+      }
+      if (colsHere.length < 2) {
+        setSaveError(`Se necesitan al menos 2 columnas en el story '${story}'.`);
+        return;
+      }
+      const nearest = (p: PendingPoint) =>
+        colsHere.reduce((best, c) => {
+          const d = Math.hypot(c.x - p.x, c.y - p.y);
+          return d < best.d ? { fid: c.fid, d } : best;
+        }, { fid: "", d: Infinity });
+      const nA = nearest(a); const nB = nearest(b);
+      // Tolerancia: el clic debe caer a < 1.5 m de la columna (snap razonable).
+      if (nA.d > 1.5 || nB.d > 1.5) {
+        setSaveError("Clickea cerca de dos columnas (snap < 1.5 m).");
+        return;
+      }
+      if (!nA.fid || !nB.fid || nA.fid === nB.fid) {
+        setSaveError("Selecciona 2 columnas distintas del vano.");
+        return;
+      }
+      const iid = `INF-${Date.now().toString(36).slice(-5).toUpperCase()}`;
+      await structuralEditorApi.createInfill(projectId, {
+        id: iid,
+        column_i_fid: nA.fid,
+        column_j_fid: nB.fid,
+        story,
+        thickness_m: defaultThickness,
+        masonry_material_id: defaultMasonry,
+        opening_ratio: 0.0,
+        width_ratio: 0.25,
+      });
+      await onModelChanged?.();
+    } catch (e) {
+      setSaveError((e as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
 
   // ── Helpers geométricos ───────────────────────────────────────────────────
   const orientedRectPoints = (
@@ -209,8 +518,7 @@ export default function Building2DPlanView({
 
   const twEmphasized = (tw: number) => {
     if (!wallEmphasis) return Math.max(tw || 0.2, 0.05);
-    // Amplifica el espesor para que sea legible manteniendo proporción visual.
-    const factor = Math.max(rawW, rawH) / 60;   // ≈ 0.5m para edificios de 30m
+    const factor = Math.max(rawW, rawH) / 60;
     return Math.max(tw || 0.2, 0.05, factor);
   };
 
@@ -226,8 +534,8 @@ export default function Building2DPlanView({
         strokeLinejoin="round" vectorEffect="non-scaling-stroke"
         onMouseEnter={(e) => setHover({ x: e.clientX, y: e.clientY, label: id, section, extra: "Losa" })}
         onMouseLeave={() => setHover(null)}
-        onClick={() => onElementClick?.({ id, type: "slab", label: id })}
-        style={{ cursor: onElementClick ? "pointer" : "default" }}
+        onClick={() => tool === "select" && onElementClick?.({ id, type: "slab", label: id })}
+        style={{ cursor: onElementClick && tool === "select" ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }}
       />
     );
   };
@@ -257,8 +565,8 @@ export default function Building2DPlanView({
           extra: `Muro · lw=${lw.toFixed(2)}m tw=${twReal.toFixed(3)}m · ${g.shell_ids.length} sub-paneles`,
         })}
         onMouseLeave={() => setHover(null)}
-        onClick={() => onElementClick?.({ id: firstId, type: "wall", label: g.pier })}
-        style={{ cursor: onElementClick ? "pointer" : "default" }}
+        onClick={() => tool === "select" && onElementClick?.({ id: firstId, type: "wall", label: g.pier })}
+        style={{ cursor: onElementClick && tool === "select" ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }}
       />
     );
   };
@@ -277,8 +585,8 @@ export default function Building2DPlanView({
         vectorEffect="non-scaling-stroke"
         onMouseEnter={(e) => setHover({ x: e.clientX, y: e.clientY, label: id, section, extra: `Columna · h=${h.toFixed(2)}m b=${b.toFixed(2)}m` })}
         onMouseLeave={() => setHover(null)}
-        onClick={() => onElementClick?.({ id, type: "column", label: id })}
-        style={{ cursor: onElementClick ? "pointer" : "default" }}
+        onClick={() => tool === "select" && onElementClick?.({ id, type: "column", label: id })}
+        style={{ cursor: onElementClick && tool === "select" ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }}
       />
     );
   };
@@ -294,8 +602,8 @@ export default function Building2DPlanView({
         strokeLinejoin="miter" vectorEffect="non-scaling-stroke"
         onMouseEnter={(e) => setHover({ x: e.clientX, y: e.clientY, label: id, section, extra: `Viga · L=${length.toFixed(2)}m b=${bWidth.toFixed(2)}m` })}
         onMouseLeave={() => setHover(null)}
-        onClick={() => onElementClick?.({ id, type: "beam", label: id })}
-        style={{ cursor: onElementClick ? "pointer" : "default" }}
+        onClick={() => tool === "select" && onElementClick?.({ id, type: "beam", label: id })}
+        style={{ cursor: onElementClick && tool === "select" ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }}
       />
     );
   };
@@ -325,6 +633,35 @@ export default function Building2DPlanView({
     }
   }
 
+  // Ejes del usuario (grid definido en /model/grid)
+  const userGridLines: React.ReactElement[] = [];
+  if (showGrid && grid) {
+    for (const ax of grid.axes_x) {
+      userGridLines.push(
+        <line key={`ugx-${ax.name}`} x1={ax.coord_m} y1={vbY} x2={ax.coord_m} y2={vbY + vbH}
+          stroke={COLORS.gridUser} strokeWidth={1.2} strokeDasharray="4 3"
+          vectorEffect="non-scaling-stroke" />
+      );
+      userGridLines.push(
+        <text key={`ugxl-${ax.name}`} x={ax.coord_m} y={vbY + 0.8}
+          fill={COLORS.gridUser} fontSize={Math.max(0.35, rawH / 90)}
+          textAnchor="middle" style={{ fontWeight: 600, pointerEvents: "none" }}>{ax.name}</text>,
+      );
+    }
+    for (const ay of grid.axes_y) {
+      userGridLines.push(
+        <line key={`ugy-${ay.name}`} x1={vbX} y1={ay.coord_m} x2={vbX + vbW} y2={ay.coord_m}
+          stroke={COLORS.gridUser} strokeWidth={1.2} strokeDasharray="4 3"
+          vectorEffect="non-scaling-stroke" />
+      );
+      userGridLines.push(
+        <text key={`ugyl-${ay.name}`} x={vbX + 0.5} y={ay.coord_m}
+          fill={COLORS.gridUser} fontSize={Math.max(0.35, rawH / 90)}
+          dominantBaseline="middle" style={{ fontWeight: 600, pointerEvents: "none" }}>{ay.name}</text>,
+      );
+    }
+  }
+
   const wallLabels = useMemo(() => {
     if (!showLabels) return [];
     return wallsInStory.map((g) => {
@@ -346,9 +683,17 @@ export default function Building2DPlanView({
 
   const labelFontSize = Math.max(0.25, rawH / 100);
 
+  // ── Snap preview del pointer ──────────────────────────────────────────────
+  const snapPreview = useMemo(() => {
+    if (!canEdit || tool === "select" || !pointerXY) return null;
+    return snapPoint(pointerXY.x, pointerXY.y);
+  }, [canEdit, tool, pointerXY, snapPoint]);
+
+  const svgCursor = dragRef.current ? "grabbing" : (tool !== "select" && canEdit ? "crosshair" : "grab");
+
   return (
     <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
-      {/* Toolbar */}
+      {/* Toolbar principal */}
       <div className="px-4 py-2.5 border-b border-[var(--border)] bg-[var(--surface-2)] flex items-center gap-3 flex-wrap text-xs">
         <span className="font-semibold text-[var(--text)] uppercase tracking-wider">Planta 2D</span>
         <select
@@ -378,6 +723,79 @@ export default function Building2DPlanView({
         </button>
       </div>
 
+      {/* Toolbar de DIBUJO */}
+      {canEdit && (
+        <div className="px-4 py-2 border-b border-[var(--border)] bg-[var(--surface)] flex items-center gap-2 flex-wrap text-xs">
+          <span className="text-[var(--text-muted)] uppercase tracking-wider text-[10px]">Herramienta</span>
+          <ToolButton active={tool === "select"} onClick={() => setTool("select")} label="Seleccionar" hotkey="S" />
+          <ToolButton active={tool === "column"} onClick={() => setTool("column")} label="Columna" hotkey="C" />
+          <ToolButton active={tool === "beam"}   onClick={() => setTool("beam")}   label="Viga"    hotkey="V" />
+          <ToolButton active={tool === "wall"}   onClick={() => setTool("wall")}   label="Muro"    hotkey="M" />
+          <ToolButton active={tool === "slab"}   onClick={() => setTool("slab")}   label="Losa"    hotkey="L" />
+          <ToolButton active={tool === "infill"} onClick={() => setTool("infill")} label="Infill"  hotkey="I" />
+
+          {(tool === "column" || tool === "beam") && (
+            <>
+              <span className="text-[var(--text-muted)] ml-2">Sección:</span>
+              <select
+                value={defaultSection}
+                onChange={(e) => setDefaultSection(e.target.value)}
+                className="bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1 text-[var(--text)] text-[11px]"
+              >
+                <option value="">— Sin sección —</option>
+                {sections && Object.keys(sections).map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </>
+          )}
+          {(tool === "wall" || tool === "slab" || tool === "infill") && (
+            <>
+              <span className="text-[var(--text-muted)] ml-2">Espesor (m):</span>
+              <input
+                type="number" step="0.01" min={0.05} max={1.0}
+                value={defaultThickness}
+                onChange={(e) => setDefaultThickness(Math.max(0.05, Number(e.target.value) || 0.20))}
+                className="bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1 text-[var(--text)] w-20 text-[11px]"
+              />
+            </>
+          )}
+          {tool === "infill" && (
+            <>
+              <span className="text-[var(--text-muted)] ml-2">Mampostería:</span>
+              <select
+                value={defaultMasonry}
+                onChange={(e) => setDefaultMasonry(e.target.value)}
+                className="bg-[var(--surface)] border border-[var(--border)] rounded px-2 py-1 text-[var(--text)] text-[11px]"
+              >
+                <option value="">— Selecciona material —</option>
+                {masonryMaterials && Object.entries(masonryMaterials).map(([id, m]) => (
+                  <option key={id} value={id}>{m.name} · fm={m.fm_mpa} MPa</option>
+                ))}
+              </select>
+            </>
+          )}
+
+          <span className="ml-auto text-[10px] font-mono text-[var(--text-muted)]">
+            {tool === "select" && "Modo selección"}
+            {tool === "column" && `Clic para colocar columna · z=${(geometry.stories[story]?.elevation_m ?? 0).toFixed(2)}m`}
+            {tool === "beam"   && `Clic 2 puntos para viga · ${pending.length}/2`}
+            {tool === "wall"   && `Clic 2 esquinas del muro · ${pending.length}/2`}
+            {tool === "slab"   && `Clic N puntos + doble-click para cerrar · ${pending.length} pt`}
+            {tool === "infill" && `Clic 2 columnas del vano · ${pending.length}/2`}
+            {saving && " · guardando..."}
+          </span>
+          {pending.length > 0 && (
+            <button onClick={() => setPending([])} className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)]">
+              Cancelar
+            </button>
+          )}
+        </div>
+      )}
+      {saveError && (
+        <div className="px-4 py-1.5 bg-red-50 border-b border-red-200 text-[11px] text-red-700 font-mono">
+          {saveError}
+        </div>
+      )}
+
       <div className="relative bg-[var(--surface)]" style={{ height }}>
         <svg
           ref={svgRef}
@@ -388,29 +806,26 @@ export default function Building2DPlanView({
           onMouseMove={onMouseMove}
           onMouseUp={endDrag}
           onMouseLeave={endDrag}
-          style={{ width: "100%", height: "100%", cursor: dragRef.current ? "grabbing" : "grab", background: "var(--surface)" }}
+          onClick={handleSvgClick}
+          onDoubleClick={handleSvgDoubleClick}
+          style={{ width: "100%", height: "100%", cursor: svgCursor, background: "var(--surface)" }}
         >
           {gridLines}
+          {userGridLines}
 
           {/* Origen (0,0) */}
           <circle cx={0} cy={0} r={0.2}
             fill="none" stroke="#f59e0b" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
 
-          {/* Losas primero (fondo) */}
           {showSlabs && slabsInStory.map(([id, s]) => renderSlab(id, s.joints, s.section))}
-
-          {/* Marcos (columnas y vigas) por debajo de muros */}
           {showFrames && framesInStory.map(([id, f]) => {
             const ji = geometry.joints[f.joint_i]; const jj = geometry.joints[f.joint_j];
             if (!ji || !jj) return null;
             if (f.element_type === "column") return renderColumn(id, ji.x, ji.y, f.section);
             return renderBeam(id, ji.x, ji.y, jj.x, jj.y, f.section);
           })}
-
-          {/* Muros arriba de todo */}
           {showWalls && wallsInStory.map((g) => renderWallGroup(g))}
 
-          {/* Etiquetas de pier */}
           {showLabels && wallLabels.map(({ pier, cx, cy }) => (
             <text key={`lbl-${pier}`} x={cx} y={cy}
               fill={COLORS.wallLbl} fontSize={labelFontSize}
@@ -420,6 +835,55 @@ export default function Building2DPlanView({
               {pier}
             </text>
           ))}
+
+          {/* Ghost de puntos pendientes + previa de la línea/polígono */}
+          {pending.map((p, i) => (
+            <circle key={`pend-${i}`} cx={p.x} cy={p.y} r={0.15}
+              fill={COLORS.ghost} stroke={COLORS.ghost} strokeWidth={1.5}
+              vectorEffect="non-scaling-stroke" style={{ pointerEvents: "none" }} />
+          ))}
+          {pending.length >= 1 && snapPreview && (tool === "beam" || tool === "wall" || tool === "infill") && (
+            <line
+              x1={pending[pending.length - 1].x} y1={pending[pending.length - 1].y}
+              x2={snapPreview.x} y2={snapPreview.y}
+              stroke={COLORS.ghost} strokeWidth={1.2} strokeDasharray="6 4"
+              vectorEffect="non-scaling-stroke" style={{ pointerEvents: "none" }}
+            />
+          )}
+          {pending.length >= 1 && tool === "slab" && snapPreview && (
+            <>
+              <line
+                x1={pending[pending.length - 1].x} y1={pending[pending.length - 1].y}
+                x2={snapPreview.x} y2={snapPreview.y}
+                stroke={COLORS.ghost} strokeWidth={1.2} strokeDasharray="6 4"
+                vectorEffect="non-scaling-stroke" style={{ pointerEvents: "none" }}
+              />
+              {pending.length >= 2 && (
+                <line
+                  x1={pending[0].x} y1={pending[0].y}
+                  x2={snapPreview.x} y2={snapPreview.y}
+                  stroke={COLORS.ghost} strokeWidth={0.8} strokeDasharray="3 3"
+                  vectorEffect="non-scaling-stroke" style={{ pointerEvents: "none", opacity: 0.5 }}
+                />
+              )}
+            </>
+          )}
+
+          {/* Snap crosshair */}
+          {snapPreview && canEdit && tool !== "select" && (
+            <>
+              <circle cx={snapPreview.x} cy={snapPreview.y} r={0.25}
+                fill="none" stroke={snapPreview.jointId ? COLORS.snap : COLORS.ghost}
+                strokeWidth={1.5} vectorEffect="non-scaling-stroke"
+                style={{ pointerEvents: "none" }} />
+              {snapPreview.jointId && (
+                <text x={snapPreview.x} y={snapPreview.y - 0.45}
+                  fill={COLORS.snap} fontSize={Math.max(0.3, rawH / 110)}
+                  textAnchor="middle" style={{ pointerEvents: "none", fontWeight: 600 }}
+                >{snapPreview.jointId}</text>
+              )}
+            </>
+          )}
         </svg>
 
         {/* Tooltip */}
@@ -449,6 +913,18 @@ export default function Building2DPlanView({
   );
 }
 
+// ── Helpers puros ────────────────────────────────────────────────────────────
+
+function nearestOr(v: number, arr: number[], tol: number): number | null {
+  let best: number | null = null;
+  let bestD = Infinity;
+  for (const c of arr) {
+    const d = Math.abs(c - v);
+    if (d < tol && d < bestD) { best = c; bestD = d; }
+  }
+  return best;
+}
+
 function ToggleChip({ active, onClick, label }: { active: boolean; onClick: () => void; label: string }) {
   return (
     <button onClick={onClick}
@@ -459,6 +935,24 @@ function ToggleChip({ active, onClick, label }: { active: boolean; onClick: () =
           : "bg-[var(--surface)] text-[var(--text-muted)] border border-[var(--border)] hover:text-[var(--text)]",
       ].join(" ")}>
       {label}
+    </button>
+  );
+}
+
+function ToolButton(
+  { active, onClick, label, hotkey }: { active: boolean; onClick: () => void; label: string; hotkey?: string },
+) {
+  return (
+    <button onClick={onClick}
+      title={hotkey ? `Tecla: ${hotkey}` : undefined}
+      className={[
+        "px-2.5 py-1 rounded text-[11px] font-semibold transition-colors flex items-center gap-1.5",
+        active
+          ? "bg-blue-600 text-white shadow-sm"
+          : "bg-[var(--surface-2)] text-[var(--text)] border border-[var(--border)] hover:bg-[var(--surface)]",
+      ].join(" ")}>
+      {label}
+      {hotkey && <span className={active ? "text-blue-100 text-[9px]" : "text-[var(--text-muted)] text-[9px]"}>[{hotkey}]</span>}
     </button>
   );
 }

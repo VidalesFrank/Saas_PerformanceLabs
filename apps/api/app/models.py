@@ -209,6 +209,7 @@ class StructuralAnalysisType(str, enum.Enum):
     wall_design     = "wall_design"      # Diseño RC de pieres (NSR-10 C.21): ρ, EBE, estribos
     nl_pushover     = "nl_pushover"      # Pushover no lineal de edificio de muros (MVLEM_3D)
     variant_pushover = "variant_pushover" # Re-análisis pushover NL de una variante de rediseño
+    frame_pushover  = "frame_pushover"   # Pushover no lineal de pórticos RC (forceBeamColumn + fibras)
 
 
 class StructuralJobStatus(str, enum.Enum):
@@ -275,6 +276,10 @@ class StructuralJob(Base):
     result_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # Progreso en vivo del análisis (actualizado por tasks largos cada N pasos).
+    # Formato libre: típicamente {direction, step, total, drift_pct, base_shear_kN, pct}
+    progress_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     project_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("structural_projects.id"), nullable=False

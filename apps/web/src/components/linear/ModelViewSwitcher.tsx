@@ -1,65 +1,104 @@
 "use client";
 
 /**
- * ModelViewSwitcher — toggle 3D ↔ 2D del modelo estructural.
+ * ModelViewSwitcher — toggle 3D ↔ Planta 2D ↔ Elevación 2D del modelo.
  *
- * Muestra un botón segmentado que alterna entre el visor 3D Plotly y la vista
- * en planta 2D SVG por piso. La geometría es compartida y solo se elige qué
- * componente montar.
+ * Cuando se pasa `projectId`, las vistas 2D activan el modo de dibujo, que
+ * permite crear columnas/vigas/muros/losas/infills con clics en el SVG y
+ * refresca el modelo canónico automáticamente al guardar.
  */
 import { useState } from "react";
-import type { ModelGeometry, SectionData } from "@/lib/structural-types";
+import type {
+  ModelGeometry,
+  SectionData,
+  GridDefinition,
+  MasonryMaterial,
+  InfillPanel,
+} from "@/lib/structural-types";
 import { LinearModelViewer3D } from "./LinearModelViewer3D";
-import Building2DPlanView     from "./Building2DPlanView";
+import Building2DPlanView from "./Building2DPlanView";
+import BuildingElevationView from "./BuildingElevationView";
 
-type ViewMode = "3d" | "2d";
+type ViewMode = "3d" | "plan" | "elevation";
 
 interface Props {
   geometry: ModelGeometry;
-  /** Secciones del canonical model — usadas por la vista 2D para dibujar
-   *  columnas y vigas con dimensiones reales (h×b). Opcional. */
   sections?: Record<string, SectionData>;
+  /** Datos del modelo completo — usados por editores 2D para snap y dibujo. */
+  grid?: GridDefinition;
+  masonryMaterials?: Record<string, MasonryMaterial>;
+  infills?: Record<string, InfillPanel>;
+  /** Habilita edición: cuando se pasa, las vistas 2D pueden crear elementos. */
+  projectId?: string;
+  onModelChanged?: () => void | Promise<void>;
   initial?: ViewMode;
-  /** Callback opcional que la página puede usar para lazy-cargar sections
-   *  cuando el usuario cambia a Vista en Planta y todavía no están listas. */
   onSwitchTo2D?: () => void;
 }
 
-export default function ModelViewSwitcher({ geometry, sections, initial = "3d", onSwitchTo2D }: Props) {
+export default function ModelViewSwitcher({
+  geometry, sections, grid, masonryMaterials, infills,
+  projectId, onModelChanged, initial = "3d", onSwitchTo2D,
+}: Props) {
   const [mode, setMode] = useState<ViewMode>(initial);
+
+  const handleSwitch = (m: ViewMode) => {
+    setMode(m);
+    if (m !== "3d") onSwitchTo2D?.();
+  };
 
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-center gap-1 self-start rounded-lg border border-[var(--border)] bg-[var(--surface-2)] p-0.5">
-        <button
-          onClick={() => setMode("3d")}
-          className={[
-            "px-3 py-1.5 rounded-md text-xs font-medium transition-colors",
-            mode === "3d"
-              ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
-              : "text-[var(--text-muted)] hover:text-[var(--text)]",
-          ].join(" ")}
-        >
-          Vista 3D
-        </button>
-        <button
-          onClick={() => { setMode("2d"); onSwitchTo2D?.(); }}
-          className={[
-            "px-3 py-1.5 rounded-md text-xs font-medium transition-colors",
-            mode === "2d"
-              ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
-              : "text-[var(--text-muted)] hover:text-[var(--text)]",
-          ].join(" ")}
-        >
-          Vista en Planta
-        </button>
+        <SwitchBtn active={mode === "3d"}        onClick={() => handleSwitch("3d")}        label="Vista 3D" />
+        <SwitchBtn active={mode === "plan"}      onClick={() => handleSwitch("plan")}      label="Vista en Planta" />
+        <SwitchBtn active={mode === "elevation"} onClick={() => handleSwitch("elevation")} label="Vista en Elevación" />
       </div>
 
-      {mode === "3d" ? (
-        <LinearModelViewer3D geometry={geometry} />
-      ) : (
-        <Building2DPlanView geometry={geometry} sections={sections} />
+      {mode === "3d" && (
+        <LinearModelViewer3D
+          geometry={geometry}
+          infills={infills}
+          showInfills={true}
+          grid={grid}
+        />
+      )}
+      {mode === "plan" && (
+        <Building2DPlanView
+          geometry={geometry}
+          sections={sections}
+          grid={grid}
+          masonryMaterials={masonryMaterials}
+          projectId={projectId}
+          onModelChanged={onModelChanged}
+        />
+      )}
+      {mode === "elevation" && (
+        <BuildingElevationView
+          geometry={geometry}
+          sections={sections}
+          grid={grid}
+          masonryMaterials={masonryMaterials}
+          infills={infills}
+          projectId={projectId}
+          onModelChanged={onModelChanged}
+        />
       )}
     </div>
+  );
+}
+
+function SwitchBtn({ active, onClick, label }: { active: boolean; onClick: () => void; label: string }) {
+  return (
+    <button
+      onClick={onClick}
+      className={[
+        "px-3 py-1.5 rounded-md text-xs font-medium transition-colors",
+        active
+          ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
+          : "text-[var(--text-muted)] hover:text-[var(--text)]",
+      ].join(" ")}
+    >
+      {label}
+    </button>
   );
 }

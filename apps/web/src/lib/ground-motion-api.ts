@@ -79,8 +79,16 @@ export async function deleteRecord(id: string): Promise<void> {
 
 // ── Historia de tiempo ─────────────────────────────────────────────────────
 
-export async function getTimeseries(id: string, component = ''): Promise<TimeseriesData> {
-  const url = `${BASE}/records/${id}/timeseries${component ? `?component=${component}` : ''}`
+export async function getTimeseries(
+  id: string,
+  component = '',
+  opts: { maxPoints?: number; full?: boolean } = {},
+): Promise<TimeseriesData> {
+  const qs = new URLSearchParams()
+  if (component) qs.set('component', component)
+  if (opts.maxPoints !== undefined) qs.set('max_points', String(opts.maxPoints))
+  if (opts.full) qs.set('full', 'true')
+  const url = `${BASE}/records/${id}/timeseries${qs.toString() ? '?' + qs.toString() : ''}`
   const res = await fetch(url, { headers: { ...authHeader() } })
   return handleResponse<TimeseriesData>(res)
 }
@@ -150,6 +158,49 @@ export async function computeSpectrum(
     body: JSON.stringify(params),
   })
   return handleResponse<SpectrumResult | SpectrumMultiXiResult>(res)
+}
+
+export async function exportSpectrum(
+  id: string,
+  params: {
+    component?: string
+    xi_list?: number[]
+    T_min?: number
+    T_max?: number
+    n_points?: number
+  },
+  format: 'xlsx' | 'txt',
+): Promise<{ blob: Blob; filename: string }> {
+  const res = await fetch(`${BASE}/records/${id}/spectrum/export?format=${format}`, {
+    method: 'POST',
+    headers: { ...authHeader(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...params, multi_xi: true }),
+  })
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`
+    try {
+      const body = await res.json()
+      msg = body.detail || body.message || msg
+    } catch {}
+    throw new Error(msg)
+  }
+  // Content-Disposition suele venir como: attachment; filename="foo.xlsx"
+  const dispo = res.headers.get('Content-Disposition') || ''
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(dispo)
+  const filename = match ? decodeURIComponent(match[1]) : `espectros.${format}`
+  const blob = await res.blob()
+  return { blob, filename }
+}
+
+export function triggerDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 export async function spectrumAtPeriod(

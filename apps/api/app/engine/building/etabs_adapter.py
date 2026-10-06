@@ -88,15 +88,91 @@ def _t_joints(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _t_frames(df: pd.DataFrame) -> pd.DataFrame:
-    """Objects and Elements - Frames (E23→E17): columnas de joints y label."""
+    """
+    Objects and Elements - Frames (E23→E17): columnas de joints y label.
+
+    ETABS23 subdivide una misma viga en varios segmentos (`24-1`, `24-2`, ...)
+    cuando introduce joints internos de mesh (labels con prefijo `~`, ej. `~143`).
+    Esos joints NO se exportan a la tabla `Objects and Elements - Joints`, así
+    que si se dejan tal cual el builder descarta los segmentos por "joint
+    huérfano" y la viga desaparece del modelo. Aquí consolidamos cada Object
+    Name en una sola fila que va del joint real del primer segmento al joint
+    real del último, ignorando los `~` intermedios.
+    """
     df = df.copy()
     df.rename(columns={
         'Element Name': 'Element Label',
         'Elm JtI': 'Joint I',
         'Elm JtJ': 'Joint J',
     }, inplace=True)
+
     cols = ['Story', 'Element Label', 'Object Type', 'Object Label',
-            'Joint I', 'Joint J']
+            'Object Name', 'Joint I', 'Joint J']
+    df = df[[c for c in cols if c in df.columns]].copy()
+
+    # La hoja `Objects and Elements - Frames` de ETABS23 mezcla filas Frame y
+    # Shell (los shells tienen Element Name con prefijo `@LC-...`). Filtramos
+    # aquí para que el groupby por Object Name no cruce columnas con shells
+    # (ambos pueden compartir Object Name numérico dentro del mismo piso).
+    if 'Object Type' in df.columns:
+        df = df[df['Object Type'].astype(str).str.strip().str.lower() == 'frame'].copy()
+
+    def _is_internal(j) -> bool:
+        s = str(j).strip()
+        return s.startswith('~') or s == '' or s.lower() == 'nan'
+
+    def _clean(v) -> str:
+        """Normaliza un valor de joint/label a string sin sufijo '.0' de floats."""
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return ''
+        s = str(v).strip()
+        if s.endswith('.0'):
+            s = s[:-2]
+        return s
+
+    # Group segments by (Story, Object Name) — only if 'Object Name' exists.
+    if 'Object Name' in df.columns:
+        out_rows: list[dict] = []
+        seen: set[tuple] = set()
+        for (story, obj_name), grp in df.groupby(['Story', 'Object Name'], sort=False):
+            if pd.isna(obj_name):
+                for _, r in grp.iterrows():
+                    d = r.to_dict()
+                    d['Element Label'] = _clean(d.get('Element Label'))
+                    d['Joint I'] = _clean(d.get('Joint I'))
+                    d['Joint J'] = _clean(d.get('Joint J'))
+                    out_rows.append(d)
+                continue
+            key = (story, obj_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(grp) == 1:
+                r = grp.iloc[0].to_dict()
+                r['Element Label'] = _clean(r.get('Element Label'))
+                r['Joint I'] = _clean(r.get('Joint I'))
+                r['Joint J'] = _clean(r.get('Joint J'))
+                out_rows.append(r)
+                continue
+            # Segmentado: primer Joint I real + último Joint J real (siguiendo
+            # el orden de aparición, que en ETABS es de I→J a lo largo del eje).
+            first_i = None
+            last_j = None
+            for _, r in grp.iterrows():
+                ji, jj = _clean(r.get('Joint I')), _clean(r.get('Joint J'))
+                if first_i is None and not _is_internal(ji):
+                    first_i = ji
+                if not _is_internal(jj):
+                    last_j = jj
+            if first_i is None or last_j is None:
+                continue
+            merged = grp.iloc[0].to_dict()
+            merged['Joint I'] = first_i
+            merged['Joint J'] = last_j
+            merged['Element Label'] = _clean(obj_name)
+            out_rows.append(merged)
+        df = pd.DataFrame(out_rows, dtype=object)
+
     return df[[c for c in cols if c in df.columns]]
 
 
@@ -423,6 +499,42 @@ def _t_offsets(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _t_grid(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Grid Definitions - Grid Lines → tabla normalizada de ejes.
+
+    Input (ETABS 23):
+        Name | Grid Line Type | ID | Ordinate | Bubble Location | Visible
+
+    Output (2 columnas):
+        Axis (X | Y)  |  Label  |  Coord_m
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if 'Grid Line Type' not in df.columns or 'ID' not in df.columns:
+        return pd.DataFrame(columns=['Axis', 'Label', 'Coord_m'])
+
+    df['Grid Line Type'] = df['Grid Line Type'].astype(str).str.strip()
+    df['Ordinate'] = pd.to_numeric(df.get('Ordinate'), errors='coerce')
+
+    rows = []
+    for _, r in df.iterrows():
+        t = r['Grid Line Type'].lower()
+        if t.startswith('x'):
+            axis = 'X'
+        elif t.startswith('y'):
+            axis = 'Y'
+        else:
+            continue
+        label = str(r.get('ID', '')).strip()
+        coord = r['Ordinate']
+        if not label or pd.isna(coord):
+            continue
+        rows.append({'Axis': axis, 'Label': label, 'Coord_m': float(coord)})
+
+    return pd.DataFrame(rows, columns=['Axis', 'Label', 'Coord_m'])
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def adapt_e23_to_e17(input_path: str, output_path: str) -> None:
@@ -457,6 +569,7 @@ def adapt_e23_to_e17(input_path: str, output_path: str) -> None:
     df_diaphr_asgns  = _read(xl, 'Joint Assigns - Diaphragms')
     df_local_axes    = _read(xl, 'Frame Assigns - Local Axes')
     df_offsets       = _read(xl, 'Frame Assigns - End Len Offsets')
+    df_grid_raw      = _read(xl, 'Grid Definitions - Grid Lines')
 
     # Derivar story_order para pier props (bottom → top)
     story_order = []
@@ -486,6 +599,7 @@ def adapt_e23_to_e17(input_path: str, output_path: str) -> None:
     df_da = _t_diaphragms(df_diaphr_asgns) if df_diaphr_asgns is not None else None
     df_la = _t_local_axes(df_local_axes, df_fr_summary) if df_local_axes is not None else None
     df_of = _t_offsets(df_offsets) if df_offsets is not None else None
+    df_gd = _t_grid(df_grid_raw) if df_grid_raw is not None else None
 
     # --- escribir XLSX E17-compatible ---
     wb = Workbook()
@@ -531,18 +645,20 @@ def adapt_e23_to_e17(input_path: str, output_path: str) -> None:
 
     if df_mass_diaphr is not None:
         dm = df_mass_diaphr.copy()
-        # E17 exporta masa en kg y momento de inercia en ton·m² — convertir desde ton/ton·m²
-        for col in ['Mass X', 'Mass Y']:
+        # ETABS23 exporta masa por diafragma en TON (verificado en fila de
+        # unidades del XLSX raw). El builder de CanonicalModelBuilder guarda el
+        # valor tal cual en `mass_x_t` (toneladas), y ops_builder pasa ese
+        # número a `ops.mass()` bajo el sistema kN-m-s (donde 1 unidad de masa
+        # = 1 kN·s²/m = 1 ton). Cualquier conversión aquí introduce un factor
+        # 1000 en los periodos (T ∝ √m).
+        for col in ('Mass X', 'Mass Y', 'Mass Moment of Inertia'):
             if col in dm.columns:
-                dm[col] = pd.to_numeric(dm[col], errors='coerce') * 1000.0  # ton → kg
-        if 'Mass Moment of Inertia' in dm.columns:
-            dm['Mass Moment of Inertia'] = pd.to_numeric(
-                dm['Mass Moment of Inertia'], errors='coerce')  # ton·m² ya está correcto
+                dm[col] = pd.to_numeric(dm[col], errors='coerce')
         _write_sheet(wb, 'Mass Summary by Diaphragm',
                      'TABLE:  "MASS SUMMARY BY DIAPHRAGM"',
                      ['Story', 'Diaphragm', 'Mass X', 'Mass Y',
                       'Mass Moment of Inertia', 'X Mass Center', 'Y Mass Center'],
-                     [None, None, 'kg', 'kg', 'ton-m2', 'm', 'm'],
+                     [None, None, 'ton', 'ton', 'ton-m2', 'm', 'm'],
                      dm)
 
     if df_r is not None:
@@ -666,5 +782,12 @@ def adapt_e23_to_e17(input_path: str, output_path: str) -> None:
                      list(df_of.columns),
                      [None] * len(df_of.columns),
                      df_of)
+
+    if df_gd is not None and len(df_gd):
+        _write_sheet(wb, 'Grid Definitions',
+                     'TABLE:  "GRID DEFINITIONS"',
+                     ['Axis', 'Label', 'Coord_m'],
+                     [None, None, 'm'],
+                     df_gd)
 
     wb.save(output_path)

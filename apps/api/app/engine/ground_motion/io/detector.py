@@ -272,6 +272,11 @@ def detect_structure(filename: str, content: bytes) -> DetectedStructure:
     ext = Path(filename).suffix.lower()
     warnings: list[str] = []
 
+    # ── miniSEED (formato binario sismológico estándar) ───────────────────────
+    if ext in (".msd", ".mseed", ".seed"):
+        from .miniseed import detect_miniseed_structure
+        return detect_miniseed_structure(filename, content)
+
     # ── Excel (delega a pandas) ───────────────────────────────────────────────
     if ext in (".xls", ".xlsx"):
         return _detect_excel(filename, content)

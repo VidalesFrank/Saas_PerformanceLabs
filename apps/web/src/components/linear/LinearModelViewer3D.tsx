@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useMemo } from "react";
-import type { ModelGeometry } from "@/lib/structural-types";
+import type { ModelGeometry, InfillPanel } from "@/lib/structural-types";
 import type { ElementClickInfo, ColorMode, ViewerTypeFilter } from "@/lib/structural-types";
 import { useTheme } from "@/lib/theme";
 import { viewer3dTheme } from "@/lib/plotly-theme";
@@ -95,6 +95,353 @@ function appendBox(p0:V3,p1:V3,b:number,h:number,offset:number,
 const LIGHTING = { ambient:0.55, diffuse:0.9, roughness:0.25, specular:0.65, fresnel:0.2 };
 const LIGHTPOS  = { x:2000, y:2000, z:5000 };
 
+// ── Infills 3D (puntales cruzados + panel translúcido) ────────────────────────
+const C_INFILL_STRUT = "#c2410c";
+const C_INFILL_FRAME = "#d97706";
+
+interface PierGeom4 {
+  base_left: V3; base_right: V3; top_left: V3; top_right: V3;
+}
+
+/**
+ * Deriva las 4 esquinas del vano del panel a partir de los dos fids de columna
+ * (column_i_fid, column_j_fid) del canonical. Cada columna aporta 2 nodos
+ * (joint_i base, joint_j tope); los 4 nodos definen el rectángulo del panel.
+ *
+ * Fallback: si el panel no tiene column_*_fid (modelos legacy), intenta usar
+ * `pier` + shells de muros con la heurística anterior.
+ */
+function deriveInfillCorners(
+  geometry: ModelGeometry, inf: InfillPanel,
+): PierGeom4 | null {
+  // Prefiere column_i_fid / column_j_fid (modelo nuevo).
+  const fi = inf.column_i_fid ?? "";
+  const fj = inf.column_j_fid ?? "";
+  const frI = fi ? geometry.frames[fi] : undefined;
+  const frJ = fj ? geometry.frames[fj] : undefined;
+  if (frI && frJ) {
+    const jIBot = geometry.joints[frI.joint_i];
+    const jITop = geometry.joints[frI.joint_j];
+    const jJBot = geometry.joints[frJ.joint_i];
+    const jJTop = geometry.joints[frJ.joint_j];
+    if (jIBot && jITop && jJBot && jJTop) {
+      return {
+        base_left:  [jIBot.x, jIBot.y, jIBot.z],
+        base_right: [jJBot.x, jJBot.y, jJBot.z],
+        top_left:   [jITop.x, jITop.y, jITop.z],
+        top_right:  [jJTop.x, jJTop.y, jJTop.z],
+      };
+    }
+  }
+
+  // Fallback legacy: pier (muros) + heurística de joints más distantes.
+  const pier = inf.pier ?? "";
+  if (!pier) return null;
+  const storyInfo = geometry.stories[inf.story];
+  if (!storyInfo) return null;
+  const zTop = storyInfo.elevation_m;
+  let zBase = 0;
+  for (const s of Object.values(geometry.stories)) {
+    if (s.elevation_m < zTop && s.elevation_m > zBase) zBase = s.elevation_m;
+  }
+  if (Math.abs(zTop - zBase) < 0.05) zBase = Math.max(0, zTop - (storyInfo.height_m ?? 3.0));
+  const seenXY = new Set<string>();
+  const pts: { x: number; y: number }[] = [];
+  for (const sh of Object.values(geometry.shells)) {
+    if (sh.element_type !== "wall") continue;
+    if ((sh.pier ?? "") !== pier) continue;
+    if (sh.story !== inf.story) continue;
+    for (const jl of sh.joints) {
+      const j = geometry.joints[jl];
+      if (!j) continue;
+      const k = `${j.x.toFixed(3)}|${j.y.toFixed(3)}`;
+      if (seenXY.has(k)) continue;
+      seenXY.add(k);
+      pts.push({ x: j.x, y: j.y });
+    }
+  }
+  if (pts.length < 2) return null;
+  let a = pts[0], b = pts[1], maxD = 0;
+  for (let i = 0; i < pts.length; i++) {
+    for (let j = i + 1; j < pts.length; j++) {
+      const d = (pts[i].x - pts[j].x) ** 2 + (pts[i].y - pts[j].y) ** 2;
+      if (d > maxD) { maxD = d; a = pts[i]; b = pts[j]; }
+    }
+  }
+  return {
+    base_left:  [a.x, a.y, zBase], base_right: [b.x, b.y, zBase],
+    top_left:   [a.x, a.y, zTop],  top_right:  [b.x, b.y, zTop],
+  };
+}
+
+function buildInfills3D(
+  geometry: ModelGeometry,
+  infills: Record<string, InfillPanel>,
+  masonryMaterials?: Record<string, { name?: string; fm_mpa?: number; brick_type?: string }>,
+  highlightedPanelId?: string | null,
+): object[] {
+  if (!infills || Object.keys(infills).length === 0) return [];
+
+  // Marco (contorno del panel) — líneas segmentadas
+  const frameXs: (number | null)[] = [];
+  const frameYs: (number | null)[] = [];
+  const frameZs: (number | null)[] = [];
+  // Puntales diagonales
+  const strutXs: (number | null)[] = [];
+  const strutYs: (number | null)[] = [];
+  const strutZs: (number | null)[] = [];
+  // Mesh3d translúcido del panel: 2 triángulos por panel (BL, BR, TR) y (BL, TR, TL)
+  const meshX: number[] = []; const meshY: number[] = []; const meshZ: number[] = [];
+  const meshI: number[] = []; const meshJ: number[] = []; const meshK: number[] = [];
+  const facecolor: string[] = [];
+  // Hover markers (invisibles) en el centro de cada panel
+  const hoverX: number[] = []; const hoverY: number[] = []; const hoverZ: number[] = [];
+  const hoverText: string[] = []; const hoverIds: string[] = [];
+  // Highlight (panel seleccionado)
+  const hiFrameX: (number | null)[] = []; const hiFrameY: (number | null)[] = []; const hiFrameZ: (number | null)[] = [];
+
+  let vIdx = 0;
+  for (const [pid, inf] of Object.entries(infills)) {
+    const g = deriveInfillCorners(geometry, inf);
+    if (!g) continue;
+    const { base_left: bl, base_right: br, top_left: tl, top_right: tr } = g;
+    const highlighted = pid === highlightedPanelId;
+
+    // Marco del panel (contorno)
+    for (const [p, q] of [[bl, br], [br, tr], [tr, tl], [tl, bl]] as [V3, V3][]) {
+      if (highlighted) {
+        hiFrameX.push(p[0], q[0], null); hiFrameY.push(p[1], q[1], null); hiFrameZ.push(p[2], q[2], null);
+      } else {
+        frameXs.push(p[0], q[0], null); frameYs.push(p[1], q[1], null); frameZs.push(p[2], q[2], null);
+      }
+    }
+    // 2 puntales diagonales
+    strutXs.push(bl[0], tr[0], null); strutYs.push(bl[1], tr[1], null); strutZs.push(bl[2], tr[2], null);
+    strutXs.push(br[0], tl[0], null); strutYs.push(br[1], tl[1], null); strutZs.push(br[2], tl[2], null);
+
+    // Mesh3d del panel (relleno traslúcido)
+    meshX.push(bl[0], br[0], tr[0], tl[0]);
+    meshY.push(bl[1], br[1], tr[1], tl[1]);
+    meshZ.push(bl[2], br[2], tr[2], tl[2]);
+    meshI.push(vIdx + 0, vIdx + 0);
+    meshJ.push(vIdx + 1, vIdx + 2);
+    meshK.push(vIdx + 2, vIdx + 3);
+    // Color del relleno (más opaco si está resaltado)
+    const faceCol = highlighted ? "#f59e0b" : "#d97706";
+    facecolor.push(faceCol, faceCol);
+    vIdx += 4;
+
+    // Datos de hover
+    const cx = (bl[0] + br[0] + tr[0] + tl[0]) / 4;
+    const cy = (bl[1] + br[1] + tr[1] + tl[1]) / 4;
+    const cz = (bl[2] + br[2] + tr[2] + tl[2]) / 4;
+    const L = Math.hypot(br[0] - bl[0], br[1] - bl[1]);
+    const H = Math.abs(tl[2] - bl[2]);
+    const mat = inf.masonry_material_id ? masonryMaterials?.[inf.masonry_material_id] : undefined;
+    const matLabel = mat ? `${mat.name ?? inf.masonry_material_id} (fm=${mat.fm_mpa ?? "?"} MPa · ${mat.brick_type ?? "?"})` : (inf.masonry_material_id || "—");
+    const lamOp = (() => {
+      const r = Math.max(0, Math.min(1, inf.opening_ratio ?? 0));
+      if (r === 0) return 1; if (r >= 1) return 0;
+      return Math.max(0, 1 - 2 * Math.pow(r, 0.54) + Math.pow(r, 1.14));
+    })();
+    hoverX.push(cx); hoverY.push(cy); hoverZ.push(cz);
+    hoverIds.push(pid);
+    hoverText.push(
+      `<b>Infill ${pid}</b> · ${inf.story}<br>` +
+      `L = ${L.toFixed(2)} m, H = ${H.toFixed(2)} m, t = ${(inf.thickness_m ?? 0).toFixed(3)} m<br>` +
+      `Material: ${matLabel}<br>` +
+      `Aberturas: ${((inf.opening_ratio ?? 0) * 100).toFixed(0)}% · λ=${lamOp.toFixed(2)}<br>` +
+      `width_ratio: ${(inf.width_ratio ?? 0.25).toFixed(2)} (Mainstone)`
+    );
+  }
+
+  if (meshX.length === 0) return [];
+
+  const traces: object[] = [];
+  // 1) Relleno traslúcido del panel
+  traces.push({
+    type: "mesh3d",
+    x: meshX, y: meshY, z: meshZ,
+    i: meshI, j: meshJ, k: meshK,
+    facecolor,
+    opacity: 0.22,
+    flatshading: true,
+    hoverinfo: "skip",
+    showlegend: false,
+    name: "Infill fill",
+  });
+  // 2) Marco del panel
+  if (frameXs.length) {
+    traces.push({
+      type: "scatter3d", mode: "lines",
+      x: frameXs, y: frameYs, z: frameZs,
+      line: { color: C_INFILL_FRAME, width: 2, dash: "dot" },
+      hoverinfo: "skip", showlegend: true,
+      name: `Infills (${Object.keys(infills).length})`,
+    });
+  }
+  // 2b) Marco resaltado (panel seleccionado)
+  if (hiFrameX.length) {
+    traces.push({
+      type: "scatter3d", mode: "lines",
+      x: hiFrameX, y: hiFrameY, z: hiFrameZ,
+      line: { color: "#f59e0b", width: 5 },
+      hoverinfo: "skip", showlegend: false,
+      name: "Infill seleccionado",
+    });
+  }
+  // 3) Puntales diagonales
+  traces.push({
+    type: "scatter3d", mode: "lines",
+    x: strutXs, y: strutYs, z: strutZs,
+    line: { color: C_INFILL_STRUT, width: 3 },
+    hoverinfo: "skip", showlegend: false,
+    name: "Puntales infill",
+  });
+  // 4) Marcadores de hover + click en el centro del panel (visibles, sutiles)
+  traces.push({
+    type: "scatter3d", mode: "markers",
+    x: hoverX, y: hoverY, z: hoverZ,
+    marker: {
+      size: 9, color: C_INFILL_FRAME, opacity: 0.75,
+      symbol: "diamond",
+      line: { color: "#78350f", width: 1 },
+    },
+    text: hoverText, customdata: hoverIds,
+    hovertemplate: "%{text}<extra></extra>",
+    showlegend: false, name: "Infill info",
+  });
+  return traces;
+}
+
+// ── Grid del usuario (axes_x/axes_y) ──────────────────────────────────────────
+
+const C_USER_GRID = "#2563eb";
+
+/**
+ * Dibuja el grid del usuario en 3D como líneas verticales en el plano Z=0
+ * (o el z_min de la geometría) recorriendo el bounding box. Cada eje X se
+ * representa como una línea entre (x_axis, y_min, 0) y (x_axis, y_max, 0) más
+ * un label en el extremo. Análogo para Y.
+ */
+function buildUserGrid3D(
+  geometry: ModelGeometry,
+  grid: import("@/lib/structural-types").GridDefinition,
+): object[] {
+  const axesX = grid.axes_x ?? [];
+  const axesY = grid.axes_y ?? [];
+  if (axesX.length === 0 && axesY.length === 0) return [];
+
+  // Bounding box en XY a partir de joints
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const j of Object.values(geometry.joints)) {
+    if (j.x < minX) minX = j.x; if (j.x > maxX) maxX = j.x;
+    if (j.y < minY) minY = j.y; if (j.y > maxY) maxY = j.y;
+  }
+  if (!isFinite(minX)) return [];
+  // Extiende cada eje 10% más allá del bbox para que se vea el label sin chocar
+  const padX = Math.max(0.5, (maxX - minX) * 0.10);
+  const padY = Math.max(0.5, (maxY - minY) * 0.10);
+  minX -= padX; maxX += padX; minY -= padY; maxY += padY;
+
+  // Los ejes X definen líneas de x=const, así que corren en Y
+  const lineXs: (number | null)[] = [];
+  const lineYs: (number | null)[] = [];
+  const lineZs: (number | null)[] = [];
+  const labelXs: number[] = [];
+  const labelYs: number[] = [];
+  const labelTxt: string[] = [];
+
+  for (const a of axesX) {
+    lineXs.push(a.coord_m, a.coord_m, null);
+    lineYs.push(minY, maxY, null);
+    lineZs.push(0, 0, null);
+    labelXs.push(a.coord_m); labelYs.push(minY - padY * 0.15); labelTxt.push(a.name);
+  }
+  for (const a of axesY) {
+    lineXs.push(minX, maxX, null);
+    lineYs.push(a.coord_m, a.coord_m, null);
+    lineZs.push(0, 0, null);
+    labelXs.push(minX - padX * 0.15); labelYs.push(a.coord_m); labelTxt.push(a.name);
+  }
+
+  return [
+    {
+      type: "scatter3d", mode: "lines",
+      x: lineXs, y: lineYs, z: lineZs,
+      line: { color: C_USER_GRID, width: 2, dash: "dash" },
+      name: "Grid (ETABS)",
+      hoverinfo: "skip",
+      showlegend: false,
+    },
+    {
+      type: "scatter3d", mode: "text",
+      x: labelXs, y: labelYs, z: labelXs.map(() => 0),
+      text: labelTxt,
+      textfont: { color: C_USER_GRID, size: 11, family: "system-ui" },
+      hoverinfo: "skip",
+      showlegend: false,
+    },
+  ];
+}
+
+/**
+ * Grid del usuario en 2D (planta / elevación) como líneas dashed sobre el
+ * canvas Plotly. Solo se dibuja cuando la proyección es 'xy' (planta).
+ */
+function buildUserGrid2D(
+  geometry: ModelGeometry,
+  grid: import("@/lib/structural-types").GridDefinition,
+  projection: Projection,
+): object[] {
+  if (projection !== "xy") return [];
+  const axesX = grid.axes_x ?? [];
+  const axesY = grid.axes_y ?? [];
+  if (axesX.length === 0 && axesY.length === 0) return [];
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const j of Object.values(geometry.joints)) {
+    if (j.x < minX) minX = j.x; if (j.x > maxX) maxX = j.x;
+    if (j.y < minY) minY = j.y; if (j.y > maxY) maxY = j.y;
+  }
+  if (!isFinite(minX)) return [];
+  const padX = Math.max(0.5, (maxX - minX) * 0.08);
+  const padY = Math.max(0.5, (maxY - minY) * 0.08);
+  minX -= padX; maxX += padX; minY -= padY; maxY += padY;
+
+  const xs: (number | null)[] = [];
+  const ys: (number | null)[] = [];
+  const labelXs: number[] = [];
+  const labelYs: number[] = [];
+  const labelTxt: string[] = [];
+
+  for (const a of axesX) {
+    xs.push(a.coord_m, a.coord_m, null);
+    ys.push(minY, maxY, null);
+    labelXs.push(a.coord_m); labelYs.push(minY - padY * 0.20); labelTxt.push(a.name);
+  }
+  for (const a of axesY) {
+    xs.push(minX, maxX, null);
+    ys.push(a.coord_m, a.coord_m, null);
+    labelXs.push(minX - padX * 0.20); labelYs.push(a.coord_m); labelTxt.push(a.name);
+  }
+
+  return [
+    {
+      type: "scatter", mode: "lines",
+      x: xs, y: ys,
+      line: { color: C_USER_GRID, width: 1.5, dash: "dash" },
+      name: "Grid (ETABS)", hoverinfo: "skip", showlegend: false,
+    },
+    {
+      type: "scatter", mode: "text",
+      x: labelXs, y: labelYs, text: labelTxt,
+      textfont: { color: C_USER_GRID, size: 11, family: "system-ui" },
+      hoverinfo: "skip", showlegend: false,
+    },
+  ];
+}
+
 // ── Opciones del viewer ────────────────────────────────────────────────────────
 export interface ViewerOptions {
   colorMode?: ColorMode;
@@ -110,6 +457,10 @@ export interface ViewerOptions {
   slabColor?: string;
   shellLoads?: Record<string, Record<string, number>>;
   shellLoadPattern?: string | null;
+  infills?: Record<string, InfillPanel>;
+  showInfills?: boolean;
+  masonryMaterials?: Record<string, { name?: string; fm_mpa?: number; brick_type?: string }>;
+  highlightedInfillId?: string | null;
 }
 
 // ── Helpers de color ───────────────────────────────────────────────────────────
@@ -733,6 +1084,14 @@ interface Props {
   slabColor?: string;
   shellLoads?: Record<string, Record<string, number>>;
   shellLoadPattern?: string | null;
+  infills?: Record<string, InfillPanel>;
+  showInfills?: boolean;
+  masonryMaterials?: Record<string, { name?: string; fm_mpa?: number; brick_type?: string }>;
+  highlightedInfillId?: string | null;
+  onClickInfill?: (panelId: string) => void;
+  grid?: import("@/lib/structural-types").GridDefinition;
+  showGrid?: boolean;
+  onToggleGrid?: (v: boolean) => void;
 }
 
 // ── Componente ────────────────────────────────────────────────────────────────
@@ -760,6 +1119,14 @@ export function LinearModelViewer3D({
   slabColor,
   shellLoads,
   shellLoadPattern = null,
+  infills,
+  showInfills = true,
+  masonryMaterials,
+  highlightedInfillId = null,
+  onClickInfill,
+  grid,
+  showGrid: showGridProp,
+  onToggleGrid,
 }: Props) {
   const containerRef     = useRef<HTMLDivElement>(null);
   const prevRenderKeyRef = useRef<string>("");   // "3d-lines" | "3d-extruded" | "2d-xy" | "2d-xz" | "2d-yz"
@@ -767,8 +1134,14 @@ export function LinearModelViewer3D({
   const [viewModeInternal, setViewModeInternal] = useState<ViewMode>("lines");
   const [showNodesInternal, setShowNodes] = useState(false);
   const [showLoadsInternal, setShowLoads] = useState(false);
+  const [showGridInternal, setShowGridInternal] = useState(true);
   const showNodes = externalShowNodes ?? showNodesInternal;
   const showLoads = externalShowLoads ?? showLoadsInternal;
+  const showGrid = showGridProp ?? showGridInternal;
+  const setShowGrid = (v: boolean) => {
+    setShowGridInternal(v);
+    onToggleGrid?.(v);
+  };
   const { theme } = useTheme();
   const isDark = theme === "dark";
 
@@ -804,7 +1177,9 @@ export function LinearModelViewer3D({
       const slabTraces = useLoadMap
         ? build2DSlabLoads(geometry, shellLoads!, shellLoadPattern!, opts, projection)
         : build2DSlabs(geometry, opts, projection);
+      const gridTraces = (showGrid && grid) ? buildUserGrid2D(geometry, grid, projection) : [];
       return [
+        ...gridTraces,
         ...build2DFrames(geometry, opts, projection),
         ...build2DWalls(geometry, opts, projection),
         ...slabTraces,
@@ -822,9 +1197,16 @@ export function LinearModelViewer3D({
     // En modo extruido, mesh3d no soporta plotly_click → añade overlay picker
     const pickerOverlay = viewMode === "extruded" ? buildShellsPickerOverlay(geometry, opts) : null;
 
+    const infillTraces = (showInfills && infills)
+      ? buildInfills3D(geometry, infills, masonryMaterials, highlightedInfillId)
+      : [];
+    const gridTraces = (showGrid && grid) ? buildUserGrid3D(geometry, grid) : [];
+
     return [
       ...buildLegendTraces(opts),
+      ...gridTraces,
       ...dataTraces,
+      ...infillTraces,
       ...(pickerOverlay ? [pickerOverlay] : []),
       buildSupports3D(geometry),
       ...(showNodes ? [buildNodes3D(geometry)] : []),
@@ -833,7 +1215,8 @@ export function LinearModelViewer3D({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geometry, viewMode, showNodes, showLoads, colorMode, storyFilter, pierFilter, typeFilter,
       isolationMode, selectedIds, sectionFilter, materialFilter, modelSections, wallColor, slabColor,
-      shellLoads, shellLoadPattern, totalHeight, is2D, projection]);
+      shellLoads, shellLoadPattern, totalHeight, is2D, projection, infills, showInfills,
+      grid, showGrid]);
 
   // ── Render Plotly ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -864,18 +1247,25 @@ export function LinearModelViewer3D({
   }, [plotlyReady, traces, isDark, is2D, projection, viewMode]);
 
   // ── Click handler ─────────────────────────────────────────────────────────
-  const onClickRef = useRef(onClickElement);
-  onClickRef.current = onClickElement;
+  const onClickRef       = useRef(onClickElement);
+  const onClickInfillRef = useRef(onClickInfill);
+  onClickRef.current       = onClickElement;
+  onClickInfillRef.current = onClickInfill;
 
   useEffect(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const Plotly = (window as any)?.Plotly;
-    if (!plotlyReady || !containerRef.current || !Plotly || !onClickElement) return;
+    if (!plotlyReady || !containerRef.current || !Plotly || (!onClickElement && !onClickInfill)) return;
     const el = containerRef.current;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const handler = (data: any) => {
       const pt = data?.points?.[0];
       if (!pt) return;
+      // Panel infill → customdata es un string (panel_id).
+      if (typeof pt.customdata === "string") {
+        onClickInfillRef.current?.(pt.customdata);
+        return;
+      }
       const info = pt.customdata as ElementClickInfo | null;
       if (info?.id) onClickRef.current?.(info.id, info);
     };
@@ -886,7 +1276,7 @@ export function LinearModelViewer3D({
       try { (el as any).removeListener?.("plotly_click", handler); } catch { /* silencioso */ }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [plotlyReady, onClickElement, is2D, projection, viewMode]);
+  }, [plotlyReady, onClickElement, onClickInfill, is2D, projection, viewMode]);
 
   // ── Cámara 3D (solo aplica en modo 3D) ───────────────────────────────────
   useEffect(() => {
@@ -987,6 +1377,13 @@ export function LinearModelViewer3D({
               className={`${btnBase} border rounded-lg ${showLoads?btnOn:btnOff}`}>
               Cargas
             </button>
+            {grid && ((grid.axes_x?.length ?? 0) > 0 || (grid.axes_y?.length ?? 0) > 0) && (
+              <button onClick={() => setShowGrid(!showGrid)}
+                className={`${btnBase} border rounded-lg ${showGrid?btnOn:btnOff}`}
+                title="Ejes del grid ETABS">
+                Grid
+              </button>
+            )}
           </div>
         </div>
       )}

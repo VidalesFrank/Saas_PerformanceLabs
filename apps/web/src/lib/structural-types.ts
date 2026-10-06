@@ -1,6 +1,6 @@
 // ── Tipos para el Módulo 1 — Constructor de Modelos Estructurales ─────────────
 
-export type StructuralAnalysisType = "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands" | "wall_design" | "nl_pushover";
+export type StructuralAnalysisType = "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands" | "wall_design" | "nl_pushover" | "variant_pushover" | "frame_pushover";
 export type StructuralJobStatus    = "pending" | "running" | "success" | "failed" | "cancelled";
 export type ValidationStatus       = "not_run" | "has_errors" | "has_warnings" | "ok";
 
@@ -65,6 +65,19 @@ export interface StructuralJob {
   project_id: string;
   created_at: string;
   finished_at: string | null;
+  /** Progreso en vivo publicado por tasks largos. Formato típico:
+   *  {stage, direction, step, total, pct, drift_pct, base_shear_kN}
+   */
+  progress?: {
+    stage?:         "init" | "gravity" | "pushover" | "done" | string;
+    direction?:     string;
+    pattern_type?:  string;
+    step?:          number;
+    total?:         number;
+    pct?:           number;
+    drift_pct?:     number;
+    base_shear_kN?: number;
+  } | null;
 }
 
 // ── Combinaciones de diseño NSR-10 B.3.4 ─────────────────────────────────────
@@ -133,6 +146,8 @@ export interface FrameGeometry {
   element_type: "column" | "beam";
   story: string;
   section: string;
+  object_label?: string;
+  release?: string;
 }
 
 export interface StoryInfo {
@@ -674,6 +689,56 @@ export interface ShellSummary {
   out_of_plane_m?: number;
 }
 
+// ── Grid, Mampostería, Infills ────────────────────────────────────────────────
+
+export interface GridAxis {
+  name: string;
+  coord_m: number;
+}
+
+export interface StoryDef {
+  name: string;
+  height_m: number;
+}
+
+export interface GridDefinition {
+  axes_x: GridAxis[];
+  axes_y: GridAxis[];
+  stories: StoryDef[];
+}
+
+export type MasonryBrickType = "VP" | "HP" | "custom";
+
+export interface MasonryMaterial {
+  id: string;
+  name: string;
+  fm_mpa: number;
+  brick_type: MasonryBrickType;
+  Em_mpa: number;
+}
+
+export interface InfillPanel {
+  id: string;
+  column_i_fid?: string;   // fid de columna izquierda (canonical.frames)
+  column_j_fid?: string;   // fid de columna derecha
+  pier?: string;           // legacy — etiqueta descriptiva opcional
+  story: string;
+  thickness_m: number;
+  masonry_material_id: string;
+  opening_ratio: number;   // 0 = sin abertura, 1 = totalmente abierta
+  width_ratio: number;     // Mainstone simplificado, default 0.25
+}
+
+// ── Herramienta de dibujo ────────────────────────────────────────────────────
+
+export type DrawingTool =
+  | "select"
+  | "column"
+  | "beam"
+  | "wall"
+  | "slab"
+  | "infill";
+
 /** Modelo canónico completo retornado por /model-data (sin analysis_results). */
 export interface FullModelData {
   schema_version: string;
@@ -696,6 +761,9 @@ export interface FullModelData {
   frames: Record<string, FrameSummary>;
   shells: Record<string, ShellSummary>;
   masses: Record<string, { story: string; mass_x_t: number; mass_y_t: number; z_m: number }>;
+  grid?: GridDefinition;
+  masonryMaterials?: Record<string, MasonryMaterial>;
+  infills?: Record<string, InfillPanel>;
 }
 
 /** Resultado del health check del modelo. */
@@ -1008,6 +1076,179 @@ export interface VDeltaPoint {
   delta_m:    number;
   shear_kN:   number;
   drift_pct:  number;
+}
+
+// ── Pushover no lineal de pórticos (Módulo 1 — F2-F6) ────────────────────────
+
+export type HingeDamageLevel = "none" | "near_io" | "io" | "ls" | "cp" | "collapse";
+export type PushoverPatternType = "triangular" | "uniforme" | "modal";
+
+export interface HingeRecord {
+  fid:             string;
+  kind:            "column" | "beam";
+  story:           string;
+  end:             "i" | "j";
+  ele_tag:         number;
+  node_tag:        number;
+  theta_p_max:     number;
+  theta_y:         number;
+  theta_IO:        number;
+  theta_LS:        number;
+  theta_CP:        number;
+  damage_level:    HingeDamageLevel;
+  dcr:             number;
+  step_first_IO:   number | null;
+  step_first_LS:   number | null;
+  step_first_CP:   number | null;
+}
+
+export interface ElementLine {
+  fid:         string;
+  kind:        "column" | "beam";
+  story:       string;
+  ele_tag:     number;
+  node_i:      number;
+  node_j:      number;
+  node_i_lbl:  string;
+  node_j_lbl:  string;
+  b_m:         number;
+  h_m:         number;
+  L_m:         number;
+  lp_m:        number;
+}
+
+export interface NLFramePushoverDirResult {
+  status:           string;
+  direction:        string;
+  pattern_type:     PushoverPatternType;
+  converged_steps:  number;
+  total_steps:      number;
+  target_drift_pct: number;
+  steps:            NLPushoverStep[];
+  summary: {
+    max_drift_pct:       number;
+    max_base_shear_kN:   number;
+    last_displacement_m: number;
+  };
+  history?: {
+    captured_steps: number;
+    stride:         number;
+    n_joints:       number;
+    n_cm:           number;
+    n_columns:      number;
+    n_beams:        number;
+  };
+  element_lines?: ElementLine[];
+  stories_z?:     Record<string, number>;
+  total_height?:  number;
+  damage?: {
+    status:     string;
+    n_total:    number;
+    n_critical: number;
+    max_dcr:    number;
+    max_level:  HingeDamageLevel;
+    hinges:     HingeRecord[];
+    by_element: Record<string, {
+      fid:       string;
+      kind:      "column" | "beam";
+      story:     string;
+      max_dcr:   number;
+      max_level: HingeDamageLevel;
+      end_i?:    HingeRecord;
+      end_j?:    HingeRecord;
+    }>;
+  };
+}
+
+export interface NLFramePushoverResult {
+  status:            string;
+  job_id:            string;
+  project_id:        string;
+  pattern_type:      PushoverPatternType;
+  target_drift_pct:  number;
+  n_integration_pts: number;
+  summary: Record<string, {
+    status:             string;
+    pattern_type:       PushoverPatternType;
+    max_drift_pct:      number;
+    max_base_shear_kN:  number;
+    converged_steps:    number;
+    total_steps:        number;
+    n_critical_hinges?: number;
+    max_dcr?:           number;
+  }>;
+  pushover_X?:   NLFramePushoverDirResult;
+  pushover_Y?:   NLFramePushoverDirResult;
+  computed_at:   string;
+}
+
+export interface InfillLine {
+  panel_id:          string;
+  story:             string;
+  nodes:             { bl: number; tl: number; br: number; tr: number };
+  coords:            { bl: [number, number, number];
+                       tl: [number, number, number];
+                       br: [number, number, number];
+                       tr: [number, number, number] };
+  L_m:               number;
+  H_m:               number;
+  thickness_m:       number;
+  effective_width_m: number;
+  area_effective_m2: number;
+  lambda_openings:   number;
+  material_id:       string;
+  ele_tags:          number[];
+}
+
+export interface NLFramePushoverHistory {
+  direction:         string;
+  total_height_m:    number;
+  target_drift_pct:  number;
+  pattern_type:      PushoverPatternType;
+  n_frames:          number;
+  n_captured:        number;
+  n_total_steps:     number;
+  stride:            number;
+  frames:            NLPushoverFrame[];
+  joints_ref:        Record<string, [number, number, number]>;
+  element_lines:     ElementLine[];
+  infill_lines?:     InfillLine[];
+  hinge_damage:      HingeRecord[];
+  damage_by_element: Record<string, {
+    fid:       string;
+    kind:      "column" | "beam";
+    story:     string;
+    max_dcr:   number;
+    max_level: HingeDamageLevel;
+    end_i?:    HingeRecord;
+    end_j?:    HingeRecord;
+  }>;
+  summary?: {
+    max_drift_pct:       number;
+    max_base_shear_kN:   number;
+    last_displacement_m: number;
+  };
+}
+
+export interface FrameElementResponsePoint {
+  step:            number;
+  kappa_1_per_m:   number;
+  eps_axial:       number;
+  drift_pct:       number;
+  base_shear_kN:   number;
+}
+
+export interface FrameElementResponse {
+  fid:    string;
+  end:    "i" | "j";
+  kind:   "column" | "beam";
+  story:  string;
+  lp_m:   number;
+  b_m:    number;
+  h_m:    number;
+  L_m:    number;
+  curve:  FrameElementResponsePoint[];
+  hinge:  HingeRecord | null;
 }
 
 // ── Variantes de diseño (Fase 6) ─────────────────────────────────────────────

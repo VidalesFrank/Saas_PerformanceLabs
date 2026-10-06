@@ -363,23 +363,33 @@ class ProcessModelObjects:
         
         # Center of mass nodes
         coordz = np.sort(pd.unique(joints['Global Z']))
-        
+
         com_nodes = [100000 * (i + 1) for i in range(len(coordz[1::]))]
         com_nodes = sorted(com_nodes, reverse=True)
-        
+
+        # Mapeo robusto Story → Global Z (soporta cualquier nomenclatura de piso)
+        story_z_map = joints.groupby('Story')['Global Z'].first().to_dict()
+
         #grouped_nodes = nodes_by_diaphragm.groupby('Diaphragm')['Unique Name'].apply(list).to_dict()
-        
+
         center_of_mass = {}
         for i, row in mass_by_diaphragm.iterrows():
-            #diaphragm_name = row['Diaphragm'] 
+            #diaphragm_name = row['Diaphragm']
+            story_name = row['Story']
+            if story_name not in story_z_map:
+                raise ValueError(
+                    f"[ERROR] El piso '{story_name}' del MASS SUMMARY BY DIAPHRAGM "
+                    f"no aparece en OBJECTS AND ELEMENTS - JOINTS. "
+                    f"Pisos disponibles: {sorted(story_z_map.keys())}"
+                )
             center_of_mass[str(100000 * len(mass_by_diaphragm) - 100000 * (i - 1))] = {
                 'mass_x': row['Mass X'],
                 'mass_y': row['Mass Y'],
                 'mass_moment_of_inertia': row['Mass Moment of Inertia'],
                 'global_x': row['X Mass Center'],
                 'global_y': row['Y Mass Center'],
-                'global_z': coordz[int(row['Story'][5:])],
-                #'nodes_diaph': grouped_nodes.get(diaphragm_name, []) 
+                'global_z': story_z_map[story_name],
+                #'nodes_diaph': grouped_nodes.get(diaphragm_name, [])
             }
             
         self.center_of_mass = center_of_mass

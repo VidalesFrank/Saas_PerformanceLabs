@@ -9,6 +9,13 @@ import type {
   BulkAssignRequest,
   BulkAssignResponse,
   AutoDiscretizeRequest,
+  WallDetailResponse,
+  AutoDesignAllRequest,
+  AutoDesignAllResponse,
+  WallRedesignRequest,
+  WallDesignPersisted,
+  DesignAndBuildAllRequest,
+  DesignAndBuildAllResponse,
 } from "./wall-types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -118,6 +125,57 @@ export function fetchOpsPreview(
   wallLabel: string,
 ): Promise<{ preview: string }> {
   return req(`/${projectId}/walls/${encodeURIComponent(wallLabel)}/preview-ops`);
+}
+
+// ── Aggregated detail (premium section view) ──────────────────────────────────
+
+export function fetchWallDetail(
+  projectId: string,
+  wallLabel: string,
+): Promise<WallDetailResponse> {
+  return req(`/${projectId}/walls/${encodeURIComponent(wallLabel)}/detail`);
+}
+
+// ── Auto-design across the whole model ────────────────────────────────────────
+
+export function autoDesignAllWalls(
+  projectId: string,
+  request: AutoDesignAllRequest = {},
+): Promise<AutoDesignAllResponse> {
+  return req(`/${projectId}/walls/auto-design-all`, {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+}
+
+export function fetchWallDesign(
+  projectId: string,
+  wallLabel: string,
+): Promise<WallDesignPersisted> {
+  return req(`/${projectId}/walls/${encodeURIComponent(wallLabel)}/design`);
+}
+
+export function redesignWall(
+  projectId: string,
+  wallLabel: string,
+  request: WallRedesignRequest,
+): Promise<WallDesignPersisted> {
+  return req(`/${projectId}/walls/${encodeURIComponent(wallLabel)}/design`, {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
+}
+
+// ── Pipeline instantáneo: diseña + arma MVLEM ────────────────────────────────
+
+export function designAndBuildAllWalls(
+  projectId: string,
+  request: DesignAndBuildAllRequest = {},
+): Promise<DesignAndBuildAllResponse> {
+  return req(`/${projectId}/walls/design-and-build-all`, {
+    method: "POST",
+    body: JSON.stringify(request),
+  });
 }
 
 // ── Bulk assign ───────────────────────────────────────────────────────────────

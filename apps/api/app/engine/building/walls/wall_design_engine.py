@@ -93,7 +93,7 @@ def compute_wall_design(
 
     # ── 8. Confinamiento EBE ──────────────────────────────────────────────────
     conf = None
-    if be.required:
+    if be.required and not reinf.be_left.is_empty:
         conf = design_confinement(
             be.lc_m, tw_m, fc_mpa, fyt_mpa,
             db_long_mm=reinf.be_left.db_mm,
@@ -118,6 +118,7 @@ def compute_wall_design(
             "n_bars": b.n_bars, "db_mm": b.db_mm, "cover_mm": b.cover_mm,
             "tie_db_mm": b.tie_db_mm, "tie_spacing_mm": b.tie_spacing_mm,
             "length_m": b.length_m, "As_mm2": b.As_mm2,
+            "n_curtains": b.n_curtains, "is_empty": b.is_empty,
         }
 
     result = {
