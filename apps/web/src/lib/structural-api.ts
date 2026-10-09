@@ -122,6 +122,51 @@ export const structuralProjectsApi = {
       method: "PUT",
       body: JSON.stringify({ selected_ids: selectedIds }),
     }),
+
+  /**
+   * Descarga el proyecto como .plabs.json autocontenido. Dispara el guardado
+   * via <a download> en el navegador y resuelve con el nombre de archivo usado.
+   */
+  exportProject: async (
+    id: string,
+    opts: { include_reinforcement?: boolean; include_design?: boolean } = {},
+  ): Promise<{ filename: string; size_bytes: number }> => {
+    const token = getToken();
+    const qs = new URLSearchParams({
+      include_reinforcement: String(opts.include_reinforcement ?? true),
+      include_design:        String(opts.include_design ?? true),
+    });
+    const h = new Headers();
+    if (token) h.set("Authorization", `Bearer ${token}`);
+    const res = await fetch(`${BASE}/${id}/export?${qs}`, { headers: h });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ detail: res.statusText }));
+      const detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      throw new ApiError(res.status, detail);
+    }
+    const blob = await res.blob();
+    // Nombre del header o fallback
+    const disp = res.headers.get("Content-Disposition") || "";
+    const match = disp.match(/filename="([^"]+)"/);
+    const filename = match?.[1] ?? `project_${id}.plabs.json`;
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    return { filename, size_bytes: blob.size };
+  },
+
+  /** Sube un .plabs.json y crea un proyecto nuevo bajo la cuenta actual. */
+  importProject: (file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return upload<StructuralProject>("/import", fd);
+  },
 };
 
 // ── Análisis ──────────────────────────────────────────────────────────────────
@@ -445,6 +490,33 @@ export const structuralDesignApi = {
       {
         method: "PUT",
         body: JSON.stringify({ reinforcement, notes }),
+      },
+    ),
+
+  /** Aplica un patrón de refuerzo a varios frames de la misma sección y tipo. */
+  bulkSaveReinforcement: (
+    projectId: string,
+    args: {
+      frame_ids: string[];
+      reinforcement: ColumnReinforcementEdit | BeamReinforcementEdit;
+      notes?: string;
+      pattern_label?: string;
+    },
+  ) =>
+    req<{
+      saved:         boolean;
+      n_frames:      number;
+      frame_ids:     string[];
+      bulk_batch_id: string;
+      pattern_label: string | null;
+      element_type:  "column" | "beam";
+      section:       string;
+      message:       string;
+    }>(
+      `/${projectId}/design/frames/reinforcement/bulk`,
+      {
+        method: "PUT",
+        body: JSON.stringify(args),
       },
     ),
 

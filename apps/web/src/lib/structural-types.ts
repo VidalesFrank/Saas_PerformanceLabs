@@ -369,6 +369,8 @@ export interface ColumnDesignResult {
 
 export type FrameStatus = "ok" | "warning" | "ng" | "user_modified" | "pending";
 
+export type ReinforcementSource = "bulk" | "manual" | null;
+
 export interface FrameListItem {
   frame_id: string;
   story: string;
@@ -379,6 +381,10 @@ export interface FrameListItem {
   has_detail: boolean;
   user_modified: boolean;
   status: FrameStatus;
+  /** "bulk" | "manual" | null. Null = sin refuerzo custom aún. */
+  source?: ReinforcementSource;
+  pattern_label?: string | null;
+  bulk_batch_id?: string | null;
 }
 
 export interface FrameListResult {
@@ -1200,6 +1206,31 @@ export interface InfillLine {
   ele_tags:          number[];
 }
 
+export type InfillDamageLevel = "none" | "cracking" | "degrading" | "collapse";
+
+export interface InfillDamagePanel {
+  panel_id:            string;
+  story:               string;
+  max_damage:          number;
+  max_level:           InfillDamageLevel;
+  step_first_cracking: number;
+  step_first_collapse: number;
+  max_strain:          number;
+  max_elong_m:         number;
+}
+
+export interface InfillDamageHistory {
+  status:      "success" | "no_infills" | "no_data";
+  n_total:     number;
+  n_collapsed: number;
+  n_degrading: number;
+  max_damage:  number;
+  panel_ids:   string[];
+  panels:      InfillDamagePanel[];
+  /** matriz [n_frames, n_panels] con damage index 0..1 por paso submuestreado */
+  history:     number[][];
+}
+
 export interface NLFramePushoverHistory {
   direction:         string;
   total_height_m:    number;
@@ -1223,6 +1254,7 @@ export interface NLFramePushoverHistory {
     end_i?:    HingeRecord;
     end_j?:    HingeRecord;
   }>;
+  infill_damage?:    InfillDamageHistory;
   summary?: {
     max_drift_pct:       number;
     max_base_shear_kN:   number;

@@ -389,3 +389,202 @@ def spectrum_preview(project_id: str, payload: SpectrumPreviewRequest, user: Cur
         n_points=300,
     )
     return result
+
+
+# ── Export / Import de proyectos ──────────────────────────────────────────────
+# Formato .plabs.json autocontenido para compartir modelos entre cuentas.
+
+_PLABS_FORMAT_VERSION = 1
+
+# Artefactos ligeros que viajan con el modelo si include_design=True.
+# Rutas relativas al work_dir del proyecto.
+_DESIGN_ARTIFACTS: tuple[tuple[str, str], ...] = (
+    ("design_columns_results.json",  "results/design_columns_results.json"),
+    ("design_columns_detail.json",   "results/design_columns_detail.json"),
+    ("beam_design_results.json",     "results/beam_design_results.json"),
+    ("beam_design_detail.json",      "results/beam_design_detail.json"),
+    ("wall_demands.json",            "results/wall_demands.json"),
+    ("wall_design_results.json",     "results/wall_design_results.json"),
+    ("wall_design_detail.json",      "results/wall_design_detail.json"),
+    ("nonlinear_model.json",         "nonlinear/nonlinear_model.json"),
+)
+
+
+def _safe_filename(name: str) -> str:
+    """Nombre seguro para Content-Disposition (ASCII, sin separadores)."""
+    base = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    return (base or "model")[:80]
+
+
+@router.get("/{project_id}/export")
+def export_project(
+    project_id:        str,
+    user:              CurrentUser,
+    db:                DB,
+    include_reinforcement: bool = True,
+    include_design:        bool = True,
+):
+    """
+    Exporta el proyecto completo como un archivo .plabs.json autocontenido.
+
+    Incluido siempre:
+      - metadata (format_version, exported_at, exported_by, source_project_id)
+      - project (name, description, parameters, validation_status)
+      - canonical_model (todo el structural_model.json)
+
+    Flags:
+      - include_reinforcement: refuerzo definitivo (reinforcement.json)
+      - include_design:        artefactos de diseño (columns/beams/walls) + spec no lineal
+
+    NO incluye resultados pesados (NPZ de pushover, modal, dinámico) — se recomputan en destino.
+    """
+    from fastapi.responses import JSONResponse
+
+    project = _get_project_or_404(db, project_id, user)
+    if not project.canonical_model_path or not os.path.exists(project.canonical_model_path):
+        raise HTTPException(
+            status_code=400,
+            detail="El modelo canónico no está disponible. Valida el modelo antes de exportar.",
+        )
+
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+
+    def _load_json(path: str) -> dict | list | None:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+
+    canonical = _load_json(project.canonical_model_path) or {}
+
+    parameters = None
+    if project.parameters_json:
+        try:
+            parameters = json.loads(project.parameters_json)
+        except ValueError:
+            parameters = None
+
+    payload: dict = {
+        "format_version":   _PLABS_FORMAT_VERSION,
+        "exported_at":      _utc_now_iso(),
+        "exported_by":      user.email,
+        "source_project_id": project.id,
+        "project": {
+            "name":              project.name,
+            "description":       project.description,
+            "parameters":        parameters,
+            "validation_status": project.validation_status,
+        },
+        "canonical_model":  canonical,
+        "artifacts":        {},
+    }
+
+    if include_reinforcement:
+        reinf = _load_json(os.path.join(work_dir, "results", "reinforcement.json"))
+        if reinf is not None:
+            payload["artifacts"]["reinforcement.json"] = reinf
+
+    if include_design:
+        for rel_key, rel_path in _DESIGN_ARTIFACTS:
+            content = _load_json(os.path.join(work_dir, rel_path))
+            if content is not None:
+                payload["artifacts"][rel_key] = content
+
+    fname = f"{_safe_filename(project.name)}.plabs.json"
+    return JSONResponse(
+        content=payload,
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+        },
+    )
+
+
+@router.post("/import", response_model=ProjectOut, status_code=201)
+async def import_project(
+    user:         CurrentUser,
+    db:           DB,
+    file:         UploadFile = File(..., description="Archivo .plabs.json exportado"),
+):
+    """
+    Importa un modelo exportado desde otra cuenta/instalación.
+
+    Crea un StructuralProject nuevo (nuevo UUID, owner=usuario actual), reconstruye
+    el work_dir con canonical_model.json + los artefactos incluidos, y devuelve el
+    proyecto creado.
+
+    El archivo original NO se guarda; solo se reconstruye el modelo canónico y
+    los JSONs ligeros. Resultados pesados (pushover, modal, dinámico) se vuelven
+    a correr en la cuenta destino.
+    """
+    name = (file.filename or "").lower()
+    if not (name.endswith(".plabs.json") or name.endswith(".json")):
+        raise HTTPException(status_code=400, detail="Solo se aceptan archivos .plabs.json o .json.")
+
+    try:
+        raw = await file.read()
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"JSON inválido: {exc}") from exc
+
+    fmt = payload.get("format_version")
+    if fmt != _PLABS_FORMAT_VERSION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"format_version={fmt!r} no soportada. Esperada: {_PLABS_FORMAT_VERSION}.",
+        )
+
+    proj_meta = payload.get("project") or {}
+    canonical = payload.get("canonical_model")
+    if not isinstance(canonical, dict) or not canonical:
+        raise HTTPException(status_code=400, detail="El archivo no contiene canonical_model.")
+
+    # Crear el proyecto con nuevo UUID
+    new_name = (proj_meta.get("name") or "Modelo importado").strip() or "Modelo importado"
+    params   = proj_meta.get("parameters")
+    project = StructuralProject(
+        owner_id=user.id,
+        name=new_name,
+        description=proj_meta.get("description"),
+        parameters_json=(json.dumps(params, ensure_ascii=False) if params else None),
+        validation_status=proj_meta.get("validation_status") or "ok",
+    )
+    db.add(project)
+    db.flush()  # obtener el id antes del commit
+
+    # Reconstruir work_dir
+    from app.tasks.structural_helpers import prepare_work_dir
+    work_dir      = prepare_work_dir(project.id, settings.upload_dir)
+    canonical_dir = os.path.join(work_dir, "canonical")
+    results_dir   = os.path.join(work_dir, "results")
+
+    canonical_path = os.path.join(canonical_dir, "structural_model.json")
+    with open(canonical_path, "w", encoding="utf-8") as f:
+        json.dump(canonical, f, ensure_ascii=False, indent=2)
+    project.canonical_model_path = canonical_path
+
+    # Escribir artefactos
+    artifacts = payload.get("artifacts") or {}
+
+    def _write_rel(rel_path: str, content) -> None:
+        dest = os.path.join(work_dir, rel_path)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fh:
+            json.dump(content, fh, ensure_ascii=False, indent=2)
+
+    if "reinforcement.json" in artifacts:
+        _write_rel("results/reinforcement.json", artifacts["reinforcement.json"])
+
+    rel_by_key = {k: p for k, p in _DESIGN_ARTIFACTS}
+    for key, content in artifacts.items():
+        if key in rel_by_key:
+            _write_rel(rel_by_key[key], content)
+
+    db.commit()
+    db.refresh(project)
+    return ProjectOut.from_orm_extra(project)
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()

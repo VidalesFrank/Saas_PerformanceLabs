@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { structuralAnalysisApi } from "@/lib/structural-api";
 import type {
   ElementLine, HingeDamageLevel, NLFramePushoverHistory, HingeRecord,
+  InfillDamageLevel,
 } from "@/lib/structural-types";
 
 interface Props {
@@ -33,6 +34,42 @@ const LEVEL_LABEL: Record<HingeDamageLevel, string> = {
   cp:       "CP",
   collapse: "Colapso",
 };
+
+// ── Colores por nivel de daño de infill ──────────────────────────────────────
+const INFILL_FILL: Record<InfillDamageLevel, string> = {
+  none:      "#d97706",   // naranja suave (sano)
+  cracking:  "#eab308",   // amarillo (fisurado)
+  degrading: "#ea580c",   // naranja intenso (degradando)
+  collapse:  "#7f1d1d",   // rojo oscuro (colapsado)
+};
+const INFILL_DIAG: Record<InfillDamageLevel, string> = {
+  none:      "#c2410c",
+  cracking:  "#ca8a04",
+  degrading: "#9a3412",
+  collapse:  "#450a0a",
+};
+const INFILL_OPACITY: Record<InfillDamageLevel, number> = {
+  none:      0.18,
+  cracking:  0.35,
+  degrading: 0.55,
+  collapse:  0.75,
+};
+const INFILL_LABEL: Record<InfillDamageLevel, string> = {
+  none:      "Infill sano",
+  cracking:  "Infill fisurado",
+  degrading: "Infill degradando",
+  collapse:  "Infill colapsado",
+};
+const DAMAGE_THRESHOLDS: Array<[number, InfillDamageLevel]> = [
+  [0.05, "none"],
+  [0.50, "cracking"],
+  [0.95, "degrading"],
+  [Infinity, "collapse"],
+];
+function classifyInfill(dmg: number): InfillDamageLevel {
+  for (const [thr, lvl] of DAMAGE_THRESHOLDS) if (dmg < thr) return lvl;
+  return "collapse";
+}
 
 
 export default function FrameDeformedShape3D({
@@ -144,67 +181,142 @@ export default function FrameDeformedShape3D({
       name: "Deformada",
     });
 
-    // ── Infills: 2 diagonales + relleno traslúcido del panel ───────────────────
+    // ── Infills: 2 diagonales + relleno coloreado por nivel de daño ────────────
     const infills = data.infill_lines ?? [];
     if (infills.length > 0) {
-      const diagX: number[] = []; const diagY: number[] = []; const diagZ: number[] = [];
-      const panelMeshX: number[] = []; const panelMeshY: number[] = []; const panelMeshZ: number[] = [];
-      const meshI: number[] = []; const meshJ: number[] = []; const meshK: number[] = [];
-      const hoverText: string[] = []; const hoverX: number[] = []; const hoverY: number[] = []; const hoverZ: number[] = [];
-      let vIdx = 0;
+      // Damage del paso actual por panel_id (si hay historia disponible)
+      const dmgInfo = data.infill_damage;
+      const dmgRow: number[] = dmgInfo?.history?.[frameIdx] ?? [];
+      const dmgByPanel: Record<string, number> = {};
+      if (dmgInfo && dmgRow.length === (dmgInfo.panel_ids?.length ?? 0)) {
+        for (let k = 0; k < dmgInfo.panel_ids.length; k++) {
+          dmgByPanel[dmgInfo.panel_ids[k]] = dmgRow[k] ?? 0;
+        }
+      }
+
+      // Agrupa los paneles por nivel para una traza por color
+      type Bucket = {
+        panelMeshX: number[]; panelMeshY: number[]; panelMeshZ: number[];
+        meshI: number[]; meshJ: number[]; meshK: number[];
+        diagX: number[]; diagY: number[]; diagZ: number[];
+        hoverX: number[]; hoverY: number[]; hoverZ: number[];
+        hoverText: string[];
+        vIdx: number;
+        count: number;
+      };
+      const emptyBucket = (): Bucket => ({
+        panelMeshX: [], panelMeshY: [], panelMeshZ: [],
+        meshI: [], meshJ: [], meshK: [],
+        diagX: [], diagY: [], diagZ: [],
+        hoverX: [], hoverY: [], hoverZ: [],
+        hoverText: [], vIdx: 0, count: 0,
+      });
+      const buckets: Record<InfillDamageLevel, Bucket> = {
+        none: emptyBucket(), cracking: emptyBucket(),
+        degrading: emptyBucket(), collapse: emptyBucket(),
+      };
+
       for (const inf of infills) {
+        const dmg = dmgByPanel[inf.panel_id] ?? 0;
+        const level = classifyInfill(dmg);
+        const b = buckets[level];
         const c = inf.coords;
-        const bl = c.bl, br = c.br, tl = c.tl, tr = c.tr;
-        // Deformadas por nodo
         const def = (lblKey: keyof typeof inf.nodes, orig: [number, number, number]): [number, number, number] => {
           const t = String(inf.nodes[lblKey]);
           const u = frame.disp[t] ?? [0, 0, 0];
           return [orig[0] + u[0] * amp, orig[1] + u[1] * amp, orig[2] + u[2] * amp];
         };
-        const dBL = def("bl", bl); const dBR = def("br", br);
-        const dTL = def("tl", tl); const dTR = def("tr", tr);
-        // Diagonal 1: BL → TR
-        diagX.push(dBL[0], dTR[0], NaN); diagY.push(dBL[1], dTR[1], NaN); diagZ.push(dBL[2], dTR[2], NaN);
-        // Diagonal 2: BR → TL
-        diagX.push(dBR[0], dTL[0], NaN); diagY.push(dBR[1], dTL[1], NaN); diagZ.push(dBR[2], dTL[2], NaN);
-        // Mesh3d: 2 triángulos (BL, BR, TR) y (BL, TR, TL)
-        panelMeshX.push(dBL[0], dBR[0], dTR[0], dTL[0]);
-        panelMeshY.push(dBL[1], dBR[1], dTR[1], dTL[1]);
-        panelMeshZ.push(dBL[2], dBR[2], dTR[2], dTL[2]);
-        meshI.push(vIdx + 0, vIdx + 0); meshJ.push(vIdx + 1, vIdx + 2); meshK.push(vIdx + 2, vIdx + 3);
-        vIdx += 4;
-        // Punto medio para hover
-        const mx = (dBL[0] + dTR[0]) / 2; const my = (dBL[1] + dTR[1]) / 2; const mz = (dBL[2] + dTR[2]) / 2;
-        hoverX.push(mx); hoverY.push(my); hoverZ.push(mz);
-        hoverText.push(
+        const dBL = def("bl", c.bl); const dBR = def("br", c.br);
+        const dTL = def("tl", c.tl); const dTR = def("tr", c.tr);
+
+        // Diagonales
+        b.diagX.push(dBL[0], dTR[0], NaN); b.diagY.push(dBL[1], dTR[1], NaN); b.diagZ.push(dBL[2], dTR[2], NaN);
+        b.diagX.push(dBR[0], dTL[0], NaN); b.diagY.push(dBR[1], dTL[1], NaN); b.diagZ.push(dBR[2], dTL[2], NaN);
+
+        // Si está colapsado, dibujar las diagonales rotas (gap al centro) para enfatizar
+        if (level === "collapse") {
+          // sobrescribe las últimas 2 diagonales con versión "quebrada"
+          b.diagX.splice(b.diagX.length - 6, 6);
+          b.diagY.splice(b.diagY.length - 6, 6);
+          b.diagZ.splice(b.diagZ.length - 6, 6);
+          const midA: [number, number, number] = [
+            dBL[0] + 0.35 * (dTR[0] - dBL[0]),
+            dBL[1] + 0.35 * (dTR[1] - dBL[1]),
+            dBL[2] + 0.35 * (dTR[2] - dBL[2]),
+          ];
+          const midB: [number, number, number] = [
+            dBL[0] + 0.65 * (dTR[0] - dBL[0]),
+            dBL[1] + 0.65 * (dTR[1] - dBL[1]),
+            dBL[2] + 0.65 * (dTR[2] - dBL[2]),
+          ];
+          b.diagX.push(dBL[0], midA[0], NaN, midB[0], dTR[0], NaN);
+          b.diagY.push(dBL[1], midA[1], NaN, midB[1], dTR[1], NaN);
+          b.diagZ.push(dBL[2], midA[2], NaN, midB[2], dTR[2], NaN);
+          const midC: [number, number, number] = [
+            dBR[0] + 0.35 * (dTL[0] - dBR[0]),
+            dBR[1] + 0.35 * (dTL[1] - dBR[1]),
+            dBR[2] + 0.35 * (dTL[2] - dBR[2]),
+          ];
+          const midD: [number, number, number] = [
+            dBR[0] + 0.65 * (dTL[0] - dBR[0]),
+            dBR[1] + 0.65 * (dTL[1] - dBR[1]),
+            dBR[2] + 0.65 * (dTL[2] - dBR[2]),
+          ];
+          b.diagX.push(dBR[0], midC[0], NaN, midD[0], dTL[0], NaN);
+          b.diagY.push(dBR[1], midC[1], NaN, midD[1], dTL[1], NaN);
+          b.diagZ.push(dBR[2], midC[2], NaN, midD[2], dTL[2], NaN);
+        }
+
+        // Mesh3d: BL, BR, TR, TL
+        b.panelMeshX.push(dBL[0], dBR[0], dTR[0], dTL[0]);
+        b.panelMeshY.push(dBL[1], dBR[1], dTR[1], dTL[1]);
+        b.panelMeshZ.push(dBL[2], dBR[2], dTR[2], dTL[2]);
+        b.meshI.push(b.vIdx + 0, b.vIdx + 0);
+        b.meshJ.push(b.vIdx + 1, b.vIdx + 2);
+        b.meshK.push(b.vIdx + 2, b.vIdx + 3);
+        b.vIdx += 4;
+
+        // Hover
+        const mx = (dBL[0] + dTR[0]) / 2;
+        const my = (dBL[1] + dTR[1]) / 2;
+        const mz = (dBL[2] + dTR[2]) / 2;
+        b.hoverX.push(mx); b.hoverY.push(my); b.hoverZ.push(mz);
+        b.hoverText.push(
           `Infill ${inf.panel_id} — ${inf.story}<br>` +
           `L=${inf.L_m.toFixed(2)} m, H=${inf.H_m.toFixed(2)} m, t=${inf.thickness_m.toFixed(3)} m<br>` +
           `Ancho eq: ${inf.effective_width_m.toFixed(3)} m · λ_aberturas=${inf.lambda_openings.toFixed(2)}<br>` +
-          `A_eff puntal: ${inf.area_effective_m2.toFixed(4)} m²`
+          `A_eff puntal: ${inf.area_effective_m2.toFixed(4)} m²<br>` +
+          `Daño actual: <b>${INFILL_LABEL[level]}</b> (D=${dmg.toFixed(2)})`
         );
+        b.count++;
       }
-      traces.push({
-        type: "mesh3d",
-        x: panelMeshX, y: panelMeshY, z: panelMeshZ,
-        i: meshI, j: meshJ, k: meshK,
-        color: "#d97706", opacity: 0.18,
-        hoverinfo: "skip", showlegend: false,
-        name: "Panel infill",
-      });
-      traces.push({
-        type: "scatter3d", mode: "lines",
-        x: diagX, y: diagY, z: diagZ,
-        line: { color: "#c2410c", width: 3 },
-        hoverinfo: "skip", showlegend: true,
-        name: `Infills (${infills.length})`,
-      });
-      traces.push({
-        type: "scatter3d", mode: "markers",
-        x: hoverX, y: hoverY, z: hoverZ,
-        marker: { size: 1, color: "#c2410c", opacity: 0 },
-        text: hoverText, hovertemplate: "%{text}<extra></extra>",
-        showlegend: false, name: "Infill info",
-      });
+
+      for (const level of ["none", "cracking", "degrading", "collapse"] as InfillDamageLevel[]) {
+        const b = buckets[level];
+        if (!b.count) continue;
+        traces.push({
+          type: "mesh3d",
+          x: b.panelMeshX, y: b.panelMeshY, z: b.panelMeshZ,
+          i: b.meshI, j: b.meshJ, k: b.meshK,
+          color: INFILL_FILL[level], opacity: INFILL_OPACITY[level],
+          hoverinfo: "skip", showlegend: false,
+          name: INFILL_LABEL[level],
+        });
+        traces.push({
+          type: "scatter3d", mode: "lines",
+          x: b.diagX, y: b.diagY, z: b.diagZ,
+          line: { color: INFILL_DIAG[level], width: level === "collapse" ? 2 : 3 },
+          hoverinfo: "skip", showlegend: true,
+          name: `${INFILL_LABEL[level]} (${b.count})`,
+        });
+        traces.push({
+          type: "scatter3d", mode: "markers",
+          x: b.hoverX, y: b.hoverY, z: b.hoverZ,
+          marker: { size: 1, color: INFILL_DIAG[level], opacity: 0 },
+          text: b.hoverText, hovertemplate: "%{text}<extra></extra>",
+          showlegend: false, name: `${INFILL_LABEL[level]} info`,
+        });
+      }
     }
 
     for (const level of ["io", "ls", "cp", "collapse"] as HingeDamageLevel[]) {

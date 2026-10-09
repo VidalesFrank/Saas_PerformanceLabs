@@ -19,6 +19,8 @@ import { CombinationSelector } from "@/components/linear/CombinationSelector";
 import FrameNavigator from "@/components/linear/FrameNavigator";
 import ColumnDetailPanel from "@/components/linear/ColumnDetailPanel";
 import BeamDetailPanel from "@/components/linear/BeamDetailPanel";
+import BulkReinforcementPanel from "@/components/linear/BulkReinforcementPanel";
+import ExportModelButton from "@/components/linear/ExportModelButton";
 import WallsPanel from "@/components/linear/WallsPanel";
 import WallDemandsPanel from "@/components/linear/WallDemandsPanel";
 import WallDesignPanel    from "@/components/linear/WallDesignPanel";
@@ -250,6 +252,10 @@ export default function StructuralProjectPage() {
   const [selectedFrameType,  setSelectedFrameType] = useState<"column" | "beam" | null>(null);
   const [frameDetailData,    setFrameDetailData]   = useState<ColumnDesignDetail | BeamDesignDetail | null>(null);
   const [loadingFrameDetail, setLoadingFrameDetail] = useState(false);
+
+  // Multi-selección para aplicar patrón de refuerzo
+  const [multiSelectMode,    setMultiSelectMode]   = useState<boolean>(false);
+  const [selectedFrameIds,   setSelectedFrameIds]  = useState<Set<string>>(new Set());
 
   // Resultado demandas de muros FHE
   const [wallDemandsResult, setWallDemandsResult] = useState<WallDemandsResult | null>(null);
@@ -816,6 +822,10 @@ export default function StructuralProjectPage() {
                   >
                     {VALIDATION_INFO[project.validation_status].label}
                   </span>
+                  <ExportModelButton
+                    projectId={project.id}
+                    disabled={!project.canonical_model_path}
+                  />
                 </div>
                 {project.description && (
                   <p className="mt-1 text-sm text-[var(--text-muted)]">{project.description}</p>
@@ -1394,12 +1404,34 @@ export default function StructuralProjectPage() {
                       data={frameListData}
                       selectedFrameId={selectedFrameId}
                       onSelect={handleFrameSelect}
+                      multiMode={multiSelectMode}
+                      onToggleMultiMode={setMultiSelectMode}
+                      selectedIds={selectedFrameIds}
+                      onToggleId={(fid) => {
+                        setSelectedFrameIds((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(fid)) next.delete(fid);
+                          else next.add(fid);
+                          return next;
+                        });
+                      }}
+                      onSetSelection={setSelectedFrameIds}
                     />
                   </div>
 
-                  {/* Panel derecho: detalle del elemento seleccionado */}
+                  {/* Panel derecho: detalle del elemento seleccionado o bulk */}
                   <div className="flex-1 overflow-y-auto bg-[var(--background)]">
-                    {loadingFrameDetail ? (
+                    {multiSelectMode && selectedFrameIds.size > 0 ? (
+                      <BulkReinforcementPanel
+                        projectId={project.id}
+                        selected={frameListData.frames.filter((f) => selectedFrameIds.has(f.frame_id))}
+                        onApplied={async () => {
+                          await loadFrameList();
+                          setSelectedFrameIds(new Set());
+                        }}
+                        onClear={() => setSelectedFrameIds(new Set())}
+                      />
+                    ) : loadingFrameDetail ? (
                       <div className="flex items-center justify-center h-full">
                         <p className="text-sm text-[var(--muted)] animate-pulse">Cargando detalle…</p>
                       </div>
@@ -1421,7 +1453,11 @@ export default function StructuralProjectPage() {
                           <rect x="6" y="6" width="32" height="32" rx="4" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 3"/>
                           <path d="M16 22h12M22 16v12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
                         </svg>
-                        <p className="text-sm">Selecciona un elemento del navegador</p>
+                        <p className="text-sm">
+                          {multiSelectMode
+                            ? "Marca al menos un elemento en el navegador para aplicar un patrón"
+                            : "Selecciona un elemento del navegador"}
+                        </p>
                       </div>
                     )}
                   </div>

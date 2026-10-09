@@ -211,6 +211,26 @@ def run_frame_pushover(
                     except Exception as e_dmg:
                         print(f"[frame_pushover] WARN damage {direction}: {e_dmg}")
 
+                # Daño de infills — historia por paso para animación en el visor
+                if push.get("history") and info.get("infill_lines"):
+                    try:
+                        from app.engine.building.nonlinear.infill_damage import (
+                            compute_infill_damage_from_history,
+                        )
+                        infill_dmg = compute_infill_damage_from_history(
+                            history_path = hist_path,
+                            infill_lines = info["infill_lines"],
+                        )
+                        push["infill_damage"] = infill_dmg
+                        if infill_dmg.get("status") == "success":
+                            print(f"[frame_pushover] Infills {direction}: "
+                                  f"{infill_dmg.get('n_collapsed', 0)} colapsados, "
+                                  f"{infill_dmg.get('n_degrading', 0)} degradando / "
+                                  f"{infill_dmg.get('n_total', 0)} paneles "
+                                  f"(dañomax = {infill_dmg.get('max_damage', 0):.2f})")
+                    except Exception as e_inf:
+                        print(f"[frame_pushover] WARN infill_damage {direction}: {e_inf}")
+
                 results_by_dir[direction] = push
 
             except Exception as e_dir:

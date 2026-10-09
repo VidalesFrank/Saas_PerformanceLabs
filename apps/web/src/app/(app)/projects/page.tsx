@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { AppHeader } from "@/components/app-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
@@ -56,7 +57,8 @@ function ProjectStatus({ project }: { project: StructuralProject }) {
 }
 
 export default function StructuralProjectsPage() {
-  const ready = useRequireAuth();
+  const ready  = useRequireAuth();
+  const router = useRouter();
   const [projects, setProjects] = useState<StructuralProject[]>([]);
   const [loading, setLoading]   = useState(true);
   const [showNew, setShowNew]   = useState(false);
@@ -64,6 +66,21 @@ export default function StructuralProjectsPage() {
   const [newDesc, setNewDesc]   = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError]       = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
+  const importRef = useRef<HTMLInputElement>(null);
+
+  async function handleImport(file: File) {
+    setImporting(true);
+    setError(null);
+    try {
+      const p = await structuralProjectsApi.importProject(file);
+      router.push(`/projects/${p.id}`);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "No se pudo importar el modelo.");
+    } finally {
+      setImporting(false);
+    }
+  }
 
   useEffect(() => {
     if (!ready) return;
@@ -108,7 +125,28 @@ export default function StructuralProjectsPage() {
               Importa tu modelo de ETABS y ejecuta análisis sísmico modal espectral con ajuste FHE NSR-10.
             </p>
           </div>
-          <Button onClick={() => setShowNew(true)}>+ Nuevo proyecto</Button>
+          <div className="flex items-center gap-2">
+            <input
+              ref={importRef}
+              type="file"
+              accept=".json,.plabs.json,application/json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleImport(f);
+                e.target.value = "";
+              }}
+            />
+            <Button
+              variant="ghost"
+              onClick={() => importRef.current?.click()}
+              disabled={importing}
+              title="Importar un modelo .plabs.json exportado desde otra cuenta"
+            >
+              {importing ? "Importando…" : "⬆ Importar modelo"}
+            </Button>
+            <Button onClick={() => setShowNew(true)}>+ Nuevo proyecto</Button>
+          </div>
         </div>
 
         {/* Formulario nuevo proyecto */}

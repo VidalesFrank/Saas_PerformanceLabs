@@ -116,6 +116,9 @@ class NLFrameOPSBuilder:
         self._ele_bm_map:    dict[str, int] = {}  # fid → ele_tag
         self._ele_infill_map:dict[str, list[int]] = {}  # panel_id → [tag_diag1, tag_diag2]
         self._mat_masonry:   dict[str, int] = {}  # material_id → uniaxialMaterial tag
+        self._mat_masonry_strains: dict[str, tuple[float, float]] = {}
+        # ↑ material_id → (e0, eu) deformaciones positivas al pico y al colapso
+        self._infill_order:  list[str] = []  # panel_id en orden estable de captura
         self._base_nodes:    list[int] = []
         self._control_node:  int | None = None
 
@@ -288,11 +291,17 @@ class NLFrameOPSBuilder:
         cm_tags = [info["tag"] for info in self._cm_nodes.values()]
         col_tags = [self._ele_col_map[fid] for fid in sorted(self._ele_col_map)]
         bm_tags  = [self._ele_bm_map[fid]  for fid in sorted(self._ele_bm_map)]
+        # Infills — orden estable idéntico al de self._infill_lines
+        infill_panel_ids = list(self._infill_order)
+        infill_truss_tags: list[list[int]] = [
+            list(self._ele_infill_map.get(pid, [])) for pid in infill_panel_ids
+        ]
 
         hist_joint:   list[list[list[float]]] = []
         hist_cm:      list[list[list[float]]] = []
         hist_col_def: list[list[list[float]]] = []  # per ele, 2 extremos → (k_i, k_j, eps_i, eps_j)
         hist_bm_def:  list[list[list[float]]] = []
+        hist_infill:  list[list[list[float]]] = []  # (n_steps, n_panels, 2) elongación axial (m)
 
         def _capture() -> None:
             if not capture:
@@ -321,6 +330,22 @@ class NLFrameOPSBuilder:
                 return out
             hist_col_def.append([_ele_sect_strain(t) for t in col_tags])
             hist_bm_def.append( [_ele_sect_strain(t) for t in bm_tags])
+            # Elongación axial de cada corotTruss (basicDeformation → lista de 1 valor)
+            if infill_truss_tags:
+                step_inf: list[list[float]] = []
+                for tag_pair in infill_truss_tags:
+                    pair_vals: list[float] = []
+                    for t in tag_pair:
+                        try:
+                            bd = ops.basicDeformation(t)
+                            pair_vals.append(float(bd[0]) if bd else 0.0)
+                        except Exception:
+                            pair_vals.append(0.0)
+                    # Rellenar a 2 valores si el panel sólo tuvo una diagonal
+                    while len(pair_vals) < 2:
+                        pair_vals.append(0.0)
+                    step_inf.append(pair_vals)
+                hist_infill.append(step_inf)
 
         steps_out: list[dict] = []
         converged = 0
@@ -367,8 +392,7 @@ class NLFrameOPSBuilder:
         if capture and hist_joint:
             import numpy as _np
             Path(history_path).parent.mkdir(parents=True, exist_ok=True)
-            _np.savez_compressed(
-                history_path,
+            payload: dict = dict(
                 disp_joint   = _np.asarray(hist_joint,  dtype=_np.float32),
                 disp_cm      = _np.asarray(hist_cm,     dtype=_np.float32),
                 col_sect_def = _np.asarray(hist_col_def, dtype=_np.float32),
@@ -378,6 +402,28 @@ class NLFrameOPSBuilder:
                 col_tags     = _np.asarray(col_tags,    dtype=_np.int64),
                 bm_tags      = _np.asarray(bm_tags,     dtype=_np.int64),
             )
+            if infill_panel_ids and hist_infill:
+                L0_arr = _np.asarray(
+                    [next((p["L0_m"] for p in self._infill_lines if p["panel_id"] == pid), 0.0)
+                     for pid in infill_panel_ids],
+                    dtype=_np.float32,
+                )
+                e0_arr = _np.asarray(
+                    [next((p["e0_strain"] for p in self._infill_lines if p["panel_id"] == pid), 0.0)
+                     for pid in infill_panel_ids],
+                    dtype=_np.float32,
+                )
+                eu_arr = _np.asarray(
+                    [next((p["eu_strain"] for p in self._infill_lines if p["panel_id"] == pid), 0.0)
+                     for pid in infill_panel_ids],
+                    dtype=_np.float32,
+                )
+                payload["infill_elong"]      = _np.asarray(hist_infill, dtype=_np.float32)
+                payload["infill_panel_ids"]  = _np.asarray(infill_panel_ids, dtype="U64")
+                payload["infill_L0_m"]       = L0_arr
+                payload["infill_e0_strain"]  = e0_arr
+                payload["infill_eu_strain"]  = eu_arr
+            _np.savez_compressed(history_path, **payload)
             history_meta = {
                 "path":           str(history_path),
                 "captured_steps": len(hist_joint),
@@ -386,6 +432,7 @@ class NLFrameOPSBuilder:
                 "n_cm":           len(cm_tags),
                 "n_columns":      len(col_tags),
                 "n_beams":        len(bm_tags),
+                "n_infills":      len(infill_panel_ids),
             }
 
         status = (
@@ -901,6 +948,8 @@ class NLFrameOPSBuilder:
                 fpc * 1000.0, eps0, fpcu * 1000.0, epsu,
             )
             self._mat_masonry[mat_id] = tag
+            # Deformaciones positivas al pico y colapso del material (para damage index)
+            self._mat_masonry_strains[mat_id] = (abs(float(eps0)), abs(float(epsu)))
             return tag
 
         n_ok = 0
@@ -980,6 +1029,10 @@ class NLFrameOPSBuilder:
 
                 if tags:
                     self._ele_infill_map[str(pid)] = tags
+                    self._infill_order.append(str(pid))
+                    mat_id = str(panel.get("masonry_material_id", ""))
+                    e0_m, eu_m = self._mat_masonry_strains.get(mat_id, (0.0, 0.0))
+                    L0_m = float(g["diagonal_m"])
                     self._infill_lines.append({
                         "panel_id":   str(pid),
                         "story":      story,
@@ -997,8 +1050,12 @@ class NLFrameOPSBuilder:
                         "effective_width_m": round(float(g["effective_width_m"]), 4),
                         "area_effective_m2": round(A_eff, 6),
                         "lambda_openings":   round(float(g["lambda_openings"]), 3),
-                        "material_id":    str(panel.get("masonry_material_id", "")),
+                        "material_id":    mat_id,
                         "ele_tags":       tags,
+                        # Metadata para post-proceso de daño
+                        "L0_m":           round(L0_m, 6),
+                        "e0_strain":      round(e0_m, 8),
+                        "eu_strain":      round(eu_m, 8),
                     })
                     n_ok += 1
         if n_ok:

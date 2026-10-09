@@ -83,6 +83,13 @@ class SaveReinforcementRequest(BaseModel):
     notes: str | None = None
 
 
+class BulkReinforcementRequest(BaseModel):
+    frame_ids: list[str]
+    reinforcement: dict
+    notes: str | None = None
+    pattern_label: str | None = None   # etiqueta visible para el ingeniero
+
+
 class VerifyRequest(BaseModel):
     reinforcement: dict
 
@@ -105,8 +112,17 @@ def list_frames(project_id: str, user: CurrentUser, db: DB):
 
     frames: list[dict] = []
 
+    def _reinf_meta(fid: str) -> dict:
+        entry = saved_r.get(fid) or {}
+        return {
+            "source":        entry.get("source"),         # "bulk" | "manual" | None
+            "pattern_label": entry.get("pattern_label"),
+            "bulk_batch_id": entry.get("bulk_batch_id"),
+        }
+
     if col_data:
         for c in col_data.get("columns", []):
+            modified = c["id"] in saved_r
             frames.append({
                 "frame_id":    c["id"],
                 "story":       c["story"],
@@ -115,12 +131,14 @@ def list_frames(project_id: str, user: CurrentUser, db: DB):
                 "dcr":         c.get("dcr", 0.0),
                 "ok":          c.get("ok", True),
                 "has_detail":  c.get("has_detail", False),
-                "user_modified": c["id"] in saved_r,
-                "status":      _frame_status(c.get("dcr", 0.0), c.get("ok", True), c["id"] in saved_r),
+                "user_modified": modified,
+                "status":      _frame_status(c.get("dcr", 0.0), c.get("ok", True), modified),
+                **_reinf_meta(c["id"]),
             })
 
     if beam_data:
         for b in beam_data.get("beams", []):
+            modified = b["id"] in saved_r
             frames.append({
                 "frame_id":    b["id"],
                 "story":       b["story"],
@@ -129,8 +147,9 @@ def list_frames(project_id: str, user: CurrentUser, db: DB):
                 "dcr":         b.get("dcr", 0.0),
                 "ok":          b.get("ok", True),
                 "has_detail":  b.get("has_detail", False),
-                "user_modified": b["id"] in saved_r,
-                "status":      _frame_status(b.get("dcr", 0.0), b.get("ok", True), b["id"] in saved_r),
+                "user_modified": modified,
+                "status":      _frame_status(b.get("dcr", 0.0), b.get("ok", True), modified),
+                **_reinf_meta(b["id"]),
             })
 
     # Cargar modelo para obtener el orden de pisos
@@ -272,6 +291,11 @@ def save_reinforcement(
         "reinforcement": payload.reinforcement,
         "notes":         payload.notes,
         "saved_at":      _utc_now(),
+        "source":        "manual",
+        # Si venía de un bulk previo y el usuario lo ajusta a mano, se descarta
+        # la referencia al batch (así el "undo del patrón" no lo revierta).
+        "pattern_label": None,
+        "bulk_batch_id": None,
     }
     _save_reinforcement(project, saved_r)
 
@@ -279,6 +303,92 @@ def save_reinforcement(
         "frame_id": frame_id,
         "saved":    True,
         "message":  f"Refuerzo definitivo guardado para {frame_id}.",
+    }
+
+
+# ── PUT /frames/reinforcement/bulk ────────────────────────────────────────────
+
+@router.put("/frames/reinforcement/bulk")
+def save_reinforcement_bulk(
+    project_id: str,
+    payload: BulkReinforcementRequest,
+    user: CurrentUser,
+    db: DB,
+):
+    """
+    Aplica el mismo refuerzo a varios frames de UNA SOLA sección y tipo.
+
+    Valida que todos los frame_ids:
+      - existan en los resultados de diseño del proyecto
+      - sean del mismo element_type (todos columnas o todos vigas)
+      - compartan la misma `section`
+    Si no, retorna 400 con el detalle de la discrepancia.
+
+    Cada entrada escrita en reinforcement.json queda marcada con:
+      source="bulk", bulk_batch_id, pattern_label.
+    """
+    import uuid
+
+    project = _get_project(db, project_id, user)
+    rd      = _results_dir(project)
+
+    if not payload.frame_ids:
+        raise HTTPException(status_code=400, detail="frame_ids vacío.")
+
+    # Indexar frames por id para validar homogeneidad
+    col_data  = _load_json_safe(os.path.join(rd, "design_columns_results.json")) or {}
+    beam_data = _load_json_safe(os.path.join(rd, "beam_design_results.json")) or {}
+    index: dict[str, dict] = {}
+    for c in col_data.get("columns", []):
+        index[c["id"]] = {"element_type": "column", "section": c.get("section")}
+    for b in beam_data.get("beams", []):
+        index[b["id"]] = {"element_type": "beam", "section": b.get("section")}
+
+    missing = [fid for fid in payload.frame_ids if fid not in index]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Frames no encontrados en los resultados de diseño: {missing[:5]}"
+                   + (" …" if len(missing) > 5 else ""),
+        )
+
+    types    = {index[fid]["element_type"] for fid in payload.frame_ids}
+    sections = {index[fid]["section"]      for fid in payload.frame_ids}
+    if len(types) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selección mixta: hay {sorted(types)}. Debe ser un solo element_type.",
+        )
+    if len(sections) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selección con secciones distintas: {sorted(sections)}. Debe ser una sola.",
+        )
+
+    batch_id = f"b-{_utc_now().replace(':', '').replace('-', '')[:15]}-{uuid.uuid4().hex[:6]}"
+    saved_at = _utc_now()
+    saved_r  = _load_reinforcement(project)
+
+    for fid in payload.frame_ids:
+        saved_r[fid] = {
+            "reinforcement": payload.reinforcement,
+            "notes":         payload.notes,
+            "saved_at":      saved_at,
+            "source":        "bulk",
+            "pattern_label": payload.pattern_label,
+            "bulk_batch_id": batch_id,
+        }
+    _save_reinforcement(project, saved_r)
+
+    return {
+        "saved":          True,
+        "n_frames":       len(payload.frame_ids),
+        "frame_ids":      payload.frame_ids,
+        "bulk_batch_id":  batch_id,
+        "pattern_label":  payload.pattern_label,
+        "element_type":   next(iter(types)),
+        "section":        next(iter(sections)),
+        "message":        f"Patrón aplicado a {len(payload.frame_ids)} elementos.",
     }
 
 

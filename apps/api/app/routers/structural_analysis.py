@@ -1118,7 +1118,19 @@ def get_nl_frame_pushover_history(
             tag = str(lbl)
         joints_ref[tag] = [float(jd.get("x", 0)), float(jd.get("y", 0)), float(jd.get("z", 0))]
 
-    damage = dir_result.get("damage", {})
+    damage        = dir_result.get("damage", {})
+    infill_damage = dir_result.get("infill_damage", {})
+
+    # Historia de daño de infills alineada con los frames submuestreados
+    infill_hist_full = infill_damage.get("history") or []
+    infill_hist_sub: list[list[float]] = []
+    if infill_hist_full:
+        for fi in idx:
+            if 0 <= int(fi) < len(infill_hist_full):
+                infill_hist_sub.append(infill_hist_full[int(fi)])
+            else:
+                infill_hist_sub.append([0.0] * len(infill_damage.get("panel_ids", [])))
+
     return {
         "direction":        direction,
         "total_height_m":   dir_result.get("total_height", 0.0),
@@ -1134,6 +1146,16 @@ def get_nl_frame_pushover_history(
         "infill_lines":     dir_result.get("infill_lines", []),
         "hinge_damage":     damage.get("hinges", []),
         "damage_by_element": damage.get("by_element", {}),
+        "infill_damage": {
+            "status":       infill_damage.get("status", "no_infills"),
+            "n_total":      infill_damage.get("n_total", 0),
+            "n_collapsed":  infill_damage.get("n_collapsed", 0),
+            "n_degrading":  infill_damage.get("n_degrading", 0),
+            "max_damage":   infill_damage.get("max_damage", 0.0),
+            "panel_ids":    infill_damage.get("panel_ids", []),
+            "panels":       infill_damage.get("panels", []),
+            "history":      infill_hist_sub,
+        },
         "summary":          dir_result.get("summary", {}),
     }
 
