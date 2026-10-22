@@ -3,9 +3,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { structuralAnalysisApi } from "@/lib/structural-api";
 import type {
-  ElementLine, HingeDamageLevel, NLFramePushoverHistory, HingeRecord,
-  InfillDamageLevel,
+  HingeDamageLevel, NLFramePushoverHistory, HingeRecord,
+  InfillDamageLevel, HingeThresholds,
 } from "@/lib/structural-types";
+import {
+  ASCE41_DMO, classifyWithThresholds, effectiveThresholds,
+  classifyInfillByDrift,
+} from "./HingeThresholdsPanel";
 
 interface Props {
   projectId:    string;
@@ -14,7 +18,16 @@ interface Props {
   /** Click en un extremo con rótula → notifica fid+end al padre */
   onSelectHinge?: (fid: string, end: "i" | "j") => void;
   selectedFid?: string | null;
+  /** Umbrales ajustables; si viene undefined, usa ASCE 41-17 DMO + k_conf. */
+  thresholds?: HingeThresholds;
+  /** Callback cuando el visor ya cargó la historia (para que el padre lea hinges). */
+  onDataLoaded?: (h: NLFramePushoverHistory) => void;
+  /** Callback con el frame actual + estado de reproducción — permite sincronizar
+   *  con otros charts (perfil de deriva, marcador en curva pushover). */
+  onFrameChange?: (frameIdx: number, playing: boolean) => void;
 }
+
+type CameraView = "3d" | "plan" | "elev_x" | "elev_y";
 
 // ── Colores por nivel de daño ASCE 41 ────────────────────────────────────────
 const DAMAGE_COLOR: Record<HingeDamageLevel, string> = {
@@ -32,7 +45,7 @@ const LEVEL_LABEL: Record<HingeDamageLevel, string> = {
   io:       "IO",
   ls:       "LS",
   cp:       "CP",
-  collapse: "Colapso",
+  collapse: "Post-CP",   // Rótula local post-CP ASCE 41 — NO colapso del edificio
 };
 
 // ── Colores por nivel de daño de infill ──────────────────────────────────────
@@ -60,23 +73,17 @@ const INFILL_LABEL: Record<InfillDamageLevel, string> = {
   degrading: "Infill degradando",
   collapse:  "Infill colapsado",
 };
-const DAMAGE_THRESHOLDS: Array<[number, InfillDamageLevel]> = [
-  [0.05, "none"],
-  [0.50, "cracking"],
-  [0.95, "degrading"],
-  [Infinity, "collapse"],
-];
-function classifyInfill(dmg: number): InfillDamageLevel {
-  for (const [thr, lvl] of DAMAGE_THRESHOLDS) if (dmg < thr) return lvl;
-  return "collapse";
-}
 
 
 export default function FrameDeformedShape3D({
   projectId, direction, height = 520, onSelectHinge, selectedFid = null,
+  thresholds, onDataLoaded, onFrameChange,
 }: Props) {
+  const activeThresholds: HingeThresholds = thresholds ?? ASCE41_DMO;
   const divRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number | null>(null);
+  const onDataLoadedRef = useRef(onDataLoaded);
+  useEffect(() => { onDataLoadedRef.current = onDataLoaded; }, [onDataLoaded]);
 
   const [data, setData]       = useState<NLFramePushoverHistory | null>(null);
   const [error, setError]     = useState<string | null>(null);
@@ -85,6 +92,13 @@ export default function FrameDeformedShape3D({
   const [frameIdx, setFrameIdx] = useState<number>(0);
   const [amp, setAmp]         = useState<number>(50);     // factor de amplificación
   const [showRef, setShowRef] = useState<boolean>(true);  // modelo indeformado
+  const [view, setView]       = useState<CameraView>("3d");
+
+  // Notificar al padre cada cambio de frame o pausa/play — para sincronizar
+  // perfil de deriva + marker en la curva pushover.
+  useEffect(() => {
+    onFrameChange?.(frameIdx, playing);
+  }, [frameIdx, playing, onFrameChange]);
 
   // ── Carga de historia ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -92,22 +106,48 @@ export default function FrameDeformedShape3D({
     setLoading(true); setError(null); setData(null);
     structuralAnalysisApi
       .nlFramePushoverHistory(projectId, direction, 60)
-      .then((h) => { if (!cancelled) { setData(h); setFrameIdx(h.frames.length - 1); } })
+      .then((h) => {
+        if (cancelled) return;
+        setData(h);
+        setFrameIdx(h.frames.length - 1);
+        onDataLoadedRef.current?.(h);
+      })
       .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [projectId, direction]);
 
-  // ── Agrupa rótulas por nivel para construir scatter3d por color ────────────
+  // ── Clasificación por frame bajo umbrales ajustables ──────────────────────
+  // Si la rótula trae `theta_p_hist`, usamos θ_p(frame) para clasificarla paso
+  // a paso. Si no (fallback), se usa el daño máximo del backend.
+  const levelsByHinge = useMemo(() => {
+    const out = new Map<string, HingeDamageLevel>();
+    for (const h of data?.hinge_damage ?? []) {
+      const { IO, LS, CP } = effectiveThresholds(h, activeThresholds);
+      const hist = h.theta_p_hist;
+      let tp: number;
+      if (Array.isArray(hist) && hist.length > 0) {
+        const i = Math.min(frameIdx, hist.length - 1);
+        tp = hist[i] ?? 0;
+      } else {
+        tp = h.theta_p_max;
+      }
+      out.set(`${h.fid}|${h.end}`, classifyWithThresholds(tp, IO, LS, CP));
+    }
+    return out;
+  }, [data, frameIdx, activeThresholds]);
+
+  // Rótulas visibles este frame (todos los niveles > "none"), agrupadas por nivel
   const hingesByLevel = useMemo(() => {
     const groups: Record<HingeDamageLevel, HingeRecord[]> = {
       none: [], near_io: [], io: [], ls: [], cp: [], collapse: [],
     };
     for (const h of data?.hinge_damage ?? []) {
-      groups[h.damage_level].push(h);
+      const lv = levelsByHinge.get(`${h.fid}|${h.end}`) ?? "none";
+      groups[lv].push(h);
     }
     return groups;
-  }, [data]);
+  }, [data, levelsByHinge]);
 
   // ── Dibuja la escena en Plotly ─────────────────────────────────────────────
   const draw = useCallback(() => {
@@ -130,13 +170,17 @@ export default function FrameDeformedShape3D({
     const defZ: number[] = [];
     const defColor: string[] = [];
 
+    // Color del elemento = el peor nivel entre sus dos extremos EN ESTE FRAME.
+    const LV_ORDER: HingeDamageLevel[] = ["none", "near_io", "io", "ls", "cp", "collapse"];
+    const rankByFid: Record<string, number> = {};
     const colorByFid: Record<string, string> = {};
-    const maxDcrByFid: Record<string, number> = {};
     for (const h of data.hinge_damage) {
-      const prev = maxDcrByFid[h.fid] ?? -1;
-      if (h.dcr > prev) {
-        maxDcrByFid[h.fid] = h.dcr;
-        colorByFid[h.fid] = DAMAGE_COLOR[h.damage_level];
+      const lv = levelsByHinge.get(`${h.fid}|${h.end}`) ?? "none";
+      const r = LV_ORDER.indexOf(lv);
+      const prev = rankByFid[h.fid] ?? -1;
+      if (r > prev) {
+        rankByFid[h.fid] = r;
+        colorByFid[h.fid] = DAMAGE_COLOR[lv];
       }
     }
 
@@ -181,10 +225,16 @@ export default function FrameDeformedShape3D({
       name: "Deformada",
     });
 
-    // ── Infills: 2 diagonales + relleno coloreado por nivel de daño ────────────
+    // ── Infills: clasificación por DERIVA del panel (fracción) ────────────────
     const infills = data.infill_lines ?? [];
     if (infills.length > 0) {
-      // Damage del paso actual por panel_id (si hay historia disponible)
+      // Componente del desplazamiento a usar según dirección del pushover
+      const dirAxis = (direction.toUpperCase().endsWith("Y") ? 1 : 0) as 0 | 1;
+      const infillIO = activeThresholds.infill.IO;
+      const infillLS = activeThresholds.infill.LS;
+      const infillCP = activeThresholds.infill.CP;
+
+      // Damage index legacy del backend (0..1) para incluir en el tooltip
       const dmgInfo = data.infill_damage;
       const dmgRow: number[] = dmgInfo?.history?.[frameIdx] ?? [];
       const dmgByPanel: Record<string, number> = {};
@@ -218,7 +268,19 @@ export default function FrameDeformedShape3D({
 
       for (const inf of infills) {
         const dmg = dmgByPanel[inf.panel_id] ?? 0;
-        const level = classifyInfill(dmg);
+
+        // Deriva del panel = diferencia relativa de desplazamientos en la
+        // dirección del pushover, dividida por la altura del panel.
+        const uBL = frame.disp[String(inf.nodes.bl)] ?? [0, 0, 0];
+        const uBR = frame.disp[String(inf.nodes.br)] ?? [0, 0, 0];
+        const uTL = frame.disp[String(inf.nodes.tl)] ?? [0, 0, 0];
+        const uTR = frame.disp[String(inf.nodes.tr)] ?? [0, 0, 0];
+        const uTop = 0.5 * (uTL[dirAxis] + uTR[dirAxis]);
+        const uBot = 0.5 * (uBL[dirAxis] + uBR[dirAxis]);
+        const H = Math.max(inf.H_m, 1e-6);
+        const drift = (uTop - uBot) / H;
+        const level = classifyInfillByDrift(drift, infillIO, infillLS, infillCP);
+
         const b = buckets[level];
         const c = inf.coords;
         const def = (lblKey: keyof typeof inf.nodes, orig: [number, number, number]): [number, number, number] => {
@@ -285,8 +347,8 @@ export default function FrameDeformedShape3D({
           `Infill ${inf.panel_id} — ${inf.story}<br>` +
           `L=${inf.L_m.toFixed(2)} m, H=${inf.H_m.toFixed(2)} m, t=${inf.thickness_m.toFixed(3)} m<br>` +
           `Ancho eq: ${inf.effective_width_m.toFixed(3)} m · λ_aberturas=${inf.lambda_openings.toFixed(2)}<br>` +
-          `A_eff puntal: ${inf.area_effective_m2.toFixed(4)} m²<br>` +
-          `Daño actual: <b>${INFILL_LABEL[level]}</b> (D=${dmg.toFixed(2)})`
+          `Deriva actual: <b>${(Math.abs(drift) * 100).toFixed(3)}%</b> (dir ${direction})<br>` +
+          `Estado: <b>${INFILL_LABEL[level]}</b> · damage index D=${dmg.toFixed(2)}`
         );
         b.count++;
       }
@@ -319,30 +381,51 @@ export default function FrameDeformedShape3D({
       }
     }
 
-    for (const level of ["io", "ls", "cp", "collapse"] as HingeDamageLevel[]) {
+    for (const level of ["near_io", "io", "ls", "cp", "collapse"] as HingeDamageLevel[]) {
       const items = hingesByLevel[level];
       if (!items.length) continue;
       const xs: number[] = []; const ys: number[] = []; const zs: number[] = [];
       const text: string[] = []; const custom: string[][] = [];
       const sizes: number[] = [];
+      // Offset estilo ETABS: marcador a 15% del largo del elemento desde el
+      // extremo correspondiente hacia el interior. Permite ver base/top de
+      // columnas e izq/der de vigas sin que los puntos se solapen en los nudos.
+      const HINGE_OFFSET_FRAC = 0.15;
+
       for (const h of items) {
         const el = data.element_lines.find((e) => String(e.fid) === h.fid);
         if (!el) continue;
         const ni = h.end === "i" ? el.node_i : el.node_j;
+        const nj = h.end === "i" ? el.node_j : el.node_i;      // nodo opuesto
         const refc = data.joints_ref[String(ni)];
-        if (!refc) continue;
+        const refo = data.joints_ref[String(nj)];
+        if (!refc || !refo) continue;
         const u = frame.disp[String(ni)] ?? [0, 0, 0];
-        xs.push(refc[0] + u[0] * amp);
-        ys.push(refc[1] + u[1] * amp);
-        zs.push(refc[2] + u[2] * amp);
+        const uo = frame.disp[String(nj)] ?? [0, 0, 0];
+
+        // Posiciones deformadas del extremo y del nodo opuesto
+        const pi = [refc[0] + u[0] * amp,  refc[1] + u[1] * amp,  refc[2] + u[2] * amp];
+        const pj = [refo[0] + uo[0] * amp, refo[1] + uo[1] * amp, refo[2] + uo[2] * amp];
+
+        // Interpolación 5% hacia el interior
+        xs.push(pi[0] + HINGE_OFFSET_FRAC * (pj[0] - pi[0]));
+        ys.push(pi[1] + HINGE_OFFSET_FRAC * (pj[1] - pi[1]));
+        zs.push(pi[2] + HINGE_OFFSET_FRAC * (pj[2] - pi[2]));
+        // θ_p actual (por frame) si hay historia; si no, el máximo final
+        const histArr = h.theta_p_hist;
+        const tpNow = Array.isArray(histArr) && histArr.length > 0
+          ? (histArr[Math.min(frameIdx, histArr.length - 1)] ?? 0)
+          : h.theta_p_max;
+        const { CP: cpEff } = effectiveThresholds(h, activeThresholds);
+        const dcrNow = cpEff > 0 ? tpNow / cpEff : 0;
         text.push(
           `${el.kind === "column" ? "Col" : "Viga"} ${h.fid} — ext ${h.end.toUpperCase()}<br>` +
-          `Daño: <b>${LEVEL_LABEL[h.damage_level]}</b><br>` +
-          `DCR = ${h.dcr.toFixed(2)}<br>` +
-          `θ_p = ${h.theta_p_max.toFixed(4)} rad`
+          `Daño actual: <b>${LEVEL_LABEL[level]}</b> (final: ${LEVEL_LABEL[h.damage_level]})<br>` +
+          `DCR = ${dcrNow.toFixed(2)} · θ_p = ${tpNow.toFixed(4)} rad<br>` +
+          `θ_p (final) = ${h.theta_p_max.toFixed(4)} rad`
         );
         custom.push([h.fid, h.end]);
-        sizes.push(6 + 6 * Math.min(h.dcr, 1.5));
+        sizes.push(level === "near_io" ? 5 : 6 + 6 * Math.min(dcrNow, 1.5));
       }
       traces.push({
         type: "scatter3d", mode: "markers",
@@ -352,11 +435,11 @@ export default function FrameDeformedShape3D({
           color: DAMAGE_COLOR[level],
           symbol: "circle",
           line: { color: "#000", width: 0.5 },
-          opacity: 0.95,
+          opacity: level === "near_io" ? 0.65 : 0.95,
         },
         text, customdata: custom,
         hovertemplate: "%{text}<extra></extra>",
-        name: LEVEL_LABEL[level],
+        name: `${LEVEL_LABEL[level]} (${items.length})`,
         showlegend: true,
       });
     }
@@ -382,6 +465,17 @@ export default function FrameDeformedShape3D({
       }
     }
 
+    // Cámara preestablecida según la vista seleccionada
+    const CAMERA_PRESETS: Record<CameraView, {
+      eye: { x: number; y: number; z: number };
+      up?: { x: number; y: number; z: number };
+    }> = {
+      "3d":     { eye: { x: 1.6, y: 1.6, z: 1.2 } },
+      "plan":   { eye: { x: 0,   y: 0,   z: 2.5 }, up: { x: 0, y: 1, z: 0 } },
+      "elev_x": { eye: { x: 0,   y: -2.5, z: 0.1 }, up: { x: 0, y: 0, z: 1 } },
+      "elev_y": { eye: { x: 2.5, y: 0,   z: 0.1 }, up: { x: 0, y: 0, z: 1 } },
+    };
+
     const layout = {
       margin: { t: 0, b: 0, l: 0, r: 0 },
       scene: {
@@ -390,6 +484,7 @@ export default function FrameDeformedShape3D({
         yaxis: { title: "Y (m)" },
         zaxis: { title: "Z (m)" },
         bgcolor: "rgba(0,0,0,0)",
+        camera: CAMERA_PRESETS[view],
       },
       paper_bgcolor: "transparent",
       legend: { x: 0.02, y: 0.98, bgcolor: "rgba(255,255,255,0.3)" },
@@ -398,7 +493,7 @@ export default function FrameDeformedShape3D({
 
     Plotly.react(divRef.current, traces, layout,
       { responsive: true, displayModeBar: true });
-  }, [data, frameIdx, amp, showRef, hingesByLevel, selectedFid]);
+  }, [data, frameIdx, amp, showRef, hingesByLevel, selectedFid, view]);
 
   // Re-dibuja cuando cambia frame / amp / ref
   useEffect(() => { draw(); }, [draw]);
@@ -497,6 +592,27 @@ export default function FrameDeformedShape3D({
               className="w-32" />
             <span className="font-mono text-[var(--text)]">{amp}×</span>
           </label>
+          {/* Botones de vista estilo ETABS */}
+          <div className="flex items-center gap-1 ml-2 border-l border-[var(--border)] pl-2">
+            {([
+              { k: "3d",     label: "3D" },
+              { k: "plan",   label: "Planta" },
+              { k: "elev_x", label: "Elev-X" },
+              { k: "elev_y", label: "Elev-Y" },
+            ] as const).map(({ k, label }) => (
+              <button key={k}
+                onClick={() => setView(k)}
+                className={[
+                  "px-2 py-0.5 rounded text-[10px] font-semibold",
+                  view === k
+                    ? "bg-[var(--accent)] text-white"
+                    : "bg-[var(--surface-2,#eef1f5)] text-[var(--text-muted)] hover:text-[var(--text)]",
+                ].join(" ")}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <div className="ml-auto text-[var(--text-muted)] font-mono">
             Frame {frameIdx + 1} / {data.frames.length} · Deriva {curFrame.drift_pct.toFixed(3)}% ·
             Vb {curFrame.base_shear_kN.toFixed(1)} kN

@@ -24,10 +24,12 @@ import ExportModelButton from "@/components/linear/ExportModelButton";
 import WallsPanel from "@/components/linear/WallsPanel";
 import WallDemandsPanel from "@/components/linear/WallDemandsPanel";
 import WallDesignPanel    from "@/components/linear/WallDesignPanel";
-import NLPushoverPanel      from "@/components/linear/NLPushoverPanel";
-import NLFramePushoverPanel from "@/components/linear/NLFramePushoverPanel";
+import UnifiedPushoverPanel from "@/components/linear/UnifiedPushoverPanel";
+import ElementThresholdsPanel from "@/components/linear/ElementThresholdsPanel";
+import NLTHPanel            from "@/components/linear/NLTHPanel";
 import ModelMaterialsPanel from "@/components/linear/ModelMaterialsPanel";
 import ModelSectionsPanel from "@/components/linear/ModelSectionsPanel";
+import FrameReinforcementPanel from "@/components/linear/FrameReinforcementPanel";
 import GridEditor from "@/components/linear/GridEditor";
 import MasonryMaterialsPanel from "@/components/linear/MasonryMaterialsPanel";
 import InfillsSplitView from "@/components/linear/InfillsSplitView";
@@ -73,8 +75,9 @@ type SectionId =
   | "sismico"
   | "wall-demands"
   | "wall-design"
-  | "nl-pushover"
-  | "frame-pushover"
+  | "pushover"
+  | "nlth"
+  | "evaluacion-elemento"
   | "diseno"
   | "no-lineal";
 
@@ -127,8 +130,9 @@ function buildNav(hasSpectral: boolean, isValidated: boolean): NavGroup[] {
       groupLabel: "Modelo no lineal",
       items: [
         { id: "muros",          label: "Asignar Muros (MVLEM_3D)",    locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
-        { id: "nl-pushover",    label: "Pushover No Lineal (Muros)",  locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
-        { id: "frame-pushover", label: "Pushover No Lineal (Pórticos)",locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "pushover",       label: "Pushover No Lineal",          locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "nlth",           label: "Análisis Cronológico (NLTHA)", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "evaluacion-elemento", label: "Evaluación por elemento",  locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
       ],
     },
     {
@@ -1542,55 +1546,8 @@ export default function StructuralProjectPage() {
                       onModelDataChange={handleModelDataChange}
                     />
                   </div>
-                  <div className="flex-1 overflow-y-auto p-6 bg-[var(--surface)]">
-                    <div className="max-w-xl">
-                      <h3 className="text-sm font-semibold text-[var(--text)] mb-1">Secciones transversales</h3>
-                      <p className="text-xs text-[var(--text-muted)] mb-4">
-                        Haz clic en &quot;Editar&quot; para ver el preview gráfico de la sección con
-                        sus propiedades geométricas calculadas.
-                      </p>
-                      <div className="rounded-lg border border-[var(--border)]/50 bg-[var(--surface-2)] divide-y divide-[var(--border)]/30">
-                        {Object.entries(fullModelData.sections).slice(0, 8).map(([name, sec]) => {
-                          const h_cm = sec.h_m * 100;
-                          const b_cm = sec.b_m * 100;
-                          const A    = sec.b_m * sec.h_m;
-                          const I33  = sec.b_m * sec.h_m ** 3 / 12;
-                          return (
-                            <div key={name} className="flex items-center gap-4 px-4 py-2.5">
-                              <svg width={36} height={28} viewBox="0 0 36 28">
-                                {(() => {
-                                  const maxD = Math.max(h_cm, b_cm, 1);
-                                  const s = 22 / maxD;
-                                  const rw = Math.max(b_cm * s, 2);
-                                  const rh = Math.max(h_cm * s, 2);
-                                  return (
-                                    <rect x={(36 - rw) / 2} y={(28 - rh) / 2}
-                                      width={rw} height={rh}
-                                      fill="#6366F1" fillOpacity="0.15"
-                                      stroke="#6366F1" strokeWidth="1" />
-                                  );
-                                })()}
-                              </svg>
-                              <div className="min-w-0 flex-1">
-                                <p className="text-xs font-semibold text-[var(--text)] truncate">{name}</p>
-                                <p className="text-[10px] text-[var(--text-muted)]">
-                                  {h_cm.toFixed(0)}×{b_cm.toFixed(0)} cm · {sec.material}
-                                </p>
-                              </div>
-                              <div className="text-right text-[10px] text-[var(--text-muted)]">
-                                <p>A = <span className="font-mono text-[var(--text)]">{(A * 1e4).toFixed(0)} cm²</span></p>
-                                <p>I₃₃ = <span className="font-mono text-[var(--text)]">{(I33 * 1e8).toFixed(0)} cm⁴</span></p>
-                              </div>
-                            </div>
-                          );
-                        })}
-                        {Object.keys(fullModelData.sections).length > 8 && (
-                          <p className="px-4 py-2 text-[10px] text-[var(--text-muted)]">
-                            … y {Object.keys(fullModelData.sections).length - 8} secciones más en la lista
-                          </p>
-                        )}
-                      </div>
-                    </div>
+                  <div className="flex-1 overflow-y-auto bg-[var(--surface)]">
+                    <FrameReinforcementPanel projectId={project.id} />
                   </div>
                 </div>
               ) : (
@@ -1982,75 +1939,94 @@ export default function StructuralProjectPage() {
             </div>
           )}
 
-          {/* ── Pushover No Lineal ───────────────────────────────────────────── */}
-          {activeSection === "nl-pushover" && (
+          {/* ── Pushover No Lineal — vista unificada (muros + pórticos) ─────── */}
+          {activeSection === "pushover" && (
             <div className="mx-auto max-w-6xl px-6 py-8 flex flex-col gap-6">
               <div>
-                <h1 className="text-xl font-semibold text-[var(--text)]">Pushover No Lineal — Edificio de Muros</h1>
+                <h1 className="text-xl font-semibold text-[var(--text)]">Pushover No Lineal</h1>
                 <p className="text-sm text-[var(--text-muted)] mt-1">
-                  MVLEM_3D con fibras Concrete02 + Steel02 · carga triangular · DisplacementControl · X e Y
+                  Análisis estático no lineal del edificio con detección automática del
+                  sistema estructural (muros, pórticos o mixto). Patrón de carga y parámetros
+                  configurables. Resultados por sistema en pestañas.
                 </p>
               </div>
 
-              <Card>
-                <CardBody className="flex items-center justify-between gap-4">
-                  <div>
-                    <p className="text-sm font-medium text-[var(--text)]">Pushover X + Y del edificio completo</p>
-                    <p className="text-xs text-[var(--text-muted)] mt-0.5">
-                      Construye modelo no lineal desde el diseño RC por pier. Aplica cargas gravitacionales
-                      y ejecuta pushover triangular hasta {"{target_drift}%"} de deriva de techo.
-                    </p>
-                  </div>
-                  <Button
-                    disabled={activeJobTypes.has("nl_pushover") || !hasWallDesign}
-                    onClick={() => handleLaunch("nl_pushover")}
-                    title={!hasWallDesign ? "Ejecuta primero el diseño de muros RC" : undefined}
-                  >
-                    {activeJobTypes.has("nl_pushover") ? "Calculando..." : hasNLPushover ? "Recalcular" : "Ejecutar"}
-                  </Button>
-                </CardBody>
-              </Card>
-
-              {hasNLPushover && nlPushoverResult && (
-                <NLPushoverPanel result={nlPushoverResult} projectId={project.id} wallDesign={wallDesignResult} />
-              )}
-
-              {activeJobTypes.has("nl_pushover") && !hasNLPushover && (
-                <Card>
-                  <CardBody>
-                    <p className="text-sm text-[var(--text-muted)] animate-pulse">
-                      Construyendo modelo no lineal y ejecutando pushover... (puede tardar varios minutos)
-                    </p>
-                  </CardBody>
-                </Card>
-              )}
+              <UnifiedPushoverPanel
+                projectId={project.id}
+                activeJobTypes={activeJobTypes}
+                wallResult={nlPushoverResult}
+                wallDesign={wallDesignResult}
+                hasFrameResult={jobs.some((j) => j.analysis_type === "frame_pushover" && j.status === "success")}
+                hasWallDesign={hasWallDesign}
+                lastWallJobId={lastJobByType("nl_pushover")?.id ?? null}
+                lastFrameJobId={lastJobByType("frame_pushover")?.id ?? null}
+              />
 
               {lastJobByType("nl_pushover")?.status === "failed" && (
                 <Card>
                   <CardBody>
-                    <p className="text-sm text-red-600 font-medium">Error en el pushover no lineal</p>
+                    <p className="text-sm text-red-600 font-medium">Error en pushover de muros</p>
                     <p className="text-xs text-[var(--text-muted)] mt-1">{lastJobByType("nl_pushover")?.error_message}</p>
+                  </CardBody>
+                </Card>
+              )}
+              {lastJobByType("frame_pushover")?.status === "failed" && (
+                <Card>
+                  <CardBody>
+                    <p className="text-sm text-red-600 font-medium">Error en pushover de pórticos</p>
+                    <p className="text-xs text-[var(--text-muted)] mt-1">{lastJobByType("frame_pushover")?.error_message}</p>
                   </CardBody>
                 </Card>
               )}
             </div>
           )}
 
-          {/* ── Pushover No Lineal de Pórticos (F2-F6) ────────────────────── */}
-          {activeSection === "frame-pushover" && (
-            <div className="mx-auto max-w-6xl px-6 py-8 flex flex-col gap-6">
+          {/* ── NLTHA (análisis cronológico no lineal) ──────────────────────── */}
+          {activeSection === "nlth" && (
+            <div className="mx-auto max-w-7xl px-6 py-6 flex flex-col gap-6">
               <div>
-                <h2 className="text-xl font-bold text-[var(--text)] mb-1">
-                  Pushover No Lineal de Pórticos
-                </h2>
-                <p className="text-xs text-[var(--text-muted)]">
-                  Modelo con fibras Concrete02 (confinado Mander + no confinado) +
-                  Steel02, HingeRadau en extremos, patrón de carga seleccionable
-                  (triangular / uniforme / modal). Coloreo de rótulas según
-                  ASCE 41-17: IO (verde) → LS (amarillo) → CP (naranja) → Colapso (rojo).
+                <h1 className="text-xl font-semibold text-[var(--text)]">
+                  Análisis Cronológico No Lineal (NLTHA)
+                </h1>
+                <p className="text-sm text-[var(--text-muted)] mt-1">
+                  Time-history bidireccional con integración Newmark adaptativa.
+                  Reusa el modelo no lineal del pushover (fibras, rótulas, infills,
+                  MVLEM_3D) con el registro sísmico que subas. Para edificios
+                  mixtos muros+pórticos, corre un NLTHA por cada sistema.
                 </p>
               </div>
-              <NLFramePushoverPanel projectId={project.id} />
+              <NLTHPanel
+                projectId={project.id}
+                system={(() => {
+                  const hasWall  = hasWallDesign;
+                  const hasFrame = jobs.some((j) => j.analysis_type === "frame_pushover" && j.status === "success")
+                                || jobs.some((j) => j.analysis_type === "design_columns" && j.status === "success");
+                  if (hasWall && hasFrame) return "mixed";
+                  if (hasWall)             return "walls";
+                  if (hasFrame)            return "frames";
+                  return "unknown";
+                })()}
+              />
+            </div>
+          )}
+
+          {/* ── Evaluación por elemento (Fases 1-8) ─────────────────────────── */}
+          {activeSection === "evaluacion-elemento" && (
+            <div className="mx-auto max-w-7xl px-6 py-6 flex flex-col gap-6">
+              <div>
+                <h1 className="text-xl font-semibold text-[var(--text)]">
+                  Evaluación por elemento
+                </h1>
+                <p className="text-sm text-[var(--text-muted)] mt-1">
+                  Umbrales de daño calculados por elemento a partir de
+                  geometría, materiales, refuerzo, carga axial y modo de falla.
+                  Combina Mander (confinamiento), Haselton 2008 (PEER 2007/03),
+                  EC8-3 Anexo A y Paulay-Priestley. Si tienes observaciones de
+                  campo (Lp medida, ganchos, empalmes), súbelas en{" "}
+                  <code>observations.csv</code> para que el cálculo las use.
+                </p>
+              </div>
+              <ElementThresholdsPanel projectId={project.id} />
             </div>
           )}
 

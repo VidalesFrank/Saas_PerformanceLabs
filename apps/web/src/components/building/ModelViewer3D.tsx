@@ -284,7 +284,7 @@ export function ModelViewer3D({ archetypeData }: Props) {
 }
 
 // ── Genera un prisma rectangular (mesh3d) para el modo extruido ───────────────
-function makeBox(
+export function makeBox(
   x1: number, y1: number, z1: number,
   x2: number, y2: number, z2: number,
   b: number, h: number,

@@ -12,7 +12,7 @@ const DAMAGE_COLOR: Record<HingeDamageLevel, string> = {
   collapse: "#ef4444",
 };
 const LABEL: Record<HingeDamageLevel, string> = {
-  none: "Elástico", near_io: "~IO", io: "IO", ls: "LS", cp: "CP", collapse: "Colapso",
+  none: "Elástico", near_io: "~IO", io: "IO", ls: "LS", cp: "CP", collapse: "Post-CP",
 };
 
 interface Props {

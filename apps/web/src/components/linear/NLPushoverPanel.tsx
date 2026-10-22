@@ -12,6 +12,8 @@ import PierResponseCurves      from "./PierResponseCurves";
 import VariantManager          from "./VariantManager";
 import VariantEditor           from "./VariantEditor";
 import VariantComparisonPanel  from "./VariantComparisonPanel";
+import N2PerformancePanel      from "./N2PerformancePanel";
+import { useBuildingWeightKN } from "./use-building-weight";
 import { structuralAnalysisApi } from "@/lib/structural-api";
 import type { DesignVariant, WallDesignRow } from "@/lib/structural-types";
 
@@ -21,11 +23,15 @@ interface Props {
   wallDesign?: { designs: WallDesignRow[] } | null;
 }
 
+type VbUnit = "kN" | "ratio";
+
 export default function NLPushoverPanel({ result, projectId, wallDesign }: Props) {
   const { pushover_X, pushover_Y, summary, fc_mpa, fy_mpa, target_drift_pct } = result;
   const [defDir, setDefDir] = useState<"X" | "Y">(
     pushover_X?.status === "success" || pushover_X?.status === "partial" ? "X" : "Y"
   );
+  const [vbUnit, setVbUnit] = useState<VbUnit>("kN");
+  const W_kN = useBuildingWeightKN(projectId);
   const [selectedPier, setSelectedPier] = useState<{ pier: string; story: string; direction: "X" | "Y" } | null>(null);
   const [activeVariant, setActiveVariant] = useState<DesignVariant | null>(null);
   const [compareVariant, setCompareVariant] = useState<DesignVariant | null>(null);
@@ -143,9 +149,30 @@ export default function NLPushoverPanel({ result, projectId, wallDesign }: Props
       </div>
 
       {/* ── Curvas pushover ───────────────────────────────────────────────── */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <h3 className="text-sm font-semibold text-[var(--text)] uppercase tracking-wider">
+          Curvas Pushover
+        </h3>
+        <VbUnitToggle
+          value={vbUnit}
+          onChange={setVbUnit}
+          wAvailable={W_kN !== null && W_kN > 0}
+          wKN={W_kN}
+        />
+      </div>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        {pushover_X && <PushoverChart dir="X" data={pushover_X} color="#3b82f6" />}
-        {pushover_Y && <PushoverChart dir="Y" data={pushover_Y} color="#22c55e" />}
+        {pushover_X && <PushoverChart dir="X" data={pushover_X} color="#3b82f6" vbUnit={vbUnit} wKN={W_kN} />}
+        {pushover_Y && <PushoverChart dir="Y" data={pushover_Y} color="#22c55e" vbUnit={vbUnit} wKN={W_kN} />}
+      </div>
+
+      {/* ── Punto de desempeño N2 (Fajfar 2000) ───────────────────────────── */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        {pushover_X && (pushover_X.status === "success" || pushover_X.status === "partial") && (
+          <N2PerformancePanel projectId={projectId} direction="X" system="walls" />
+        )}
+        {pushover_Y && (pushover_Y.status === "success" || pushover_Y.status === "partial") && (
+          <N2PerformancePanel projectId={projectId} direction="Y" system="walls" />
+        )}
       </div>
 
       {/* ── Deformada 3D animada ─────────────────────────────────────────────── */}
@@ -278,7 +305,15 @@ export default function NLPushoverPanel({ result, projectId, wallDesign }: Props
   );
 }
 
-function PushoverChart({ dir, data, color }: { dir: string; data: NLPushoverDirResult; color: string }) {
+function PushoverChart({
+  dir, data, color, vbUnit = "kN", wKN,
+}: {
+  dir: string;
+  data: NLPushoverDirResult;
+  color: string;
+  vbUnit?: VbUnit;
+  wKN?:    number | null;
+}) {
   const divRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -287,19 +322,25 @@ function PushoverChart({ dir, data, color }: { dir: string; data: NLPushoverDirR
     const Plotly = (window as unknown as { Plotly: { newPlot: (...args: unknown[]) => void; purge: (el: Element) => void } }).Plotly;
     if (!Plotly) return;
 
-    const drifts    = data.steps.map((s) => s.drift_pct);
-    const shears    = data.steps.map((s) => s.base_shear_kN);
+    const drifts = data.steps.map((s) => s.drift_pct);
+    const shearsKN = data.steps.map((s) => s.base_shear_kN);
+    const useRatio = vbUnit === "ratio" && wKN && wKN > 0;
+    const y        = useRatio ? shearsKN.map((v) => v / (wKN as number)) : shearsKN;
+    const yLabel   = useRatio ? "Vb / W" : "Cortante basal (kN)";
+    const hover    = useRatio
+      ? "Deriva: %{x:.3f}%<br>Vb/W: %{y:.3f}<extra></extra>"
+      : "Deriva: %{x:.3f}%<br>Vb: %{y:.1f} kN<extra></extra>";
 
     Plotly.newPlot(
       divRef.current,
       [{
         x: drifts,
-        y: shears,
+        y,
         type: "scatter",
         mode: "lines",
         line: { color, width: 2 },
-        name: `Vb (kN)`,
-        hovertemplate: "Deriva: %{x:.3f}%<br>Vb: %{y:.1f} kN<extra></extra>",
+        name: `Vb ${dir}`,
+        hovertemplate: hover,
       }],
       {
         paper_bgcolor: "transparent",
@@ -312,7 +353,7 @@ function PushoverChart({ dir, data, color }: { dir: string; data: NLPushoverDirR
           zerolinecolor: "var(--border)",
         },
         yaxis: {
-          title: { text: "Cortante basal (kN)", font: { size: 11 } },
+          title: { text: yLabel, font: { size: 11 } },
           gridcolor: "var(--border)",
           zerolinecolor: "var(--border)",
         },
@@ -324,7 +365,7 @@ function PushoverChart({ dir, data, color }: { dir: string; data: NLPushoverDirR
     return () => {
       if (divRef.current) Plotly.purge(divRef.current);
     };
-  }, [data, color]);
+  }, [data, color, vbUnit, wKN, dir]);
 
   return (
     <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
@@ -340,7 +381,51 @@ function PushoverChart({ dir, data, color }: { dir: string; data: NLPushoverDirR
       )}
       <p className="text-[10px] text-[var(--text-muted)] mt-2 text-center">
         {data.converged_steps} pasos · deriva máx {(data.summary?.max_drift_pct ?? 0).toFixed(3)}% · Vb máx {(data.summary?.max_base_shear_kN ?? 0).toFixed(1)} kN
+        {vbUnit === "ratio" && wKN && wKN > 0 && (
+          <> · Vb/W máx {((data.summary?.max_base_shear_kN ?? 0) / wKN).toFixed(3)}</>
+        )}
       </p>
+    </div>
+  );
+}
+
+function VbUnitToggle({
+  value, onChange, wAvailable, wKN,
+}: {
+  value:       VbUnit;
+  onChange:    (v: VbUnit) => void;
+  wAvailable:  boolean;
+  wKN:         number | null;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-[10px] text-[var(--text-muted)] uppercase tracking-wider">
+        {wAvailable && wKN ? `W = ${wKN.toFixed(0)} kN` : "W no disponible"}
+      </span>
+      <div className="inline-flex rounded-md border border-[var(--border)] overflow-hidden text-[11px] font-medium">
+        {(["kN", "ratio"] as const).map((u) => {
+          const disabled = u === "ratio" && !wAvailable;
+          return (
+            <button
+              key={u}
+              onClick={() => !disabled && onChange(u)}
+              disabled={disabled}
+              className={`px-2 py-1 transition-colors ${
+                value === u
+                  ? "bg-[var(--accent)] text-white"
+                  : "bg-[var(--surface-2)] text-[var(--text-muted)] hover:text-[var(--text)]"
+              } ${disabled ? "opacity-40 cursor-not-allowed" : ""}`}
+              title={
+                disabled
+                  ? "Requiere masas definidas en el canonical. Valida el modelo primero."
+                  : u === "ratio" ? "Normalizar por peso del edificio" : "Mostrar en kN"
+              }
+            >
+              {u === "kN" ? "kN" : "Vb/W"}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

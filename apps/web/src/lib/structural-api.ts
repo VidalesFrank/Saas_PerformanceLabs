@@ -31,6 +31,10 @@ import type {
   MasonryMaterial,
   MasonryBrickType,
   InfillPanel,
+  SectionReinforcementList,
+  SectionReinforcementItem,
+  ReinforcementNSR10Result,
+  SaveSectionReinforcementPayload,
 } from "./structural-types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -274,6 +278,64 @@ export const structuralAnalysisApi = {
   /** URL del XLSX con resumen + curvas + rótulas + metadata. */
   nlFramePushoverXlsxUrl: (projectId: string) =>
     `${BASE}/analysis/${projectId}/nl-frame-pushover/export/xlsx`,
+
+  /** Calcula punto de desempeño por el método N2 (síncrono).
+   *  `system` rutea el pushover fuente: "frames" (pórticos) o "walls" (muros). */
+  computeN2: (
+    projectId: string,
+    direction: "X" | "Y",
+    system: "frames" | "walls" = "frames",
+  ) =>
+    req<import("./structural-types").N2Result>(
+      `/analysis/${projectId}/${system === "walls" ? "nl-pushover" : "nl-frame-pushover"}/${direction}/n2`,
+      { method: "POST" },
+    ),
+
+  /** Lee el último resultado N2 persistido. */
+  getN2: (
+    projectId: string,
+    direction: "X" | "Y",
+    system: "frames" | "walls" = "frames",
+  ) =>
+    req<import("./structural-types").N2Result>(
+      `/analysis/${projectId}/${system === "walls" ? "nl-pushover" : "nl-frame-pushover"}/${direction}/n2`,
+    ),
+
+  // ── NLTHA (análisis cronológico no lineal) ────────────────────────────────
+
+  /** Sube un archivo ACC (una aceleración por línea) para el NLTHA.
+   *  `direction` es "X" o "Y". Devuelve la ruta absoluta del archivo en el
+   *  worker que debes pasar en el launch. */
+  uploadNLTHRecord: async (
+    projectId: string,
+    direction: "X" | "Y",
+    file: File,
+  ): Promise<import("./structural-types").NLTHUploadResult> => {
+    const url  = `${BASE}/analysis/${projectId}/nlth/upload-record?direction=${direction}`;
+    const form = new FormData();
+    form.append("file", file);
+    const token = getToken();
+    const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {};
+    const res   = await fetch(url, { method: "POST", body: form, headers });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(text || `Upload falló (${res.status})`);
+    }
+    return res.json();
+  },
+
+  /** Lee el último `nlth_results.json` persistido. */
+  getNLTHResult: (projectId: string) =>
+    req<import("./structural-types").NLTHResult>(
+      `/analysis/${projectId}/nlth/result`,
+    ),
+
+  /** Lista los registros X/Y ya subidos — para re-poblar el UI al montar. */
+  listNLTHRecords: (projectId: string) =>
+    req<{ X: import("./structural-types").NLTHUploadResult | null;
+          Y: import("./structural-types").NLTHUploadResult | null; }>(
+      `/analysis/${projectId}/nlth/records`,
+    ),
 };
 
 // ── Editor del modelo estructural ────────────────────────────────────────────
@@ -532,7 +594,73 @@ export const structuralDesignApi = {
         body: JSON.stringify({ reinforcement }),
       },
     ),
+
+  // ── Patrones de refuerzo por sección (as-built) ─────────────────────────
+  listSectionReinforcement: (projectId: string) =>
+    req<SectionReinforcementList>(`/${projectId}/design/sections`),
+
+  saveSectionReinforcement: (
+    projectId:    string,
+    elementType:  "column" | "beam",
+    sectionName:  string,
+    payload:      SaveSectionReinforcementPayload,
+  ) =>
+    req<{
+      ok:            boolean;
+      section_key:   string;
+      n_elements:    number;
+      pattern_label: string | null;
+      message:       string;
+    }>(
+      `/${projectId}/design/sections/${elementType}/${encodeURIComponent(sectionName)}/reinforcement`,
+      { method: "PUT", body: JSON.stringify(payload) },
+    ),
+
+  deleteSectionReinforcement: (
+    projectId:   string,
+    elementType: "column" | "beam",
+    sectionName: string,
+  ) =>
+    req<{ ok: boolean; removed: boolean; section_key?: string; message?: string }>(
+      `/${projectId}/design/sections/${elementType}/${encodeURIComponent(sectionName)}/reinforcement`,
+      { method: "DELETE" },
+    ),
+
+  listFrameOverrides: (projectId: string) =>
+    req<{
+      overrides: Record<string, {
+        reinforcement: unknown;
+        source:        string | null;
+        pattern_label: string | null;
+        notes:         string | null;
+        saved_at:      string | null;
+      }>;
+      n_total: number;
+    }>(`/${projectId}/design/overrides`),
+
+  deleteFrameReinforcement: (projectId: string, frameId: string) =>
+    req<{ ok: boolean; removed: boolean; frame_id: string }>(
+      `/${projectId}/design/frames/${encodeURIComponent(frameId)}/reinforcement`,
+      { method: "DELETE" },
+    ),
+
+  validateSectionReinforcement: (
+    projectId:   string,
+    elementType: "column" | "beam",
+    sectionName: string,
+    payload: Pick<
+      SaveSectionReinforcementPayload,
+      "longitudinal" | "transverse" | "zones" | "shear"
+    >,
+  ) =>
+    req<ReinforcementNSR10Result>(
+      `/${projectId}/design/sections/${elementType}/${encodeURIComponent(sectionName)}/validate-nsr10`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
 };
+
+// Re-export para que los consumidores no tengan que importar desde types
+export type { SectionReinforcementItem };
 
 const NL_BASE = `${API_URL}/api/v1/projects/nonlinear`;
 
@@ -599,3 +727,155 @@ export const nlSpecApi = {
   deleteSpec: (projectId: string) =>
     nlReq<{ ok: boolean; message: string }>(`/${projectId}/spec`, { method: "DELETE" }),
 };
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fase 7 — umbrales por elemento (basados en Fases 1-6)
+// ─────────────────────────────────────────────────────────────────────────────
+export type RotationMethod = "mecanico" | "ec8_3" | "haselton";
+export type UmbralesMode   = "FEMA" | "elemento" | "ambos";
+
+export interface DamageStateConfig {
+  id:                string;
+  name:              string;
+  threshold_source:  string;
+  repair_action:     string;
+  beta_override:     number | null;
+}
+
+export interface ElementThresholdRow {
+  fid:              string;
+  kind:             string;
+  story:            string;
+  section:          string;
+  failure_mode:     string;
+  asce_condition:   string;
+  flags:            string[];
+  Vp_kN:            number;
+  Vn_kN:            number;
+  Vp_over_Vn:       number;
+  M_peak_kNm:       number;
+  phi_u_rad_per_m:  number;
+  method:           string;
+  Lp_mm:            number;
+  Lp_source:        string;
+  theta_y:          number;
+  theta_IO:         number;
+  theta_LS:         number;
+  theta_CP:         number;
+  theta_u:          number;
+  lambda_imk:       number | null;
+  Mc_over_My:       number | null;
+  medians_DS:       Record<string, number>;
+  betas_DS:         Record<string, number>;
+  has_measured_Lp:  boolean;
+  damage_notes:     string | null;
+}
+
+export interface ElementThresholdResult {
+  metodo_rotacion:       RotationMethod;
+  metodo_umbrales:       UmbralesMode;
+  beta_global:           number;
+  beta_poor_detailing:   number;
+  rows:                  ElementThresholdRow[];
+  fragilities:           Record<string, {
+    fid: string;
+    medians: Record<string, number>;
+    betas: Record<string, number>;
+    ds_catalog: DamageStateConfig[];
+  }>;
+  n_elements:            number;
+  n_with_lp_measured:    number;
+  n_poor_detailing:      number;
+  warnings:              string[];
+}
+
+export interface FieldObservation {
+  L_p_measured_mm?: number;
+  L_p_method?:      string;
+  hook_type?:       string;
+  splice_in_hinge?: boolean;
+  fu_MPa?:          number;
+  eps_su?:          number;
+  damage_notes?:    string;
+  photo_path?:      string;
+}
+
+export const elementThresholdsApi = {
+  compute: (projectId: string, params: {
+    metodo_rotacion?:     RotationMethod;
+    metodo_umbrales?:     UmbralesMode;
+    beta_global?:         number;
+    beta_poor_detailing?: number;
+    ds_catalog?:          DamageStateConfig[];
+  }) =>
+    req<ElementThresholdResult>(`/analysis/${projectId}/element-thresholds`, {
+      method: "POST",
+      body:   JSON.stringify(params),
+    }),
+
+  get: (projectId: string) =>
+    req<ElementThresholdResult>(`/analysis/${projectId}/element-thresholds`),
+
+  getDSCatalog: (projectId: string) =>
+    req<DamageStateConfig[]>(`/analysis/${projectId}/damage-states-catalog`),
+
+  putDSCatalog: (projectId: string, catalog: DamageStateConfig[]) =>
+    req<{ saved: boolean; n_states: number }>(
+      `/analysis/${projectId}/damage-states-catalog`,
+      { method: "PUT", body: JSON.stringify(catalog) },
+    ),
+
+  getFieldObservations: (projectId: string) =>
+    req<{ observations: Record<string, FieldObservation>; n_elements: number }>(
+      `/analysis/${projectId}/field-observations`,
+    ),
+
+  uploadFieldObservations: (projectId: string, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return upload<{ saved: boolean; n_elements: number }>(
+      `/analysis/${projectId}/field-observations`, fd,
+    );
+  },
+
+  putFieldObservation: (projectId: string, fid: string, obs: FieldObservation & { fid: string }) =>
+    req<{ saved: boolean; fid: string }>(
+      `/analysis/${projectId}/field-observations/${fid}`,
+      { method: "PUT", body: JSON.stringify(obs) },
+    ),
+
+  applyLpToSection: (projectId: string, section_name: string, kind: "column" | "beam", L_p_measured_mm: number) =>
+    req<{ applied_to: string[]; n_elements: number }>(
+      `/analysis/${projectId}/field-observations/apply-lp-to-section`,
+      {
+        method: "POST",
+        body:   JSON.stringify({ section_name, kind, L_p_measured_mm }),
+      },
+    ),
+
+  getElementDemand: (projectId: string) =>
+    req<ElementDemandResult>(`/analysis/${projectId}/element-demand`),
+};
+
+// Demanda unificada (NLTHA / pushover) por elemento
+export interface ElementDemandEntry {
+  theta_p_max:        number;
+  end_at_max:         string;
+  direction_at_max:   string;
+  level:              "none" | "near_io" | "io" | "ls" | "cp" | "collapse";
+  theta_IO_fema?:     number | null;
+  theta_LS_fema?:     number | null;
+  theta_CP_fema?:     number | null;
+  kind?:              string | null;
+  story?:             string | null;
+  source:             "nlth" | "pushover";
+}
+
+export interface ElementDemandResult {
+  source:            "none" | "nlth" | "pushover" | "both";
+  by_fid:            Record<string, ElementDemandEntry>;
+  n_elements:        number;
+  n_from_nlth:       number;
+  n_from_pushover:   number;
+}

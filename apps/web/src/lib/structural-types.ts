@@ -1,6 +1,6 @@
 // ── Tipos para el Módulo 1 — Constructor de Modelos Estructurales ─────────────
 
-export type StructuralAnalysisType = "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands" | "wall_design" | "nl_pushover" | "variant_pushover" | "frame_pushover";
+export type StructuralAnalysisType = "import_validate" | "modal" | "spectral" | "design_columns" | "design_beams" | "wall_demands" | "wall_design" | "nl_pushover" | "variant_pushover" | "frame_pushover" | "nlth";
 export type StructuralJobStatus    = "pending" | "running" | "success" | "failed" | "cancelled";
 export type ValidationStatus       = "not_run" | "has_errors" | "has_warnings" | "ok";
 
@@ -648,6 +648,129 @@ export interface BeamReinforcementEdit {
   };
 }
 
+// ── Refuerzo por sección (as-built) — Módulo 1, F1/F2 reinforcement ─────────
+
+export interface ColumnBarGroup {
+  bar_label: string;
+  n_bars:    number;
+  db_mm?:    number;
+  As_cm2?:   number;
+}
+export interface ColumnBarGroups {
+  corners:    ColumnBarGroup;   // siempre 4 barras
+  top_face:   ColumnBarGroup;
+  bot_face:   ColumnBarGroup;
+  left_face:  ColumnBarGroup;
+  right_face: ColumnBarGroup;
+}
+export interface ColumnReinfLongitudinal {
+  // Resumen (opcional en entrada — el backend lo calcula si viene granular)
+  n_bars?:    number;
+  bar_label?: string;      // dominante
+  As_cm2?:    number;
+  // Nuevo modelo granular
+  groups?:    ColumnBarGroups;
+}
+export interface ColumnReinfTransverse {
+  tie_bar_label:      string;
+  n_legs_b:           number;
+  n_legs_h:           number;
+  s_confined_mm:      number;
+  s_general_mm:       number;
+  L_confinement_mm?:  number;
+}
+export interface BeamZoneBarsAsBuilt {
+  top: { n_bars: number; bar_label: string; As_cm2: number };
+  bot: { n_bars: number; bar_label: string; As_cm2: number };
+}
+export interface BeamZones {
+  end_i: BeamZoneBarsAsBuilt;
+  mid:   BeamZoneBarsAsBuilt;
+  end_j: BeamZoneBarsAsBuilt;
+}
+export interface BeamShear {
+  tie_bar_label:      string;
+  n_legs:             number;
+  s_confined_mm:      number;
+  s_central_mm:       number;
+  L_confinement_mm?:  number;
+}
+
+export interface SectionPatternColumn {
+  mode:          "manual";
+  section_name:  string;
+  element_type:  "column";
+  longitudinal:  ColumnReinfLongitudinal;
+  transverse:    ColumnReinfTransverse;
+  pattern_label: string | null;
+  notes:         string | null;
+  updated_at:    string;
+}
+export interface SectionPatternBeam {
+  mode:          "manual";
+  section_name:  string;
+  element_type:  "beam";
+  zones:         BeamZones;
+  shear:         BeamShear;
+  pattern_label: string | null;
+  notes:         string | null;
+  updated_at:    string;
+}
+export type SectionPattern = SectionPatternColumn | SectionPatternBeam;
+
+export interface SectionReinforcementItem {
+  section_key:   string;             // "column:C40x40" | "beam:V30x40"
+  section_name:  string;
+  element_type:  "column" | "beam";
+  b_m:           number;
+  h_m:           number;
+  material:      string;
+  fc_MPa:        number;
+  fy_MPa:        number;
+  cover_m:       number;
+  frame_ids:     string[];
+  stories:       string[];
+  n_elements:    number;
+  mode:          "auto" | "manual";
+  pattern:       SectionPattern | null;
+  pattern_label: string | null;
+  updated_at:    string | null;
+  n_overrides:   number;
+}
+
+export interface SectionReinforcementList {
+  sections:  SectionReinforcementItem[];
+  n_total:   number;
+  n_manual:  number;
+  n_auto:    number;
+}
+
+export interface ReinforcementNSR10Warning {
+  level:   "info" | "warning" | "error";
+  code:    string;
+  message: string;
+}
+export interface ReinforcementNSR10Result {
+  warnings:    ReinforcementNSR10Warning[];
+  n_errors:    number;
+  n_warnings:  number;
+  n_info:      number;
+  nsr10_ok:    boolean;
+  section_key: string;
+}
+
+export interface SaveSectionReinforcementPayload {
+  mode:          "manual";
+  pattern_label?: string | null;
+  notes?:        string | null;
+  // columna
+  longitudinal?: ColumnReinfLongitudinal;
+  transverse?:   ColumnReinfTransverse;
+  // viga
+  zones?:        BeamZones;
+  shear?:        BeamShear;
+}
+
 // ── Tipos para el editor interactivo del modelo (Módulo 1 v3) ─────────────────
 
 /** Datos de una sección de marco en el modelo canónico. */
@@ -1101,11 +1224,32 @@ export interface HingeRecord {
   theta_IO:        number;
   theta_LS:        number;
   theta_CP:        number;
+  /** Capacidades base ASCE 41-17 (sin aplicar k_conf). */
+  theta_IO_base?:  number;
+  theta_LS_base?:  number;
+  theta_CP_base?:  number;
+  /** Factor por confinamiento Mander aplicado a la capacidad base. */
+  k_conf?:         number;
+  rho_s?:          number;
   damage_level:    HingeDamageLevel;
   dcr:             number;
   step_first_IO:   number | null;
   step_first_LS:   number | null;
   step_first_CP:   number | null;
+  /** Serie θ_p submuestreada alineada con `frames` del endpoint history. */
+  theta_p_hist?:   number[];
+}
+
+/** Umbrales ajustables de daño separados por tipo.
+ *  - beam/column: rotación plástica θ_p (rad).
+ *  - infill: deriva relativa del panel (fracción adimensional).
+ */
+export interface HingeThresholds {
+  beam:   { IO: number; LS: number; CP: number };
+  column: { IO: number; LS: number; CP: number };
+  infill: { IO: number; LS: number; CP: number };
+  /** Si true, se aplica el factor k_conf de cada rótula a la capacidad base. */
+  applyKConf: boolean;
 }
 
 export interface ElementLine {
@@ -1121,6 +1265,35 @@ export interface ElementLine {
   h_m:         number;
   L_m:         number;
   lp_m:        number;
+}
+
+// ── Eventos locales (Bloque B): fluencia, aplastamiento, pandeo, fractura ────
+
+export type LocalEventType =
+  | "first_yield_bar"
+  | "cover_crush"
+  | "core_crush"
+  | "bar_buckling"
+  | "bar_fracture";
+
+export interface LocalEvent {
+  fid:       string;
+  kind:      "column" | "beam";
+  story:     string;
+  step:      number;
+  time_s:    number | null;
+  type:      LocalEventType;
+  location:  "end_i" | "end_j";
+  strain:    number;
+  threshold: number;
+  direction: string | null;
+}
+
+export interface LocalEventsPayload {
+  status:  "success" | "no_sect_def_captured" | "failed" | string;
+  message?: string;
+  events:  LocalEvent[];
+  summary: Record<LocalEventType, number>;
 }
 
 export interface NLFramePushoverDirResult {
@@ -1147,6 +1320,7 @@ export interface NLFramePushoverDirResult {
   element_lines?: ElementLine[];
   stories_z?:     Record<string, number>;
   total_height?:  number;
+  events?:        LocalEventsPayload;
   damage?: {
     status:     string;
     n_total:    number;
@@ -1242,6 +1416,7 @@ export interface NLFramePushoverHistory {
   stride:            number;
   frames:            NLPushoverFrame[];
   joints_ref:        Record<string, [number, number, number]>;
+  stories_z?:        Record<string, number>;
   element_lines:     ElementLine[];
   infill_lines?:     InfillLine[];
   hinge_damage:      HingeRecord[];
@@ -1281,6 +1456,175 @@ export interface FrameElementResponse {
   L_m:    number;
   curve:  FrameElementResponsePoint[];
   hinge:  HingeRecord | null;
+}
+
+// ── Método N2 (Fajfar 2000) — punto de desempeño ─────────────────────────────
+
+export interface N2Result {
+  status:     "success" | "collapse";
+  project_id: string;
+  direction:  "X" | "Y";
+  spectrum: {
+    source:    string;
+    params:    Record<string, number>;
+    zona?:     string;
+    I_factor:  number;
+    T:         number[];
+    Sa_mps2:   number[];
+    Sd_m:      number[];
+  };
+  sdof: {
+    gamma_1:              number;
+    m_ast_ton:            number;
+    T_star:               number;
+    K_star:               number;
+    Say_mps2:             number;
+    Sdy_m:                number;
+    Sa_max_mps2:          number;
+    Sd_ultimo_m:          number;
+    idx_falla:            number;
+    strength_drop_found:  boolean;
+    Tc:                   number;
+    Sae_mps2:             number;
+    Sde_m:                number;
+    R_mu:                 number;
+    rule:                 "equal_displacement" | "equal_energy";
+    Sd_target_m:          number;
+    ductility:            number;
+    is_collapse:          boolean;
+  };
+  capacity: {
+    Sd_m:            number[];
+    Sa_mps2:         number[];
+    Sd_useful_m:     number[];
+    Sa_useful_mps2:  number[];
+    Sd_degraded_m:   number[];
+    Sa_degraded_mps2:number[];
+    bilinear_sd:     number[];
+    bilinear_sa:     number[];
+  };
+  mdof_target: {
+    D_target_m:        number;
+    pushover_step?:    number;
+    drift_pct?:        number;
+    base_shear_kN?:    number;
+    // Pórticos (ASCE 41): presentes cuando el N2 corre sobre un pushover de frame.
+    n_hinges_IO?:       number;
+    n_hinges_LS?:       number;
+    n_hinges_CP?:       number;
+    n_hinges_collapse?: number;
+    // Muros (Park-Ang): presentes cuando el N2 corre sobre un pushover de muros.
+    n_piers_none?:      number;
+    n_piers_minor?:     number;
+    n_piers_moderate?:  number;
+    n_piers_severe?:    number;
+    n_piers_collapse?:  number;
+  };
+  warnings:    string[];
+  computed_at: string;
+}
+
+// ── NLTHA (análisis cronológico no lineal) ──────────────────────────────────
+
+export interface NLTHUploadResult {
+  ok:           boolean;
+  direction:    "X" | "Y";
+  path:         string;              // clean_path, lo que va al task
+  source_path:  string;
+  filename:     string;
+  format:       "peer_at2" | "fema_flat" | "csv_time_acc" | "flat_whitespace";
+  n_samples:    number;
+  dt_detected:  number | null;
+  duration_s:   number | null;
+  pga:          number;
+  units_hint:   "g" | "mps2" | "cm/s2" | null;
+  header_lines: string[];
+  description:  string;
+  preview:      { t: number[]; a: number[]; stride: number };
+}
+
+export interface NLTHDamageHinges {
+  status:       "success" | "no_data";
+  scheme:       string;
+  thresholds:   { IO: number; LS: number; CP: number; collapse: number };
+  counts:       { none: number; io: number; ls: number; cp: number; collapse: number };
+  max_theta_p:  number;
+  worst_elements: Array<{ element: number; theta_p_max: number; level: string }>;
+}
+
+export interface NLTHDamagePiers {
+  status:    "success" | "no_data";
+  scheme:    string;
+  ductility: string;
+  drift_cap: number;
+  counts:    { none: number; minor: number; moderate: number; severe: number; collapse: number };
+  max_di:    number;
+  stories:   Array<{ story_idx: number; z_m: number; max_drift_pct: number; DI: number; level: string }>;
+}
+
+export interface NLTHResult {
+  status:        "success" | "partial";
+  system:        "walls" | "frames";
+  project_id:    string;
+  computed_at:   string;
+  record_x_file: string;
+  record_y_file: string;
+  t_s:           number[];
+  techo: {
+    x:     number[];
+    y:     number[];
+    total: number[];
+  };
+  Vb_history: {
+    x_kN: number[];
+    y_kN: number[];
+  };
+  envelope: {
+    max_abs_disp_x_m:            number;
+    max_abs_disp_y_m:            number;
+    max_drift_x_pct:             number;
+    max_drift_y_pct:             number;
+    max_drift_pct:               number;
+    max_drift_by_story_x:        number[];
+    max_drift_by_story_y:        number[];
+    max_accel_by_story_x_mps2:   number[];
+    max_accel_by_story_y_mps2:   number[];
+    max_Vb_x_kN:                 number;
+    max_Vb_y_kN:                 number;
+    max_roof_disp_total_m:       number;
+    t_elapsed_s:                 number;
+    t_target_s:                  number;
+  };
+  damage: NLTHDamageHinges | NLTHDamagePiers;
+  events?: LocalEventsPayload;
+  element_lines?: ElementLine[];
+  infill_lines?:  InfillLine[];
+  infill_damage?: InfillDamageHistory;
+  runtime?: {
+    wall_time_s:    number;    // segundos de reloj
+    wall_time_min:  number;    // minutos de reloj
+    t_simulated_s:  number;    // seg del registro procesados
+    speed_ratio:    number;    // seg wall / seg simulado
+  };
+  meta: {
+    dtrec:          number;
+    dt_analysis:    number;
+    damping:        number;
+    scale:          number;
+    record_units:   string;
+    factor_applied: number;
+    duration_s:     number;
+    total_height_m: number;
+    n_stories:      number;
+    eletype:        "wall" | "frame";
+    ductility:      string;
+  };
+  history: {
+    path:       string;
+    n_steps:    number;
+    dt_rec:     number;
+    n_elements: number;
+  } | null;
 }
 
 // ── Variantes de diseño (Fase 6) ─────────────────────────────────────────────
