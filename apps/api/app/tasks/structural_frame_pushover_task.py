@@ -211,6 +211,28 @@ def run_frame_pushover(
                     except Exception as e_dmg:
                         print(f"[frame_pushover] WARN damage {direction}: {e_dmg}")
 
+                # Eventos locales: aplastamiento, pandeo, fluencia, fractura (Bloque B)
+                if push.get("history"):
+                    try:
+                        from app.engine.building.nonlinear.event_detector import (
+                            detect_events_pushover,
+                        )
+                        ev = detect_events_pushover(
+                            npz_path      = str(hist_path),
+                            spec          = spec,
+                            element_lines = info["element_lines"],
+                            direction     = direction,
+                        )
+                        push["events"] = ev
+                        print(f"[frame_pushover] Eventos {direction}: "
+                              f"fluencia={ev['summary']['first_yield_bar']}, "
+                              f"cover_crush={ev['summary']['cover_crush']}, "
+                              f"core_crush={ev['summary']['core_crush']}, "
+                              f"pandeo={ev['summary']['bar_buckling']}, "
+                              f"fractura={ev['summary']['bar_fracture']}")
+                    except Exception as e_ev:
+                        print(f"[frame_pushover] WARN events {direction}: {e_ev}")
+
                 # Daño de infills — historia por paso para animación en el visor
                 if push.get("history") and info.get("infill_lines"):
                     try:
@@ -365,7 +387,13 @@ def _ensure_nl_spec(project, work_dir: str) -> None:
 
     col_detail  = _load(os.path.join(rd, "design_columns_detail.json"))
     beam_detail = _load(os.path.join(rd, "beam_design_detail.json"))
-    user_reinf  = _load(os.path.join(rd, "reinforcement.json"))
+    reinf_json  = _load(os.path.join(rd, "reinforcement.json"))
+
+    # El reinforcement.json contiene (a) section_patterns = refuerzo as-built
+    # por sección, y (b) overrides individuales por frame_id. Separamos para
+    # pasarlos como argumentos distintos al builder.
+    section_patterns = reinf_json.pop("section_patterns", {}) if isinstance(reinf_json, dict) else {}
+    user_reinf       = reinf_json
 
     params = json.loads(project.parameters_json) if project.parameters_json else {}
     ed = params.get("energy_dissipation", "DMO")
@@ -375,6 +403,7 @@ def _ensure_nl_spec(project, work_dir: str) -> None:
         col_detail         = col_detail,
         beam_detail        = beam_detail,
         user_reinforcement = user_reinf,
+        section_patterns   = section_patterns,
         energy_dissipation = ed,
         project_id         = str(getattr(project, "id", "")),
     )

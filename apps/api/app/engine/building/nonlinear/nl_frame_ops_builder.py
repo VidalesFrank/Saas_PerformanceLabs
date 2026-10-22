@@ -182,11 +182,16 @@ class NLFrameOPSBuilder:
             "infill_lines":   self._infill_lines,
         }
 
-    def run_gravity(self, factor: float = 1.0, steps: int = 10) -> dict:
+    def run_gravity(self, factor: float = 1.0, steps: int = 10,
+                    axial_out_path: Path | None = None) -> dict:
         """
         Análisis gravitacional incremental aplicando el peso del edificio como
         carga puntual en los CM (W_kN del spec). Se divide en N pasos y se
         bloquea con loadConst al terminar.
+
+        Si axial_out_path está dado, al final persiste un JSON con la carga
+        axial por elemento (columnas y vigas): {fid: {N_grav_kN}}. Convención
+        de compresión POSITIVA.
         """
         ops = self._ops
         ops.timeSeries("Linear", 1)
@@ -219,7 +224,44 @@ class NLFrameOPSBuilder:
             ok = ops.analyze(max(steps, 1))
 
         ops.loadConst("-time", 0.0)
+
+        if axial_out_path is not None:
+            self._persist_axial_from_gravity(axial_out_path)
+
         return {"status": "success" if ok == 0 else "partial"}
+
+    def _persist_axial_from_gravity(self, out_path: Path) -> None:
+        """Extrae la fuerza axial de cada columna y viga tras loadConst y la
+        persiste a disco para que el posproceso (ElementData, Fase 1) la lea.
+
+        En forceBeamColumn, ``sectionForce(ele, ip_section, 1)`` devuelve la
+        fuerza axial de la sección en el IP indicado. Convención OpenSees:
+        compresión < 0 → se invierte el signo para almacenar compresión > 0.
+
+        Si la lectura falla para algún elemento, su entrada queda en 0.0 — no
+        se aborta el análisis.
+        """
+        ops = self._ops
+        payload: dict[str, dict] = {}
+
+        for fid, ele_tag in self._ele_col_map.items():
+            try:
+                # IP 1 — extremo i de la columna
+                N = float(ops.sectionForce(ele_tag, 1, 1))
+                payload[fid] = {"N_grav_kN": -N}       # compresión positiva
+            except Exception:
+                payload[fid] = {"N_grav_kN": 0.0}
+
+        for fid, ele_tag in self._ele_bm_map.items():
+            try:
+                N = float(ops.sectionForce(ele_tag, 1, 1))
+                payload[fid] = {"N_grav_kN": -N}       # usualmente ≈ 0 en vigas
+            except Exception:
+                payload[fid] = {"N_grav_kN": 0.0}
+
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def run_pushover(
         self,
@@ -353,7 +395,11 @@ class NLFrameOPSBuilder:
         for step_idx in range(n_steps):
             if cancel_flag and cancel_flag[0]:
                 break
-            if self._try_step() != 0:
+            # Primero paso completo; si falla, bisection progresivo.
+            # Esto permite "atravesar" fallos locales (una fibra entra a crush
+            # con MinMax) sin detener el pushover global — el edificio todavía
+            # tiene capacidad por redistribución.
+            if self._try_step_with_bisection(sign, inc_m, dof) != 0:
                 break
             converged += 1
             ctrl_disp  = float(ops.nodeDisp(self._control_node, dof))
@@ -460,6 +506,93 @@ class NLFrameOPSBuilder:
                                 steps_out, status, n_steps, converged)
         return result
 
+    def run_dynamic(
+        self,
+        record_x_path:  str,
+        record_y_path:  str,
+        dtrec:          float,
+        dt_analysis:    float = 0.005,
+        damping:        float = 0.05,
+        scale:          float = 1.0,
+        record_units:   str   = "g",      # "g" | "mps2" | "cm/s2"
+        duration:       float | None = None,
+        history_path:   Path | None = None,
+        progress_cb               = None,
+    ) -> dict:
+        """
+        Análisis cronológico no lineal (NLTHA) bidireccional sobre el modelo
+        de pórticos no lineal (fibras + rótulas + infills). La carga
+        gravitacional debe estar aplicada previamente con `run_gravity()`.
+
+        Los elementos registrados son columnas + vigas (frame). Los puntales
+        de infill contribuyen a la respuesta pero no se registran en Prot.
+        """
+        from .nlth_runner import run_nlth
+
+        if not self._control_node:
+            raise RuntimeError("Modelo sin nodo de control (CM azotea).")
+        if not self._base_nodes:
+            raise RuntimeError("Modelo sin nodos base — no se puede correr NLTHA.")
+
+        # CM ordenados por z
+        cm_sorted = sorted(
+            self._cm_nodes.items(),
+            key=lambda kv: self._stories_z.get(kv[0], 0.0),
+        )
+        cm_tags   = [info["tag"] for _, info in cm_sorted]
+        stories_z = [self._stories_z[s] for s, _ in cm_sorted]
+
+        base_tag      = self._base_nodes[0]
+        nodes_control = [base_tag] + cm_tags
+        control_node  = self._control_node
+
+        # Elementos a registrar: columnas + vigas (fibras forceBeamColumn)
+        col_tags = sorted(self._ele_col_map.values())
+        bm_tags  = sorted(self._ele_bm_map.values())
+        elements = col_tags + bm_tags
+        total_height = max(self._stories_z.values(), default=1.0)
+
+        # Infills: panel_ids + truss tag pairs + arrays L0/e0/eu para capturar
+        # elongación y post-procesar daño por panel.
+        infill_panel_ids   = list(self._infill_order)
+        infill_truss_tags  = [list(self._ele_infill_map.get(pid, []))
+                              for pid in infill_panel_ids]
+        infill_L0_arr      = [next((p["L0_m"]      for p in self._infill_lines
+                                     if p["panel_id"] == pid), 0.0)
+                               for pid in infill_panel_ids]
+        infill_e0_arr      = [next((p["e0_strain"] for p in self._infill_lines
+                                     if p["panel_id"] == pid), 0.0)
+                               for pid in infill_panel_ids]
+        infill_eu_arr      = [next((p["eu_strain"] for p in self._infill_lines
+                                     if p["panel_id"] == pid), 0.0)
+                               for pid in infill_panel_ids]
+
+        return run_nlth(
+            ops_module    = self._ops,
+            nodes_control = nodes_control,
+            base_nodes    = list(self._base_nodes),
+            elements      = elements,
+            control_node  = control_node,
+            stories_z     = stories_z,
+            total_height  = total_height,
+            record_x_path = record_x_path,
+            record_y_path = record_y_path,
+            dtrec         = dtrec,
+            dt_analysis   = dt_analysis,
+            damping       = damping,
+            scale         = scale,
+            record_units  = record_units,
+            duration      = duration,
+            eletype       = "frame",
+            history_path  = history_path,
+            progress_cb   = progress_cb,
+            infill_panel_ids  = infill_panel_ids,
+            infill_truss_tags = infill_truss_tags,
+            infill_L0_arr     = infill_L0_arr,
+            infill_e0_arr     = infill_e0_arr,
+            infill_eu_arr     = infill_eu_arr,
+        )
+
     def wipe(self) -> None:
         if self._ops:
             try:
@@ -532,38 +665,79 @@ class NLFrameOPSBuilder:
     def _get_concrete(
         self, fcc_MPa: float, eps_cc: float, eps_cu: float, label: str = "conf",
     ) -> int:
-        """Concrete02 con parámetros Mander (ya calculados por fase F1)."""
+        """Concrete02 Mander envuelto en MinMax.
+
+        El MinMax wrapper hace que la fibra devuelva σ=0 definitivamente al
+        superar εcu (crush físico). Sin esto, Concrete02 mantiene su residual
+        del 20% para siempre y el modelo subestima drásticamente el colapso.
+
+        Buffer de 20% más allá de εcu antes de activar el crush — ayuda a la
+        convergencia numérica cerca de la deformación última sin perder
+        realismo (el crush real ocurre en el rango εcu ± 20%).
+        """
         key = (round(fcc_MPa, 2), round(eps_cc, 5), round(eps_cu, 5), label)
         if key in self._mat_concrete:
             return self._mat_concrete[key]
-        tag = self._next_mat()
+
+        # Material base Concrete02 (Mander) — tag "interno"
+        tag_base = self._next_mat()
         fcc_kPa = fcc_MPa * 1000.0
-        f_cu    = 0.20 * fcc_kPa          # 20% residual
+        f_cu    = 0.20 * fcc_kPa          # 20% residual (rama descendente)
         ft      = 0.10 * fcc_kPa          # resistencia a tracción
         Ets     = ft / max(eps_cc * 0.5, 0.0005)
         self._ops.uniaxialMaterial(
-            "Concrete02", tag,
+            "Concrete02", tag_base,
             -fcc_kPa, -eps_cc,            # fpc, epsc0
             -f_cu,    -eps_cu,            # fpcu, epsU
             0.1, ft, Ets,                 # lambda, ft, Ets
         )
-        self._mat_concrete[key] = tag
-        return tag
 
-    def _get_steel(self, fy_MPa: float) -> int:
-        key = round(fy_MPa, 1)
+        # MinMax wrapper — fuerza σ=0 fuera del rango de deformación válido.
+        # Buffer generoso 2.5·εcu: el Concrete02 ya tiene rama descendente al
+        # 20% residual, dejamos que esa rama actúe en un rango amplio antes
+        # del crush físico. Evita que una fibra sola rompa la convergencia
+        # cuando la columna todavía puede redistribuir carga a vecinas.
+        tag_wrap = self._next_mat()
+        eps_crush   = -2.5 * eps_cu
+        eps_tension = +5.0 * (ft / 1000.0 / 24000.0)
+        self._ops.uniaxialMaterial(
+            "MinMax", tag_wrap, tag_base,
+            "-min", eps_crush,
+            "-max", eps_tension,
+        )
+        self._mat_concrete[key] = tag_wrap
+        return tag_wrap
+
+    def _get_steel(self, fy_MPa: float, eps_su: float = 0.10) -> int:
+        """Steel02 (Menegotto-Pinto) envuelto en MinMax para fractura simétrica.
+
+        Default εsu = 0.10 (A615 Gr60). Al llegar a |ε| ≥ εsu, la barra
+        fractura (σ=0 definitivo) — captura el colapso dúctil del acero
+        longitudinal, que Steel02 solo no hace.
+        """
+        key = (round(fy_MPa, 1), round(eps_su, 4))
         if key in self._mat_steel:
             return self._mat_steel[key]
-        tag = self._next_mat()
+        tag_base = self._next_mat()
         self._ops.uniaxialMaterial(
-            "Steel02", tag,
+            "Steel02", tag_base,
             fy_MPa * 1000.0,       # Fy [kPa]
             200_000_000.0,          # E0 = 200 GPa [kPa]
             0.01,                   # b (hardening)
             15.0, 0.925, 0.15,      # R0, cR1, cR2
         )
-        self._mat_steel[key] = tag
-        return tag
+        # Buffer 1.2·εsu — permite deformación plástica adicional antes de
+        # fractura (varias barras pueden "estirarse" un 10-20% más allá de
+        # εsu nominal en edificios reales por hardening residual).
+        tag_wrap = self._next_mat()
+        eps_fail = 1.2 * eps_su
+        self._ops.uniaxialMaterial(
+            "MinMax", tag_wrap, tag_base,
+            "-min", -eps_fail,
+            "-max",  eps_fail,
+        )
+        self._mat_steel[key] = tag_wrap
+        return tag_wrap
 
     # ── Secciones Fiber ───────────────────────────────────────────────────────
 
@@ -729,6 +903,71 @@ class NLFrameOPSBuilder:
             })
         return layers
 
+    def _column_bar_layers_by_group(
+        self, groups: dict, b_m: float, h_m: float, cover_m: float,
+    ) -> list[dict]:
+        """
+        Distribución granular: 4 esquinas con un diámetro + 4 caras (top, bot,
+        left, right) con sus propios diámetros y conteos.
+
+        Las esquinas son fibras puntuales en las 4 esquinas internas.
+        Las caras: capas rectas entre esquinas, con n_bars intermedias.
+        """
+        # Diámetros y áreas por grupo
+        corner = groups.get("corners", {})
+        db_corner_m = _bar_diam_m(corner.get("bar_label", "#6"))
+        As_corner   = _bar_area_m2(corner.get("bar_label", "#6"))
+
+        # Coordenadas de las 4 esquinas internas (centro de barra)
+        # El eje "y" apunta en dirección b, "z" en dirección h (convención OpenSees)
+        y_lo = -b_m / 2.0 + cover_m + db_corner_m / 2.0
+        y_hi =  b_m / 2.0 - cover_m - db_corner_m / 2.0
+        z_lo = -h_m / 2.0 + cover_m + db_corner_m / 2.0
+        z_hi =  h_m / 2.0 - cover_m - db_corner_m / 2.0
+
+        layers: list[dict] = []
+
+        # 4 esquinas como fibras puntuales
+        for (yc, zc) in [(y_lo, z_hi), (y_hi, z_hi), (y_lo, z_lo), (y_hi, z_lo)]:
+            layers.append({"kind": "point", "y": yc, "z": zc, "As_m2": As_corner, "n": 1})
+
+        # Barras intermedias por cara (entre las dos esquinas correspondientes)
+        for face_key, (y1, z1, y2, z2) in [
+            ("top_face",   (y_lo, z_hi, y_hi, z_hi)),
+            ("bot_face",   (y_lo, z_lo, y_hi, z_lo)),
+            ("left_face",  (y_lo, z_lo, y_lo, z_hi)),
+            ("right_face", (y_hi, z_lo, y_hi, z_hi)),
+        ]:
+            face = groups.get(face_key, {})
+            n_face = int(face.get("n_bars", 0))
+            if n_face <= 0:
+                continue
+            label = str(face.get("bar_label", "#5"))
+            As    = _bar_area_m2(label)
+            db    = _bar_diam_m(label)
+            # Insertar las N barras ENTRE las dos esquinas (sin tocarlas). La
+            # `ops.layer("straight", ...)` con n+2 bar coloca puntos en los
+            # extremos; usamos un sub-tramo para evitar duplicar las esquinas.
+            if face_key in ("top_face", "bot_face"):
+                step = (y2 - y1) / (n_face + 1)
+                for i in range(1, n_face + 1):
+                    y = y1 + step * i
+                    z = z1
+                    layers.append({
+                        "kind": "point", "y": y, "z": z,
+                        "As_m2": As, "n": 1, "db_m": db,
+                    })
+            else:
+                step = (z2 - z1) / (n_face + 1)
+                for i in range(1, n_face + 1):
+                    y = y1
+                    z = z1 + step * i
+                    layers.append({
+                        "kind": "point", "y": y, "z": z,
+                        "As_m2": As, "n": 1, "db_m": db,
+                    })
+        return layers
+
     def _beam_bar_layers(
         self,
         n_top: int, db_top_m: float, As_top_m2: float,
@@ -778,10 +1017,9 @@ class NLFrameOPSBuilder:
             cover  = float(geo.get("cover_m", 0.040))
 
             long_r = col.get("reinforcement", {}).get("longitudinal", {})
-            n_bars = int(long_r.get("n_bars", 8))
-            label  = str(long_r.get("bar_label", "#5"))
-            db_m   = _bar_diam_m(label)
-            As_bar = _bar_area_m2(label)
+            # Si viene granular (grupos), usar reparto por grupo con diámetros
+            # distintos. Si no, caer al legacy (un solo diámetro).
+            groups = long_r.get("groups")
 
             conf   = col.get("confinement", {})
             conf_end = conf.get("end", {})
@@ -790,7 +1028,14 @@ class NLFrameOPSBuilder:
             # Secciones Fiber (end y mid)
             sec_end = self._next_sec()
             sec_mid = self._next_sec()
-            bar_layers = self._column_bar_layers(n_bars, db_m, As_bar, b, h, cover)
+            if isinstance(groups, dict):
+                bar_layers = self._column_bar_layers_by_group(groups, b, h, cover)
+            else:
+                n_bars = int(long_r.get("n_bars", 8))
+                label  = str(long_r.get("bar_label", "#5"))
+                db_m   = _bar_diam_m(label)
+                As_bar = _bar_area_m2(label)
+                bar_layers = self._column_bar_layers(n_bars, db_m, As_bar, b, h, cover)
             self._build_fiber_section(sec_end, b, h, cover, fc, conf_end, fy, bar_layers)
             self._build_fiber_section(sec_mid, b, h, cover, fc, conf_mid, fy, bar_layers)
 
@@ -1230,6 +1475,47 @@ class NLFrameOPSBuilder:
             except Exception:
                 continue
             if ops.analyze(1) == 0:
+                return 0
+        return -1
+
+    def _try_step_with_bisection(
+        self,
+        sign:   float,
+        inc_m:  float,
+        dof:    int,
+        max_subdivisions: tuple[int, ...] = (2, 4, 10, 20),
+    ) -> int:
+        """Intenta un paso completo. Si falla, subdivide el incremento
+        progresivamente y reintenta hasta `max_subdivisions`.
+
+        Permite "atravesar" transiciones bruscas (p.ej. una fibra entra
+        a crush con MinMax) con pasos finos aunque el solver no converja
+        con el incremento completo.
+
+        Retorna 0 si tras alguna subdivisión el conjunto de sub-pasos
+        logra avanzar un incremento equivalente al original, −1 si todas
+        las subdivisiones fallan.
+        """
+        ops = self._ops
+        # Primer intento con el step completo
+        if self._try_step() == 0:
+            return 0
+
+        for n_sub in max_subdivisions:
+            inc_sub = sign * inc_m / n_sub
+            ops.integrator("DisplacementControl", self._control_node, dof, inc_sub)
+            ok_sub = 0
+            for _ in range(n_sub):
+                if self._try_step() != 0:
+                    break
+                ok_sub += 1
+            # Siempre restaurar el integrator original (importante para el
+            # próximo paso principal)
+            ops.integrator("DisplacementControl", self._control_node, dof, sign * inc_m)
+            if ok_sub == n_sub:
+                return 0
+            # Si avanzamos parcialmente, aceptamos y seguimos — es mejor que detener
+            if ok_sub >= max(1, n_sub // 2):
                 return 0
         return -1
 

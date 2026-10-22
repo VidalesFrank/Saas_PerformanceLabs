@@ -171,7 +171,15 @@ def generate_spec(project_id: str, user: CurrentUser, db: DB):
 
     col_detail  = _load_json_safe(os.path.join(rd, "design_columns_detail.json") if rd else None)
     beam_detail = _load_json_safe(os.path.join(rd, "beam_design_detail.json")    if rd else None)
-    user_reinf  = _load_json_safe(os.path.join(rd, "reinforcement.json")         if rd else None)
+    reinf_json  = _load_json_safe(os.path.join(rd, "reinforcement.json")         if rd else None)
+
+    # Separar patrones por sección (as-built) y overrides individuales
+    if isinstance(reinf_json, dict):
+        section_patterns = reinf_json.pop("section_patterns", {})
+        user_reinf       = reinf_json
+    else:
+        section_patterns = {}
+        user_reinf       = reinf_json
 
     # Nivel de ductilidad desde parámetros del proyecto
     params = json.loads(project.parameters_json) if project.parameters_json else {}
@@ -182,6 +190,7 @@ def generate_spec(project_id: str, user: CurrentUser, db: DB):
         col_detail         = col_detail,
         beam_detail        = beam_detail,
         user_reinforcement = user_reinf,
+        section_patterns   = section_patterns,
         energy_dissipation = ed,
         project_id         = project_id,
     )

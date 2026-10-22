@@ -50,6 +50,7 @@ Factor por confinamiento (ρ_s del Mander):
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 
@@ -187,6 +188,10 @@ def compute_hinge_damage_from_history(
         theta_p_i_hist = _theta_plastic(slab[:, 1],          slab[:, 2],          lp, kappa_y)
         theta_p_j_hist = _theta_plastic(slab[:, n_vals + 1], slab[:, n_vals + 2], lp, kappa_y)
 
+        theta_io_base = base_cap["IO"]
+        theta_ls_base = base_cap["LS"]
+        theta_cp_base = base_cap["CP"]
+
         for end_label, hist in (("i", theta_p_i_hist), ("j", theta_p_j_hist)):
             tp_max = float(np.max(hist)) if hist.size else 0.0
             level  = _classify(tp_max, theta_io, theta_ls, theta_cp)
@@ -208,6 +213,11 @@ def compute_hinge_damage_from_history(
                 "theta_IO":       round(theta_io, 6),
                 "theta_LS":       round(theta_ls, 6),
                 "theta_CP":       round(theta_cp, 6),
+                "theta_IO_base":  round(theta_io_base, 6),
+                "theta_LS_base":  round(theta_ls_base, 6),
+                "theta_CP_base":  round(theta_cp_base, 6),
+                "k_conf":         round(k_conf, 3),
+                "rho_s":          round(rho_s, 5),
                 "damage_level":   level,
                 "dcr":            round(dcr, 3),
                 "step_first_IO":  step_io,
@@ -246,6 +256,100 @@ def compute_hinge_damage_from_history(
         "hinges":     hinges,
         "by_element": by_element,
     }
+
+
+def compute_theta_p_submatrix(
+    history_path:  Path,
+    element_lines: list[dict],
+    spec:          dict,
+    frame_indices: Iterable[int],
+) -> dict:
+    """
+    Para cada extremo (fid × end) devuelve la serie θ_p submuestreada en los
+    índices `frame_indices` del NPZ, junto con θ_IO/LS/CP base y el factor
+    k_conf — así el frontend puede reclasificar nivel de daño por frame bajo
+    umbrales ajustables sin recalcular en el backend.
+
+    Retorna:
+        {
+          "<fid>|i": {"theta_p_hist":[...], "theta_IO_base":..., ...},
+          "<fid>|j": {...},
+          ...
+        }
+    """
+    if not Path(history_path).exists():
+        return {}
+
+    data = np.load(history_path, allow_pickle=False)
+    col_def = data["col_sect_def"] if "col_sect_def" in data.files else np.empty((0,))
+    bm_def  = data["bm_sect_def"]  if "bm_sect_def"  in data.files else np.empty((0,))
+    col_tags = data["col_tags"].tolist() if "col_tags" in data.files else []
+    bm_tags  = data["bm_tags"].tolist()  if "bm_tags"  in data.files else []
+
+    idx_arr = np.asarray(list(frame_indices), dtype=int)
+    if idx_arr.size == 0:
+        return {}
+
+    cols_by_fid  = spec.get("elements", {}).get("columns", {})
+    beams_by_fid = spec.get("elements", {}).get("beams", {})
+    col_tag_to_idx = {int(t): i for i, t in enumerate(col_tags)}
+    bm_tag_to_idx  = {int(t): i for i, t in enumerate(bm_tags)}
+
+    out: dict[str, dict] = {}
+
+    for e in element_lines:
+        fid     = str(e.get("fid", ""))
+        kind    = e.get("kind", "beam")
+        ele_tag = int(e.get("ele_tag", 0))
+        lp      = float(e.get("lp_m", max(float(e.get("h_m", 0.3)) / 2.0, 0.1)))
+        h_m     = float(e.get("h_m", 0.3))
+
+        spec_el = cols_by_fid.get(fid) if kind == "column" else beams_by_fid.get(fid)
+        if not spec_el:
+            continue
+
+        geo    = spec_el.get("geometry", {})
+        fy_MPa = float(geo.get("fy_MPa", 420.0))
+        conf   = spec_el.get("confinement", {})
+        rho_s  = float((conf.get("end") or {}).get("rho_s", 0.0))
+        k_conf = _confinement_factor(rho_s)
+
+        base_cap = _CAP_COLUMN if kind == "column" else _CAP_BEAM
+        kappa_y  = _yield_curvature(fy_MPa, h_m)
+
+        if kind == "column":
+            arr_idx = col_tag_to_idx.get(ele_tag)
+            arr     = col_def if arr_idx is not None else None
+        else:
+            arr_idx = bm_tag_to_idx.get(ele_tag)
+            arr     = bm_def if arr_idx is not None else None
+        if arr is None or arr.size == 0:
+            continue
+        slab = arr[:, arr_idx, :]
+        if slab.shape[1] < 6 or slab.shape[1] % 2 != 0:
+            continue
+        n_vals = slab.shape[1] // 2
+
+        n_steps = slab.shape[0]
+        safe_idx = np.clip(idx_arr, 0, n_steps - 1)
+
+        hist_i = _theta_plastic(slab[:, 1],          slab[:, 2],          lp, kappa_y)
+        hist_j = _theta_plastic(slab[:, n_vals + 1], slab[:, n_vals + 2], lp, kappa_y)
+        hist_i_sub = [float(x) for x in np.round(hist_i[safe_idx], 7)]
+        hist_j_sub = [float(x) for x in np.round(hist_j[safe_idx], 7)]
+
+        payload = {
+            "theta_IO_base": round(base_cap["IO"], 6),
+            "theta_LS_base": round(base_cap["LS"], 6),
+            "theta_CP_base": round(base_cap["CP"], 6),
+            "k_conf":        round(k_conf, 3),
+            "rho_s":         round(rho_s, 5),
+            "lp_m":          round(lp, 4),
+        }
+        out[f"{fid}|i"] = {**payload, "theta_p_hist": hist_i_sub}
+        out[f"{fid}|j"] = {**payload, "theta_p_hist": hist_j_sub}
+
+    return out
 
 
 def _theta_plastic(

@@ -48,22 +48,32 @@ def run_wall_demands(
         canonical_path = project.canonical_model_path
         work_dir       = os.path.dirname(os.path.dirname(canonical_path))
 
-        # El XLSX puede estar en input_file_path (xlsx directo) o generado en import
+        # El XLSX puede estar en input_file_path (xlsx directo) o generado en import.
+        # Si no está disponible, caemos a reconstruir raw_data desde el canonical.
         xlsx_path = project.input_file_path
         if not xlsx_path or not os.path.exists(xlsx_path):
             xlsx_path = os.path.join(work_dir, "input", "input_model.xlsx")
-        if not os.path.exists(xlsx_path):
-            raise FileNotFoundError(
-                "XLSX de importación no encontrado. "
-                "Asegúrate de que el análisis de importación se completó correctamente."
-            )
+        has_xlsx = os.path.exists(xlsx_path)
 
         # ── 1. Cargar modelo canónico ──────────────────────────────────────────
         with open(canonical_path, encoding="utf-8") as f:
             model = json.load(f)
 
-        # ── 2. Cargar raw_data desde XLSX ─────────────────────────────────────
-        raw_data = _load_wall_raw_data(xlsx_path)
+        # ── 2. Cargar raw_data desde XLSX o reconstruir desde canonical ───────
+        if has_xlsx:
+            raw_data = _load_wall_raw_data(xlsx_path)
+            print(f"[wall_demands] raw_data cargado desde XLSX: {xlsx_path}")
+        else:
+            from app.tasks.wall_demands_canonical_shim import raw_data_from_canonical
+            raw_data = raw_data_from_canonical(model)
+            _k_piers  = 'TABLE:  "PIER SECTION PROPERTIES"'
+            _k_shells = 'TABLE:  "OBJECTS AND ELEMENTS - SHELLS"'
+            n_piers  = len(raw_data.get(_k_piers,  []))
+            n_shells = len(raw_data.get(_k_shells, []))
+            print(
+                "[wall_demands] raw_data reconstruido desde canonical "
+                f"(piers={n_piers}, shells={n_shells})"
+            )
 
         # ── 2b. Fuerzas RSA del análisis espectral (si existe) ────────────────
         rsa_forces = None

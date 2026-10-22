@@ -74,6 +74,32 @@ def _save_reinforcement(project: StructuralProject, reinforcement: dict) -> None
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(reinforcement, f, ensure_ascii=False, indent=2)
+    # Al editar el refuerzo (patrón o individual) se invalida el spec no lineal
+    # cacheado — así el próximo pushover / NLTHA lo regenera con los nuevos valores.
+    _invalidate_nonlinear_spec(project)
+
+
+def _invalidate_nonlinear_spec(project: StructuralProject) -> None:
+    try:
+        wd = _work_dir(project)
+    except HTTPException:
+        return
+    spec_path = os.path.join(wd, "nonlinear", "nonlinear_model.json")
+    if os.path.exists(spec_path):
+        try:
+            os.remove(spec_path)
+        except OSError:
+            pass
+
+
+def _section_patterns(saved_r: dict) -> dict:
+    """Devuelve el dict de patrones de sección, sin mutar `saved_r`."""
+    sp = saved_r.get("section_patterns")
+    return sp if isinstance(sp, dict) else {}
+
+
+def _section_key(element_type: str, section_name: str) -> str:
+    return f"{element_type.lower()}:{section_name}"
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -520,3 +546,323 @@ def _find_frame_detail(rd: str, frame_id: str, etype: str) -> dict | None:
 def _utc_now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patrones de refuerzo POR SECCIÓN (as-built, edificios existentes)
+#
+# Permiten definir refuerzo longitudinal + transversal a nivel de sección
+# geométrica (ej: C40x40, V30x40) que aplicará a todos los elementos que la
+# usen, sin necesidad de correr el diseño automático. Convive con los
+# overrides individuales por frame_id (que tienen mayor prioridad).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class SectionReinforcementPayload(BaseModel):
+    mode:            str                 # "manual" (único soportado hoy; "auto" = DELETE)
+    longitudinal:    dict | None = None
+    transverse:      dict | None = None  # columnas
+    zones:           dict | None = None  # vigas
+    shear:           dict | None = None  # vigas
+    pattern_label:   str | None  = None
+    notes:           str | None  = None
+
+
+class SectionValidationRequest(BaseModel):
+    longitudinal:  dict | None = None
+    transverse:    dict | None = None
+    zones:         dict | None = None
+    shear:         dict | None = None
+
+
+def _collect_sections_from_canonical(canonical: dict) -> list[dict]:
+    """
+    Agrupa los frames del canonical por (element_type, section_name).
+    Devuelve una fila por combinación con conteo y propiedades geométricas.
+    """
+    sections_dict = canonical.get("sections", {})
+    materials     = canonical.get("materials", {})
+    frames        = canonical.get("frames",    {})
+
+    groups: dict[tuple, dict] = {}
+    for fid, fd in frames.items():
+        et = str(fd.get("element_type", "")).lower()
+        if et not in ("column", "beam"):
+            continue
+        sec_name = str(fd.get("section", ""))
+        if not sec_name:
+            continue
+        key = (et, sec_name)
+        if key not in groups:
+            sec_d = sections_dict.get(sec_name, {}) or {}
+            mat   = str(sec_d.get("material", ""))
+            fpc   = ((materials.get(mat) or {}).get("fpc_mpa")
+                     or (materials.get(mat) or {}).get("fc_MPa") or 21.0)
+            groups[key] = {
+                "section_key":  _section_key(et, sec_name),
+                "section_name": sec_name,
+                "element_type": et,
+                "b_m":          float(sec_d.get("b_m", 0.30)),
+                "h_m":          float(sec_d.get("h_m", 0.40 if et == "beam" else 0.30)),
+                "material":     mat,
+                "fc_MPa":       float(fpc),
+                "fy_MPa":       420.0,
+                "cover_m":      0.040,
+                "frame_ids":    [],
+                "stories":      set(),
+            }
+        groups[key]["frame_ids"].append(fid)
+        if fd.get("story"):
+            groups[key]["stories"].add(str(fd["story"]))
+
+    out: list[dict] = []
+    for g in groups.values():
+        out.append({
+            **g,
+            "n_elements": len(g["frame_ids"]),
+            "stories":    sorted(g.pop("stories")),
+        })
+    out.sort(key=lambda g: (0 if g["element_type"] == "column" else 1, g["section_name"]))
+    return out
+
+
+@router.get("/sections")
+def list_sections(project_id: str, user: CurrentUser, db: DB):
+    """
+    Lista las secciones geométricas del modelo con estado de refuerzo:
+      - `mode`: "auto" (sin patrón manual) | "manual" (as-built definido)
+      - resumen del refuerzo si manual
+      - cantidad de frames que usan la sección
+    """
+    project = _get_project(db, project_id, user)
+    canonical = _load_json_safe(project.canonical_model_path) if project.canonical_model_path else None
+    if not canonical:
+        raise HTTPException(status_code=400, detail="Modelo canónico no disponible.")
+
+    sections  = _collect_sections_from_canonical(canonical)
+    saved_r   = _load_reinforcement(project)
+    patterns  = _section_patterns(saved_r)
+
+    # Frames con override individual (para informar al cliente cuántos están
+    # con override vs heredando de la sección)
+    frame_overrides = {
+        fid for fid, v in saved_r.items()
+        if fid != "section_patterns" and isinstance(v, dict) and "reinforcement" in v
+    }
+
+    for s in sections:
+        key   = s["section_key"]
+        patt  = patterns.get(key)
+        s["mode"]           = "manual" if patt else "auto"
+        s["pattern"]        = patt
+        s["pattern_label"]  = (patt or {}).get("pattern_label")
+        s["updated_at"]     = (patt or {}).get("updated_at")
+        s["n_overrides"]    = sum(1 for fid in s["frame_ids"] if fid in frame_overrides)
+
+    return {
+        "sections":   sections,
+        "n_total":    len(sections),
+        "n_manual":   sum(1 for s in sections if s["mode"] == "manual"),
+        "n_auto":     sum(1 for s in sections if s["mode"] == "auto"),
+    }
+
+
+@router.put("/sections/{element_type}/{section_name}/reinforcement")
+def save_section_reinforcement(
+    project_id:   str,
+    element_type: str,
+    section_name: str,
+    payload:      SectionReinforcementPayload,
+    user:         CurrentUser,
+    db:           DB,
+):
+    """
+    Guarda el patrón de refuerzo as-built para una sección geométrica.
+    Aplica a todos los frames que usen esa sección (salvo que tengan override
+    individual). Invalida el spec no lineal cacheado.
+    """
+    et = element_type.lower()
+    if et not in ("column", "beam"):
+        raise HTTPException(status_code=400, detail=f"element_type inválido: {element_type}")
+    if payload.mode.lower() != "manual":
+        raise HTTPException(
+            status_code=400,
+            detail="mode debe ser 'manual' (usa DELETE para volver a 'auto').",
+        )
+
+    project = _get_project(db, project_id, user)
+
+    # Verificar que la sección exista en el canonical
+    canonical = _load_json_safe(project.canonical_model_path) if project.canonical_model_path else None
+    if not canonical:
+        raise HTTPException(status_code=400, detail="Modelo canónico no disponible.")
+    sections = _collect_sections_from_canonical(canonical)
+    key = _section_key(et, section_name)
+    sec_info = next((s for s in sections if s["section_key"] == key), None)
+    if not sec_info:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sección '{section_name}' no se usa en ningún elemento de tipo '{et}'.",
+        )
+
+    saved_r  = _load_reinforcement(project)
+    patterns = dict(_section_patterns(saved_r))
+
+    entry: dict[str, object] = {
+        "mode":          "manual",
+        "section_name":  section_name,
+        "element_type":  et,
+        "pattern_label": payload.pattern_label,
+        "notes":         payload.notes,
+        "updated_at":    _utc_now(),
+    }
+    if et == "column":
+        if not payload.longitudinal or not payload.transverse:
+            raise HTTPException(
+                status_code=400,
+                detail="Columna: se requieren `longitudinal` y `transverse`.",
+            )
+        entry["longitudinal"] = payload.longitudinal
+        entry["transverse"]   = payload.transverse
+    else:
+        if not payload.zones or not payload.shear:
+            raise HTTPException(
+                status_code=400,
+                detail="Viga: se requieren `zones` (end_i, mid, end_j) y `shear`.",
+            )
+        entry["zones"] = payload.zones
+        entry["shear"] = payload.shear
+
+    patterns[key] = entry
+    saved_r["section_patterns"] = patterns
+    _save_reinforcement(project, saved_r)
+
+    return {
+        "ok":            True,
+        "section_key":   key,
+        "n_elements":    sec_info["n_elements"],
+        "pattern_label": payload.pattern_label,
+        "message":       f"Patrón as-built aplicado a {sec_info['n_elements']} elementos.",
+    }
+
+
+@router.delete("/sections/{element_type}/{section_name}/reinforcement")
+def delete_section_reinforcement(
+    project_id:   str,
+    element_type: str,
+    section_name: str,
+    user:         CurrentUser,
+    db:           DB,
+):
+    """
+    Elimina el patrón as-built de una sección (vuelve a modo auto).
+    Los overrides individuales de frames NO se tocan.
+    """
+    et = element_type.lower()
+    key = _section_key(et, section_name)
+    project = _get_project(db, project_id, user)
+    saved_r = _load_reinforcement(project)
+    patterns = dict(_section_patterns(saved_r))
+    if key not in patterns:
+        return {"ok": True, "removed": False, "message": "La sección ya estaba en modo auto."}
+    patterns.pop(key, None)
+    saved_r["section_patterns"] = patterns
+    _save_reinforcement(project, saved_r)
+    return {"ok": True, "removed": True, "section_key": key}
+
+
+@router.get("/overrides")
+def list_frame_overrides(project_id: str, user: CurrentUser, db: DB):
+    """
+    Lista todos los overrides individuales por frame_id (del reinforcement.json).
+    No incluye los patrones de sección — solo overrides elemento-por-elemento.
+    """
+    project = _get_project(db, project_id, user)
+    saved_r = _load_reinforcement(project)
+    overrides: dict[str, dict] = {}
+    for fid, val in saved_r.items():
+        if fid == "section_patterns":
+            continue
+        if not isinstance(val, dict):
+            continue
+        reinf = val.get("reinforcement", val)
+        overrides[fid] = {
+            "reinforcement": reinf,
+            "source":        val.get("source"),
+            "pattern_label": val.get("pattern_label"),
+            "notes":         val.get("notes"),
+            "saved_at":      val.get("saved_at") or val.get("updated_at"),
+        }
+    return {"overrides": overrides, "n_total": len(overrides)}
+
+
+@router.delete("/frames/{frame_id}/reinforcement")
+def delete_frame_reinforcement(
+    project_id: str,
+    frame_id:   str,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """Elimina el override individual del frame — vuelve a heredar del patrón de sección."""
+    project = _get_project(db, project_id, user)
+    saved_r = _load_reinforcement(project)
+    if frame_id not in saved_r:
+        return {"ok": True, "removed": False, "frame_id": frame_id}
+    saved_r.pop(frame_id, None)
+    _save_reinforcement(project, saved_r)
+    return {"ok": True, "removed": True, "frame_id": frame_id}
+
+
+@router.post("/sections/{element_type}/{section_name}/validate-nsr10")
+def validate_section_reinforcement(
+    project_id:   str,
+    element_type: str,
+    section_name: str,
+    payload:      SectionValidationRequest,
+    user:         CurrentUser,
+    db:           DB,
+):
+    """
+    Valida un refuerzo propuesto contra NSR-10 (checks constructivos; no bloquea).
+    Devuelve warnings con nivel info/warning/error.
+    """
+    from engine.building.nonlinear import validate_frame_reinforcement
+
+    et = element_type.lower()
+    if et not in ("column", "beam"):
+        raise HTTPException(status_code=400, detail=f"element_type inválido: {element_type}")
+
+    project = _get_project(db, project_id, user)
+    canonical = _load_json_safe(project.canonical_model_path) if project.canonical_model_path else None
+    if not canonical:
+        raise HTTPException(status_code=400, detail="Modelo canónico no disponible.")
+
+    sections = _collect_sections_from_canonical(canonical)
+    key = _section_key(et, section_name)
+    sec_info = next((s for s in sections if s["section_key"] == key), None)
+    if not sec_info:
+        raise HTTPException(status_code=404, detail=f"Sección '{section_name}' no encontrada.")
+
+    params = json.loads(project.parameters_json) if project.parameters_json else {}
+    ed     = params.get("energy_dissipation", "DMO")
+
+    if et == "column":
+        reinf = {
+            "longitudinal": payload.longitudinal or {},
+            "transverse":   payload.transverse   or {},
+        }
+    else:
+        reinf = {
+            "zones": payload.zones or {},
+            "shear": payload.shear or {},
+        }
+
+    geom = {
+        "b_m":    sec_info["b_m"],
+        "h_m":    sec_info["h_m"],
+        "fc_MPa": sec_info["fc_MPa"],
+        "fy_MPa": sec_info["fy_MPa"],
+    }
+    result = validate_frame_reinforcement(et, reinf, geom, ed)
+    result["section_key"] = key
+    return result

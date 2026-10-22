@@ -5,6 +5,59 @@ from .mander import (
     default_confinement,
     mander_rect_confinement,
 )
+from .reinforcement_validator import (
+    validate_frame_reinforcement,
+    validate_column_reinforcement,
+    validate_beam_reinforcement,
+)
+from .element_data import (
+    AxialState,
+    Detailing,
+    ElementData,
+    FieldObservations,
+    Geometry,
+    HookType,
+    LongitudinalReinf,
+    LpMethod,
+    Materials,
+    TransverseReinf,
+    elements_from_spec,
+    load_axial_from_gravity,
+    load_observations_csv,
+)
+from .failure_mode import (
+    FailureModeResult,
+    compute_failure_mode,
+    compute_vn_aci,
+    compute_vn_sezen_moehle,
+    compute_vp,
+    flag_deficient_detailing,
+)
+from .moment_curvature_element import (
+    MomentCurvatureResult,
+    compute_moment_curvature,
+    mander_stress,
+    steel_stress,
+)
+from .rotation_capacity import (
+    RotationCapacity,
+    comparative_table,
+    compute_rotation_capacity,
+    haselton_imk_column,
+)
+from .damage_states import (
+    DEFAULT_DS_CATALOG,
+    DamageStateDef,
+    ElementFragility,
+    build_fragility,
+)
+from .element_thresholds import (
+    ElementThresholdResult,
+    ElementThresholdRow,
+    classify_demand_by_element,
+    compute_element_thresholds,
+    compute_from_project_dir,
+)
 
 __all__ = [
     "NLSpecBuilder",
@@ -12,4 +65,43 @@ __all__ = [
     "confinement_to_dict",
     "default_confinement",
     "mander_rect_confinement",
+    "validate_frame_reinforcement",
+    "validate_column_reinforcement",
+    "validate_beam_reinforcement",
+    "AxialState",
+    "Detailing",
+    "ElementData",
+    "FieldObservations",
+    "Geometry",
+    "HookType",
+    "LongitudinalReinf",
+    "LpMethod",
+    "Materials",
+    "TransverseReinf",
+    "elements_from_spec",
+    "load_axial_from_gravity",
+    "load_observations_csv",
+    "FailureModeResult",
+    "compute_failure_mode",
+    "compute_vn_aci",
+    "compute_vn_sezen_moehle",
+    "compute_vp",
+    "flag_deficient_detailing",
+    "MomentCurvatureResult",
+    "compute_moment_curvature",
+    "mander_stress",
+    "steel_stress",
+    "RotationCapacity",
+    "comparative_table",
+    "compute_rotation_capacity",
+    "haselton_imk_column",
+    "DEFAULT_DS_CATALOG",
+    "DamageStateDef",
+    "ElementFragility",
+    "build_fragility",
+    "ElementThresholdResult",
+    "ElementThresholdRow",
+    "classify_demand_by_element",
+    "compute_element_thresholds",
+    "compute_from_project_dir",
 ]

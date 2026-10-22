@@ -224,10 +224,12 @@ class NLWallOPSBuilder:
         direction:        str   = "X",
         target_drift_pct: float = 2.0,
         inc_m:            float = 0.001,
+        pattern_type:     str   = "triangular",   # triangular | uniforme | modal
         result_path:      Path | None = None,
         cancel_flag:      list[bool] | None = None,
         history_path:     Path | None = None,
         history_stride:   int = 1,
+        progress_cb                = None,
     ) -> dict:
         """
         Pushover desplazamiento-controlado con carga triangular en nodos CM.
@@ -255,14 +257,14 @@ class NLWallOPSBuilder:
         target_disp = sign * (target_drift_pct / 100.0) * total_h
         n_steps     = max(10, int(abs(target_disp) / abs(inc_m)))
 
-        # Patrón triangular: fuerza proporcional a la altura del CM de cada piso
+        # Patrón de carga lateral — triangular | uniforme | modal
+        # (FEMA 356 §3.3.3.2.3 / ASCE 41 §7.4.3)
         ops.timeSeries("Linear", 2)
         ops.pattern("Plain", 2, 2)
 
-        cm_list = [(info["tag"], info["z"]) for info in self._cm_map.values()]
-        total_z = sum(z for _, z in cm_list) or 1.0
-        for cm_tag, z in cm_list:
-            fi = sign * (z / total_z)
+        factors = self._lateral_factors(pattern_type.lower(), dof)
+        for cm_tag, fi_norm in factors:
+            fi = sign * fi_norm
             load = [fi, 0.0, 0.0, 0.0, 0.0, 0.0] if dof == 1 else [0.0, fi, 0.0, 0.0, 0.0, 0.0]
             ops.load(cm_tag, *load)
 
@@ -332,6 +334,19 @@ class NLWallOPSBuilder:
                 self._write_partial(result_path, direction, steps_out,
                                     "running", n_steps, converged)
 
+            # Progreso en vivo (cada 5 pasos para no sobrecargar la BD)
+            if progress_cb is not None and (converged % 5 == 0 or converged == n_steps):
+                try:
+                    progress_cb({
+                        "direction":     direction,
+                        "step":          converged,
+                        "total":         n_steps,
+                        "drift_pct":     drift_pct,
+                        "base_shear_kN": base_shear,
+                    })
+                except Exception:
+                    pass
+
         # ── Serialización de historia ─────────────────────────────────────────
         history_meta: dict | None = None
         if capture and hist_disp_cm:
@@ -369,6 +384,7 @@ class NLWallOPSBuilder:
         result = {
             "status":           status,
             "direction":        direction,
+            "pattern_type":     pattern_type,
             "converged_steps":  converged,
             "total_steps":      n_steps,
             "target_drift_pct": target_drift_pct,
@@ -384,6 +400,69 @@ class NLWallOPSBuilder:
         if result_path:
             self._write_partial(result_path, direction, steps_out, status, n_steps, converged)
         return result
+
+    def run_dynamic(
+        self,
+        record_x_path:  str,
+        record_y_path:  str,
+        dtrec:          float,
+        dt_analysis:    float = 0.005,
+        damping:        float = 0.05,
+        scale:          float = 1.0,
+        record_units:   str   = "g",      # "g" | "mps2" | "cm/s2"
+        duration:       float | None = None,
+        history_path:   Path | None = None,
+        progress_cb               = None,
+        ductility:      str   = "DMO",
+    ) -> dict:
+        """
+        Análisis cronológico no lineal (NLTHA) bidireccional sobre el modelo
+        MVLEM_3D ya construido. La carga gravitacional debe estar aplicada
+        previamente con `run_gravity()`.
+
+        Delega en `nlth_runner.run_nlth`. Retorna el payload estándar NLTHA
+        (ver `nlth_runner.run_nlth` para el schema).
+        """
+        from .nlth_runner import run_nlth
+
+        # CM ordenados por z (azotea al final)
+        cm_sorted = sorted(
+            self._cm_map.items(),
+            key=lambda kv: self._stories_z.get(kv[0], 0.0),
+        )
+        cm_tags   = [info["tag"] for _, info in cm_sorted]
+        stories_z = [self._stories_z[s] for s, _ in cm_sorted]
+
+        if not self._base_nodes:
+            raise RuntimeError("Modelo sin nodos base — no se puede correr NLTHA.")
+        # El motor dinámico necesita [base, cm_1, cm_2, ...] para derivas por piso
+        base_tag      = self._base_nodes[0]
+        nodes_control = [base_tag] + cm_tags
+        control_node  = cm_tags[-1]
+        elements      = sorted(self._ele_map.values())
+        total_height  = max(self._stories_z.values(), default=1.0)
+
+        return run_nlth(
+            ops_module    = self._ops,
+            nodes_control = nodes_control,
+            base_nodes    = list(self._base_nodes),
+            elements      = elements,
+            control_node  = control_node,
+            stories_z     = stories_z,
+            total_height  = total_height,
+            record_x_path = record_x_path,
+            record_y_path = record_y_path,
+            dtrec         = dtrec,
+            dt_analysis   = dt_analysis,
+            damping       = damping,
+            scale         = scale,
+            record_units  = record_units,
+            duration      = duration,
+            eletype       = "wall",
+            history_path  = history_path,
+            progress_cb   = progress_cb,
+            ductility     = ductility,
+        )
 
     def wipe(self) -> None:
         if self._ops:
@@ -520,11 +599,17 @@ class NLWallOPSBuilder:
         if k not in self._mat_unc:
             tag    = self._next_mat()
             fc_kPa = fc * 1000.0
+            # NSR-10 C.9.5 — tensión del concreto no confinado:
+            #   ft = 0.33·√f'c (MPa) ≈ 10% de f'c para fc≈21-28 MPa.
+            # Pasar ft=0, Ets=0 degenera el material (nunca entra a tracción) y
+            # resulta en pushover elásticamente ilimitado.
+            ft_kPa = 0.33 * (fc ** 0.5) * 1000.0
+            Ets    = ft_kPa / 0.002
             self._ops.uniaxialMaterial(
                 "Concrete02", tag,
                 -fc_kPa, -0.002,
                 -0.2 * fc_kPa, -0.006,
-                0.1, 0.0, 0.0,
+                0.1, ft_kPa, Ets,
             )
             self._mat_unc[k] = tag
         return self._mat_unc[k]
@@ -561,11 +646,21 @@ class NLWallOPSBuilder:
             self._mat_stl[k] = tag
         return self._mat_stl[k]
 
-    def _get_shear(self, Ks: float) -> int:
-        k = round(Ks)
+    def _get_shear(self, Ks: float, Vn_kN: float) -> int:
+        """
+        Resorte de corte elasto-plástico (NSR-10 C.11 / ACI 318 §11.6):
+        elástico con rigidez Ks hasta ±Vn_kN, luego meseta plástica.
+
+        Antes era un `Elastic` ilimitado que hacía al pushover devolver
+        cortantes basales de 100-1000× W (los muros nunca fluían a corte).
+        """
+        k = (round(Ks), round(Vn_kN))
         if k not in self._mat_shr:
-            tag = self._next_mat()
-            self._ops.uniaxialMaterial("Elastic", tag, max(Ks, 1.0))
+            tag  = self._next_mat()
+            Ks_e = max(Ks, 1.0)
+            Vn_e = max(Vn_kN, 1.0)
+            eps_y = Vn_e / Ks_e
+            self._ops.uniaxialMaterial("ElasticPP", tag, Ks_e, eps_y, -eps_y)
             self._mat_shr[k] = tag
         return self._mat_shr[k]
 
@@ -632,6 +727,67 @@ class NLWallOPSBuilder:
                     self._node_map[key] = self._node_ctr
                     ops.node(self._node_ctr, xn, yn, g["z_top"])
                     self._wall_top_nodes[story].append(self._node_ctr)
+
+    def _lateral_factors(self, pattern_type: str, dof: int) -> list[tuple[int, float]]:
+        """
+        Factores normalizados (suma |f_i| = 1) de carga lateral por piso.
+        Retorna [(cm_tag, factor), ...] ordenado por z.
+
+        Patrones:
+          - triangular : F_i ∝ m_i · z_i   (NSR-10 A.4.3 con k=1)
+          - uniforme   : F_i ∝ m_i         (ASCE 7 §12.8.3)
+          - modal      : F_i ∝ φ_i · m_i   (primer modo en la dirección)
+        """
+        masses = self._m.get("masses", {}) or {}
+        mkey = "mass_y_t" if dof == 2 else "mass_x_t"
+        mass_by_story: dict[str, float] = {
+            str(md.get("story", "")): float(md.get(mkey, 0.0))
+            for md in masses.values()
+        }
+
+        items: list[tuple[int, float, float, str]] = []
+        for story, info in self._cm_map.items():
+            m_i = mass_by_story.get(story, 0.0)
+            items.append((info["tag"], info["z"], m_i, story))
+        items.sort(key=lambda t: t[1])  # por z
+
+        if pattern_type == "triangular":
+            raw = [(tag, m * z) for tag, z, m, _ in items]
+        elif pattern_type == "uniforme":
+            raw = [(tag, m) for tag, _, m, _ in items]
+        elif pattern_type == "modal":
+            raw = self._modal_factors_wall(items, dof)
+        else:
+            raise ValueError(f"Patrón '{pattern_type}' no soportado.")
+
+        total = sum(abs(f) for _, f in raw) or 1.0
+        return [(tag, f / total) for tag, f in raw]
+
+    def _modal_factors_wall(
+        self, items: list[tuple[int, float, float, str]], dof: int,
+    ) -> list[tuple[int, float]]:
+        """
+        Factor_i = φ_i (primer modo en la dir) × m_i.
+        Fallback a (m_i · z_i) si eigen falla.
+        """
+        ops = self._ops
+        try:
+            vals = ops.eigen("-fullGenLapack", 1)
+        except Exception:
+            try:
+                vals = ops.eigen(1)
+            except Exception:
+                vals = []
+        if not vals or vals[0] <= 0:
+            return [(tag, m * z) for tag, z, m, _ in items]
+        out: list[tuple[int, float]] = []
+        for tag, _, m_i, _ in items:
+            try:
+                phi = float(ops.nodeEigenvector(tag, 1, dof))
+            except Exception:
+                phi = 0.0
+            out.append((tag, phi * m_i))
+        return out
 
     def _fix_base_nodes(self) -> None:
         for (pier, bnd_idx, side), tag in self._node_map.items():
@@ -710,9 +866,25 @@ class NLWallOPSBuilder:
             thick, width, rho, mat_c, mat_s = self._discretize(pier, story, lw, tw, fc)
             m = len(thick)
 
-            # Resorte de corte elástico (Gc × lw × tw)
-            Gc = g["Ec_kPa"] / (2.0 * (1.0 + _NU))
-            sh = self._get_shear(Gc * lw * tw)
+            # Resorte de corte elasto-plástico (NSR-10 C.11.5.4 / ACI 318-19 §11.6):
+            #   Ks = Gc·lw·tw                                     (rigidez elástica)
+            #   Vn = (α_c·√f'c + ρ_h·fy_t) · Acv                   (fluencia)
+            # Acv = lw·tw. α_c = 0.17 para muros con hw/lw ≥ 2 (edificios altos).
+            # ρ_h = cuantía horizontal real del diseño (fallback a ρ_v si falta,
+            # luego a 0.25% mínimo NSR-10 C.14.3). fy_t = fy del estribo.
+            Gc  = g["Ec_kPa"] / (2.0 * (1.0 + _NU))
+            Ks  = Gc * lw * tw
+            ds  = self._design.get((pier, story)) or {}
+            rho_h_pct = ds.get("rho_h_pct")
+            if rho_h_pct in (None, 0, 0.0):
+                rho_h_pct = ds.get("rho_v_pct", 0.25)
+            rho_h    = max(float(rho_h_pct) / 100.0, 0.0025)
+            alpha_c  = 0.17        # muros esbeltos; conservador para hw/lw<2
+            Acv      = lw * tw                                 # m²
+            Vn_concrete_kN = alpha_c * (fc ** 0.5) * Acv * 1000.0    # α·√f'c·Acv [kN]
+            Vn_steel_kN    = rho_h * self._fy_mpa * Acv * 1000.0
+            Vn_kN = Vn_concrete_kN + Vn_steel_kN
+            sh = self._get_shear(Ks, Vn_kN)
 
             self._ele_ctr += 1
             ops.element(

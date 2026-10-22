@@ -153,16 +153,18 @@ def run_variant_pushover(
             f"deriva objetivo={target_drift}%"
         )
 
-        # ── Cargar raw_data del XLSX ─────────────────────────────────────────
+        # ── Cargar raw_data del XLSX o reconstruirlo desde canonical ─────────
         from app.tasks.structural_wall_demands_task import _load_wall_raw_data
 
         xlsx_path = project.input_file_path
         if not xlsx_path or not os.path.exists(xlsx_path):
             xlsx_path = os.path.join(work_dir, "input", "input_model.xlsx")
-        if not os.path.exists(xlsx_path):
-            raise FileNotFoundError("XLSX de importación no encontrado.")
 
-        raw_data = _load_wall_raw_data(xlsx_path)
+        if os.path.exists(xlsx_path):
+            raw_data = _load_wall_raw_data(xlsx_path)
+        else:
+            from app.tasks.wall_demands_canonical_shim import raw_data_from_canonical
+            raw_data = raw_data_from_canonical(model)
 
         # ── Marca variante como analizando ───────────────────────────────────
         update_variant(work_dir, variant_id, {"status": "analyzing"})

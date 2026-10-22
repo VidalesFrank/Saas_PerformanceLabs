@@ -20,6 +20,23 @@ from pathlib import Path
 from app.tasks.celery_app import celery_app
 
 
+def _update_job_progress(job_id: str, progress: dict) -> None:
+    """Actualiza `progress_json` del StructuralJob en una sesión corta y aislada."""
+    try:
+        from app.db import SessionLocal
+        from app.models import StructuralJob
+        db = SessionLocal()
+        try:
+            job = db.get(StructuralJob, job_id)
+            if job:
+                job.progress_json = progress
+                db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass
+
+
 @celery_app.task(name="app.tasks.structural_nl_pushover_task.run_nl_pushover", bind=True)
 def run_nl_pushover(
     self,
@@ -86,6 +103,7 @@ def run_nl_pushover(
         inc_m         = float(params.get("inc_m", 0.001))
         n_fibers      = int(params.get("n_fibers", 10))
         directions    = params.get("directions", ["X", "Y"])
+        pattern_type  = str(params.get("pattern_type", "triangular")).lower()
 
         # ── Cargas gravitacionales por pier desde wall_demands.json ───────────
         # Usa la combinación de gravedad (sin E) con mayor Pu
@@ -103,17 +121,24 @@ def run_nl_pushover(
         print(f"[nl_pushover] {len(design_rows)} pieres con diseño RC")
         print(f"[nl_pushover] fc={fc_mpa} MPa  fy={fy_mpa} MPa  deriva objetivo={target_drift}%")
 
-        # ── Cargar raw_data del XLSX ──────────────────────────────────────────
+        # ── Cargar raw_data del XLSX o reconstruirlo desde canonical ──────────
         from app.tasks.structural_wall_demands_task import _load_wall_raw_data
 
         xlsx_path = project.input_file_path
         if not xlsx_path or not os.path.exists(xlsx_path):
             xlsx_path = os.path.join(work_dir, "input", "input_model.xlsx")
-        if not os.path.exists(xlsx_path):
-            raise FileNotFoundError("XLSX de importación no encontrado.")
 
-        raw_data = _load_wall_raw_data(xlsx_path)
-        print(f"[nl_pushover] raw_data cargado desde {os.path.basename(xlsx_path)}")
+        if os.path.exists(xlsx_path):
+            raw_data = _load_wall_raw_data(xlsx_path)
+            print(f"[nl_pushover] raw_data cargado desde {os.path.basename(xlsx_path)}")
+        else:
+            from app.tasks.wall_demands_canonical_shim import raw_data_from_canonical
+            raw_data = raw_data_from_canonical(model)
+            _k_piers = 'TABLE:  "PIER SECTION PROPERTIES"'
+            n_piers = len(raw_data.get(_k_piers, []))
+            print(
+                f"[nl_pushover] raw_data reconstruido desde canonical (piers={n_piers})"
+            )
 
         # ── Importar builder ──────────────────────────────────────────────────
         from app.engine.building.nonlinear.nl_wall_ops_builder import NLWallOPSBuilder
@@ -136,20 +161,36 @@ def run_nl_pushover(
                 n_fibers    = n_fibers,
             )
             try:
+                _update_job_progress(job_id, {"stage": "init", "direction": direction})
                 info = builder.build()
                 n_elem = len(info["pier_elements"])
                 print(f"[nl_pushover] Modelo {direction}: {n_elem} elementos MVLEM_3D")
 
+                _update_job_progress(job_id, {"stage": "gravity", "direction": direction})
                 grav_result = builder.run_gravity(pier_pu, steps=10)
                 print(f"[nl_pushover] Gravedad {direction}: {grav_result['status']}")
+
+                def _progress_cb(data: dict) -> None:
+                    pct = int(100.0 * data["step"] / max(data["total"], 1))
+                    _update_job_progress(job_id, {
+                        "stage":         "pushover",
+                        "direction":     data["direction"],
+                        "step":          data["step"],
+                        "total":         data["total"],
+                        "pct":           pct,
+                        "drift_pct":     data["drift_pct"],
+                        "base_shear_kN": data["base_shear_kN"],
+                    })
 
                 push_result = builder.run_pushover(
                     direction        = direction,
                     target_drift_pct = target_drift,
                     inc_m            = inc_m,
+                    pattern_type     = pattern_type,
                     result_path      = part_path,
                     history_path     = hist_path,
                     history_stride   = int(params.get("history_stride", 1)),
+                    progress_cb      = _progress_cb,
                 )
                 # Se persiste pier_lines para reconstruir la deformada en frontend
                 push_result["pier_lines"]   = info["pier_lines"]
@@ -211,6 +252,7 @@ def run_nl_pushover(
             "fc_mpa":      fc_mpa,
             "fy_mpa":      fy_mpa,
             "target_drift_pct": target_drift,
+            "pattern_type": pattern_type,
             "n_fibers":    n_fibers,
             "summary":     summary,
             "pushover_X":  results_by_dir.get("X"),
@@ -237,6 +279,7 @@ def run_nl_pushover(
         job.result_path    = res_path
         job.result_summary = json.dumps(db_summary)
         job.finished_at    = datetime.now(timezone.utc)
+        job.progress_json  = {"stage": "done", "pct": 100}
         db.commit()
         return result
 
@@ -251,6 +294,7 @@ def run_nl_pushover(
                 j.status        = StructuralJobStatus.failed
                 j.error_message = str(exc)[:4000]
                 j.finished_at   = datetime.now(timezone.utc)
+                j.progress_json = {"stage": "done", "pct": 100, "status": "failed"}
                 db.commit()
         except Exception:
             pass

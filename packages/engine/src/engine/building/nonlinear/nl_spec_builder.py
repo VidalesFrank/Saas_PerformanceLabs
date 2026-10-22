@@ -39,6 +39,102 @@ def _bar_diam(label: str, default: float = 15.9) -> float:
     return _BAR_DIAM_MM.get(str(label).strip(), default)
 
 
+_BAR_AREA_CM2: dict[str, float] = {
+    label: round(math.pi * (d / 10.0) ** 2 / 4.0, 4)
+    for label, d in _BAR_DIAM_MM.items()
+}
+
+
+def _bar_area_cm2(label: str, n_bars: int) -> float:
+    return _BAR_AREA_CM2.get(str(label).strip(), 2.0) * max(int(n_bars), 0)
+
+
+def _column_long_groups(long_r: dict) -> dict:
+    """
+    Devuelve un dict con los 5 grupos del refuerzo longitudinal:
+        corners    (4 barras siempre)
+        top_face   (intermedias en cara superior, sin esquinas)
+        bot_face
+        left_face
+        right_face
+
+    Acepta tres formas de entrada:
+        (a) Granular aplanado — las 5 claves directamente en `long_r`.
+        (b) Granular anidado — `long_r["groups"]` contiene las 5 claves (schema
+            que usa el router /sections cuando guarda un patrón as-built desde la UI).
+        (c) Legacy — {n_bars, bar_label} agregado, se reparte uniforme.
+    """
+    # (b) Anidado bajo "groups" — aplanar y re-entrar
+    nested = long_r.get("groups")
+    if isinstance(nested, dict) and any(
+        k in nested for k in ("corners", "top_face", "bot_face", "left_face", "right_face")
+    ):
+        return _column_long_groups(nested)
+
+    # Granular aplanado — detectar presencia de cualquiera de las claves por-grupo
+    has_granular = any(k in long_r for k in
+                       ("corners", "top_face", "bot_face", "left_face", "right_face"))
+
+    def _grp(src: dict, default_label: str, default_n: int = 0, is_corner: bool = False) -> dict:
+        label = str(src.get("bar_label", default_label))
+        n     = 4 if is_corner else max(0, int(src.get("n_bars", default_n)))
+        return {
+            "bar_label": label,
+            "n_bars":    n,
+            "db_mm":     _bar_diam(label),
+            "As_cm2":    round(_bar_area_cm2(label, n), 3),
+        }
+
+    if has_granular:
+        corners_label = str((long_r.get("corners") or {}).get("bar_label", "#6"))
+        return {
+            "corners":    _grp(long_r.get("corners",    {}), corners_label, 4, is_corner=True),
+            "top_face":   _grp(long_r.get("top_face",   {}), corners_label, 0),
+            "bot_face":   _grp(long_r.get("bot_face",   {}), corners_label, 0),
+            "left_face":  _grp(long_r.get("left_face",  {}), corners_label, 0),
+            "right_face": _grp(long_r.get("right_face", {}), corners_label, 0),
+        }
+
+    # Legacy: {n_bars, bar_label} — reparto uniforme perimetral
+    label = str(long_r.get("bar_label", "#6"))
+    n     = max(4, int(long_r.get("n_bars", 8)))
+    # Esquinas = 4 fijas; resto por caras
+    remaining = n - 4
+    # Reparto 50% top+bot, 50% left+right (ajustable)
+    n_tb = remaining // 2
+    n_lr = remaining - n_tb
+    n_top  = n_tb // 2
+    n_bot  = n_tb - n_top
+    n_left = n_lr // 2
+    n_right = n_lr - n_left
+    return {
+        "corners":    _grp({"bar_label": label}, label, 4, is_corner=True),
+        "top_face":   _grp({"bar_label": label, "n_bars": n_top},   label, 0),
+        "bot_face":   _grp({"bar_label": label, "n_bars": n_bot},   label, 0),
+        "left_face":  _grp({"bar_label": label, "n_bars": n_left},  label, 0),
+        "right_face": _grp({"bar_label": label, "n_bars": n_right}, label, 0),
+    }
+
+
+def _column_groups_stats(groups: dict) -> tuple[int, float, str]:
+    """Devuelve (n_total, As_total_cm2, dominant_label).
+
+    `dominant_label` = etiqueta con mayor conteo (en empate: con mayor diámetro).
+    """
+    n_total = sum(int(g["n_bars"]) for g in groups.values())
+    As_total = sum(float(g["As_cm2"]) for g in groups.values())
+    counts: dict[str, int] = {}
+    for g in groups.values():
+        if int(g["n_bars"]) == 0:
+            continue
+        counts[g["bar_label"]] = counts.get(g["bar_label"], 0) + int(g["n_bars"])
+    if counts:
+        dominant = max(counts.items(), key=lambda kv: (kv[1], _bar_diam(kv[0])))[0]
+    else:
+        dominant = groups.get("corners", {}).get("bar_label", "#6")
+    return n_total, As_total, dominant
+
+
 def _compute_digest(*objs: Any) -> str:
     h = hashlib.sha256()
     for o in objs:
@@ -85,6 +181,12 @@ class NLSpecBuilder:
         builder = NLSpecBuilder(canonical, col_detail, beam_detail,
                                 user_reinforcement, energy_dissipation)
         spec = builder.build()
+
+    Prioridad del refuerzo (de más fuerte a más débil):
+        1. user_reinforcement[frame_id]           → override individual (as-built).
+        2. section_patterns["column:<section>"]   → patrón de sección (as-built).
+        3. col_detail / beam_detail               → diseño automático.
+        4. defaults NSR-10 ρ=1%.
     """
 
     def __init__(
@@ -95,13 +197,30 @@ class NLSpecBuilder:
         user_reinforcement: dict | None = None,
         energy_dissipation: str = "DMO",
         project_id:         str = "",
+        section_patterns:   dict | None = None,
     ):
         self._m          = canonical
         self._col        = col_detail
         self._bm         = beam_detail
-        self._user_r     = user_reinforcement or {}
+        # Normalizar: el router guarda {fid: {"reinforcement": {...}, "source": ...}}
+        # pero legacy pasa {fid: {"longitudinal": ..., "transverse": ...}} directo.
+        # Aceptar ambos — el engine siempre consume el nivel con longitudinal/transverse.
+        self._user_r: dict[str, dict] = {}
+        for fid, val in (user_reinforcement or {}).items():
+            if not isinstance(val, dict):
+                continue
+            if "reinforcement" in val and isinstance(val["reinforcement"], dict):
+                self._user_r[fid] = val["reinforcement"]
+            else:
+                self._user_r[fid] = val
         self._ed         = energy_dissipation.upper()
         self._project_id = project_id
+        # Patrones de sección (as-built) — clave: "column:<section_name>" o
+        # "beam:<section_name>". Valor: {mode, longitudinal, transverse, ...}.
+        self._section_patterns: dict[str, dict] = {}
+        for key, val in (section_patterns or {}).items():
+            if isinstance(val, dict) and str(val.get("mode", "")).lower() == "manual":
+                self._section_patterns[str(key)] = val
 
         # Índices rápidos para búsqueda
         self._col_idx: dict[str, dict] = {
@@ -301,12 +420,13 @@ class NLSpecBuilder:
             b = _to_float(sec_d.get("b_m"), 0.30)
             h = _to_float(sec_d.get("h_m"), 0.30)
 
-            # Refuerzo: prioridad → user_reinforcement > col_detail > defaults
-            design   = self._col_idx.get(fid)
-            user_ovr = self._user_r.get(fid)
+            # Refuerzo: prioridad → user_ovr > section_pattern > col_detail > defaults
+            design      = self._col_idx.get(fid)
+            user_ovr    = self._user_r.get(fid)
+            sec_pattern = self._section_patterns.get(f"column:{sec}") if sec else None
 
             reinf, has_design = self._column_reinforcement(
-                fid, design, user_ovr, b, h, L, fpc
+                fid, design, user_ovr, sec_pattern, b, h, L, fpc
             )
 
             # Mander: confinamiento en zona de rótula (s_confined) y zona central
@@ -407,60 +527,35 @@ class NLSpecBuilder:
         fid: str,
         design: dict | None,
         user_ovr: dict | None,
+        sec_pattern: dict | None,
         b: float,
         h: float,
         L: float,
         fc: float,
     ) -> tuple[dict, bool]:
-        # Usar override del usuario si existe
+        # Override individual del frame tiene máxima prioridad
         if user_ovr:
             long_r  = user_ovr.get("longitudinal", {})
             trans_r = user_ovr.get("transverse", {})
-            return {
-                "longitudinal": {
-                    "n_bars":    int(long_r.get("n_bars", 8)),
-                    "bar_label": str(long_r.get("bar_label", "#6")),
-                    "As_cm2":    round(_to_float(long_r.get("As_placed_cm2", 15.8)), 2),
-                },
-                "transverse": {
-                    "tie_bar_label":     str(trans_r.get("tie_bar_label", "#3")),
-                    "n_legs_b":          int(trans_r.get("n_legs_b", 2)),
-                    "n_legs_h":          int(trans_r.get("n_legs_h", 2)),
-                    "s_confined_mm":     int(trans_r.get("s_confined_mm", 100)),
-                    "s_general_mm":      int(trans_r.get("s_general_mm", 200)),
-                    "L_confinement_mm":  int(trans_r.get("L_confinement_mm",
-                                             max(b, h) * 1000)),
-                    "energy_dissipation": self._ed,
-                },
-            }, True
+            return self._pack_column_reinf(long_r, trans_r, b, h), True
 
-        # Usar resultado del designer
+        # Patrón as-built aplicado a toda la sección
+        if sec_pattern:
+            long_r  = sec_pattern.get("longitudinal", {})
+            trans_r = sec_pattern.get("transverse", {})
+            return self._pack_column_reinf(long_r, trans_r, b, h), True
+
+        # Resultado del diseñador automático
         if design:
             pr   = design.get("final_reinforcement") or design.get("proposed_reinforcement", {})
-            long = pr.get("longitudinal", {})
-            tran = pr.get("transverse", {})
-            return {
-                "longitudinal": {
-                    "n_bars":    int(long.get("n_bars", 8)),
-                    "bar_label": str(long.get("bar_label", "#6")),
-                    "As_cm2":    round(_to_float(long.get("As_placed_cm2", 0)), 2),
-                },
-                "transverse": {
-                    "tie_bar_label":     str(tran.get("tie_bar_label", "#3")),
-                    "n_legs_b":          int(tran.get("n_legs_b", 2)),
-                    "n_legs_h":          int(tran.get("n_legs_h", 2)),
-                    "s_confined_mm":     int(tran.get("s_confined_mm", 100)),
-                    "s_general_mm":      int(tran.get("s_general_mm", 200)),
-                    "L_confinement_mm":  int(tran.get("L_confinement_mm",
-                                             max(b, h) * 1000)),
-                    "energy_dissipation": self._ed,
-                },
-            }, True
+            long_r = pr.get("longitudinal", {})
+            trans_r = pr.get("transverse", {})
+            return self._pack_column_reinf(long_r, trans_r, b, h), True
 
-        # Sin diseño: defaults mínimos NSR-10 ρ=1%
+        # Sin diseño: defaults NSR-10 ρ=1%
         Ag_cm2 = (b * 100) * (h * 100)
         As_def = max(Ag_cm2 * 0.01, 10.0)
-        n_def  = max(4, int(As_def / 2.85))   # ~#5 barras
+        n_def  = max(4, int(As_def / 2.85))
         return {
             "longitudinal": {
                 "n_bars":    n_def,
@@ -477,6 +572,46 @@ class NLSpecBuilder:
                 "energy_dissipation": self._ed,
             },
         }, False
+
+    def _pack_column_reinf(
+        self,
+        long_r: dict,
+        trans_r: dict,
+        b: float,
+        h: float,
+    ) -> dict:
+        """Normaliza una entrada de refuerzo de columna al schema del spec.
+
+        Acepta DOS formatos de entrada:
+          A) Legacy: {n_bars, bar_label, As_cm2} — un solo diámetro para todas.
+          B) Granular: {corners, top_face, bot_face, left_face, right_face}
+             — permite diámetros distintos por grupo. Esquinas = 4 barras siempre.
+
+        El spec de salida incluye SIEMPRE ambos formatos:
+          - groups: refuerzo granular por grupo (ingresa B o lo infiere de A).
+          - n_bars/bar_label/As_cm2: resumen agregado para compat retro.
+        """
+        groups = _column_long_groups(long_r)
+        n_total, As_total_cm2, dominant_label = _column_groups_stats(groups)
+        return {
+            "longitudinal": {
+                "n_bars":    n_total,
+                "bar_label": dominant_label,
+                "As_cm2":    round(As_total_cm2, 2),
+                "groups":    groups,
+            },
+            "transverse": {
+                "tie_bar_label":     str(trans_r.get("tie_bar_label", "#3")),
+                "n_legs_b":          int(trans_r.get("n_legs_b", 2)),
+                "n_legs_h":          int(trans_r.get("n_legs_h", 2)),
+                "s_confined_mm":     int(trans_r.get("s_confined_mm", 100)),
+                "s_general_mm":      int(trans_r.get("s_general_mm", 200)),
+                "L_confinement_mm":  int(trans_r.get("L_confinement_mm",
+                                         max(b, h) * 1000)),
+                "energy_dissipation": self._ed,
+            },
+        }
+
 
     # ── Vigas ──────────────────────────────────────────────────────────────────
 
@@ -507,11 +642,12 @@ class NLSpecBuilder:
             b = _to_float(sec_d.get("b_m"), 0.30)
             h = _to_float(sec_d.get("h_m"), 0.40)
 
-            design   = self._bm_idx.get(fid)
-            user_ovr = self._user_r.get(fid)
+            design      = self._bm_idx.get(fid)
+            user_ovr    = self._user_r.get(fid)
+            sec_pattern = self._section_patterns.get(f"beam:{sec}") if sec else None
 
             reinf, has_design = self._beam_reinforcement(
-                fid, design, user_ovr, b, h, L, fpc
+                fid, design, user_ovr, sec_pattern, b, h, L, fpc
             )
 
             confinement = self._beam_confinement(reinf, b, h, fpc, has_design)
@@ -634,14 +770,19 @@ class NLSpecBuilder:
         fid: str,
         design: dict | None,
         user_ovr: dict | None,
+        sec_pattern: dict | None,
         b: float,
         h: float,
         L: float,
         fc: float,
     ) -> tuple[dict, bool]:
-        # Override manual del usuario
+        # Override manual del usuario — máxima prioridad
         if user_ovr:
             return self._beam_reinf_from_user(user_ovr, b, h), True
+
+        # Patrón de sección (as-built) aplicado a toda la sección
+        if sec_pattern:
+            return self._beam_reinf_from_user(sec_pattern, b, h), True
 
         if design:
             return self._beam_reinf_from_design(design, b, h), True

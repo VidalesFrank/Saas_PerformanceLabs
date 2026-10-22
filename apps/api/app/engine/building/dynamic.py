@@ -154,7 +154,22 @@ def dinamicoBD4_adaptive(
     # Parámetros de adaptación de paso
     reduce_factor: float = 0.5,     # cada fallo: dt *= 0.5
     dt_min: float = 1e-4,
-    maxNumIter: int = 25,          
+    maxNumIter: int = 25,
+    # Callback opcional invocado cada `progress_every` pasos convergidos.
+    # Recibe {step, total, t, pct}. No lanza — errores internos se silencian.
+    progress_cb               = None,
+    progress_every: int       = 25,
+    # Opt-in: si `base_nodes` se pasa, cada paso convergido captura las
+    # reacciones horizontales (DOF 1 y 2) de esos nodos y las acumula como
+    # Vb_x(t) y Vb_y(t). El resultado se devuelve como arrays al final.
+    base_nodes:   Optional[List[int]] = None,
+    # Opt-in para Bloque B (detección de eventos): si > 0, cada N pasos
+    # captura las deformaciones de sección en IP 1 y 6 (extremos) de los
+    # elementos frame. Resultado: `sect_def_hist`, `sect_t_hist` extra.
+    sect_def_stride: int = 0,
+    # Opt-in para captura de infills: lista de pares de truss tags por panel.
+    # Se captura basicDeformation con el mismo stride que sect_def.
+    infill_truss_tags: Optional[List[List[int]]] = None,
 ) -> tuple:
     """
     Versión de dinamicoBD4 con ajuste adaptativo de dtan:
@@ -237,6 +252,24 @@ def dinamicoBD4_adaptive(
     time_target = dtrec * nPts
     ok = 0
     step = 0
+
+    # Captura opcional de cortante basal (sumatoria de reacciones horizontales)
+    capture_vb = bool(base_nodes)
+    Vb_x = np.zeros(Nsteps + 1, dtype=np.float32) if capture_vb else None
+    Vb_y = np.zeros(Nsteps + 1, dtype=np.float32) if capture_vb else None
+
+    # Captura opcional de deformaciones de sección (Bloque B: eventos locales).
+    # Guarda cada `sect_def_stride` pasos: 8 valores por elemento frame
+    # (axial, κz, κy, torsion × 2 extremos). Para NLTHA típicamente stride=10
+    # (0.05s de resolución para un record a dt=0.005s).
+    capture_sect = (eletype == 'frame' and sect_def_stride > 0)
+    sect_def_hist: list[list[list[float]]] = []
+    sect_t_hist: list[float] = []
+
+    # Captura opcional de elongación de infills (mismo stride que sect_def).
+    capture_infill = (eletype == 'frame' and sect_def_stride > 0 and
+                       bool(infill_truss_tags))
+    infill_elong_hist: list[list[list[float]]] = []
 
     # Bucle por tiempo REAL
     while ops.getTime() + 1e-12 < time_target:
@@ -338,6 +371,82 @@ def dinamicoBD4_adaptive(
                 except Exception:
                     pass
 
+        # Captura con stride de deformaciones de sección (Bloque B)
+        if capture_sect and (step % sect_def_stride == 0):
+            try:
+                frame_sect: list[list[float]] = []
+                for e in elements:
+                    row: list[float] = []
+                    for ip in (1, 6):
+                        try:
+                            d = ops.sectionDeformation(e, ip)
+                            row.extend([float(x) for x in d[:4]])
+                            while len(row) % 4 != 0:
+                                row.append(0.0)
+                        except Exception:
+                            row.extend([0.0, 0.0, 0.0, 0.0])
+                    # Garantizar 8 valores por elemento (4+4 extremos)
+                    while len(row) < 8:
+                        row.append(0.0)
+                    frame_sect.append(row[:8])
+                sect_def_hist.append(frame_sect)
+                sect_t_hist.append(float(ops.getTime()))
+            except Exception:
+                pass
+
+            # Captura paralela de elongación de infills (mismo stride)
+            if capture_infill:
+                try:
+                    step_inf: list[list[float]] = []
+                    for tag_pair in (infill_truss_tags or []):
+                        pair_vals: list[float] = []
+                        for t in tag_pair:
+                            try:
+                                bd = ops.basicDeformation(t)
+                                pair_vals.append(float(bd[0]) if bd else 0.0)
+                            except Exception:
+                                pair_vals.append(0.0)
+                        while len(pair_vals) < 2:
+                            pair_vals.append(0.0)
+                        step_inf.append(pair_vals)
+                    infill_elong_hist.append(step_inf)
+                except Exception:
+                    pass
+
+        # Captura de Vb (cortante basal) sumando reacciones en nodos base
+        if capture_vb:
+            try:
+                ops.reactions()
+                if step >= Vb_x.shape[0]:
+                    Vb_x = np.concatenate([Vb_x, np.zeros(1024, dtype=np.float32)])
+                    Vb_y = np.concatenate([Vb_y, np.zeros(1024, dtype=np.float32)])
+                vx = 0.0
+                vy = 0.0
+                for bn in base_nodes:
+                    try:
+                        vx += float(ops.nodeReaction(bn, 1))
+                        vy += float(ops.nodeReaction(bn, 2))
+                    except Exception:
+                        pass
+                # Convención: Vb = -Σ Reacciones (fuerza interna = -restauring)
+                Vb_x[step] = -vx
+                Vb_y[step] = -vy
+            except Exception:
+                pass
+
+        # Progreso en vivo cada N pasos convergidos
+        if progress_cb is not None and (step % max(1, progress_every) == 0):
+            try:
+                t_now = ops.getTime()
+                progress_cb({
+                    "step":  step,
+                    "total": Nsteps,
+                    "t":     float(t_now),
+                    "pct":   float(min(100.0, 100.0 * t_now / max(time_target, 1e-9))),
+                })
+            except Exception:
+                pass
+
     # Recortes y salidas
     techo1 = np.array(dtecho1)
     techo2 = np.array(dtecho2)
@@ -355,10 +464,37 @@ def dinamicoBD4_adaptive(
     if Prot is not None:
         Prot = Prot[:, :step + 1]
 
-    # Salida estable: siempre devolvemos Prot (None si no aplica) y Eds
-    return (tiempo, techo1, techo2, techoT,
-            node_disp, node_vel, node_acel, node_disp2, node_acel2,
-            driftX, driftY, Prot, Eds)
+    # Recortar Vb a los pasos reales
+    if capture_vb:
+        Vb_x = Vb_x[:step + 1]
+        Vb_y = Vb_y[:step + 1]
+
+    # Convertir historia de sect_def a arrays
+    sect_def_arr = (
+        np.asarray(sect_def_hist, dtype=np.float32) if sect_def_hist
+        else np.zeros((0, 0, 8), dtype=np.float32)
+    )
+    sect_t_arr = (
+        np.asarray(sect_t_hist, dtype=np.float32) if sect_t_hist
+        else np.zeros((0,), dtype=np.float32)
+    )
+    infill_elong_arr = (
+        np.asarray(infill_elong_hist, dtype=np.float32) if infill_elong_hist
+        else np.zeros((0, 0, 2), dtype=np.float32)
+    )
+
+    # Salida estable: siempre devolvemos Prot (None si no aplica) y Eds.
+    # Si se solicitó captura de Vb, se añaden Vb_x y Vb_y al final para que
+    # el llamador los pueda desempaquetar (nuevo); el llamador legacy ignora
+    # la tupla extendida con *_ y recibe la tupla antigua intacta.
+    base_result = (tiempo, techo1, techo2, techoT,
+                   node_disp, node_vel, node_acel, node_disp2, node_acel2,
+                   driftX, driftY, Prot, Eds)
+    if capture_vb and capture_sect:
+        return base_result + (Vb_x, Vb_y, sect_def_arr, sect_t_arr, infill_elong_arr)
+    if capture_vb:
+        return base_result + (Vb_x, Vb_y)
+    return base_result
     
 #%% FUNCION QUE CORRE EL DINAMICO
 def run_pair_dynamic(

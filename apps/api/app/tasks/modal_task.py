@@ -114,17 +114,29 @@ def run_modal(
                     shape[tag] = [0.0, 0.0, 0.0]
             mode_shapes[mode] = shape
 
-        # ── 9. Masas participativas ─────────────────────────────────────────
+        # ── 9. Masas participativas + Γ y m* por dirección (para N2) ────────
         try:
             mp = ops.modalProperties("-return")
             pmx  = [float(v) for v in mp.get("partiMassRatiosMX",  [])]
             pmy  = [float(v) for v in mp.get("partiMassRatiosMY",  [])]
             pmrz = [float(v) for v in mp.get("partiMassRatiosRMZ", [])]
+            # Factor de participación modal (Γ) y masa modal absoluta (m*·Γ):
+            #   Γ_i   = partiFactorM{X,Y}[i]
+            #   m*_i  = partiMassM{X,Y}[i] / Γ_i   (si Γ ≠ 0)
+            parti_factor_x = [float(v) for v in mp.get("partiFactorMX", [])]
+            parti_factor_y = [float(v) for v in mp.get("partiFactorMY", [])]
+            parti_mass_x   = [float(v) for v in mp.get("partiMassMX",   [])]
+            parti_mass_y   = [float(v) for v in mp.get("partiMassMY",   [])]
         except Exception as e:
             print(f"[modal] modalProperties falló: {e}")
             pmx = pmy = pmrz = []
+            parti_factor_x = parti_factor_y = parti_mass_x = parti_mass_y = []
 
         # ── 10. Tabla de resultados ─────────────────────────────────────────
+        def _m_ast(gamma: float, pmass: float) -> float:
+            """m* = partiMass / Γ (ton). Devuelve 0 si Γ es casi cero."""
+            return float(pmass / gamma) if abs(gamma) > 1e-12 else 0.0
+
         modes_table = []
         cum_ux = cum_uy = cum_rz = 0.0
         for i, T in enumerate(periods):
@@ -132,13 +144,47 @@ def run_modal(
             py  = pmy[i]  if i < len(pmy)  else 0.0
             prz = pmrz[i] if i < len(pmrz) else 0.0
             cum_ux += px; cum_uy += py; cum_rz += prz
+            gx = parti_factor_x[i] if i < len(parti_factor_x) else 0.0
+            gy = parti_factor_y[i] if i < len(parti_factor_y) else 0.0
+            Mx = parti_mass_x[i]   if i < len(parti_mass_x)   else 0.0
+            My = parti_mass_y[i]   if i < len(parti_mass_y)   else 0.0
             modes_table.append({
                 "mode": i + 1, "T": round(T, 4),
                 "Ux_pct": round(px, 2),   "Uy_pct": round(py, 2),   "Rz_pct": round(prz, 2),
                 "Ux_cum": round(min(cum_ux, 100.0), 2),
                 "Uy_cum": round(min(cum_uy, 100.0), 2),
                 "Rz_cum": round(min(cum_rz, 100.0), 2),
+                # Para el método N2 (SDOF equivalente por dirección)
+                "gamma_x": round(gx, 6), "gamma_y": round(gy, 6),
+                "m_ast_x": round(_m_ast(gx, Mx), 6),
+                "m_ast_y": round(_m_ast(gy, My), 6),
             })
+
+        # Primer modo dominante por dirección: índice con mayor % de masa modal
+        i_mode_x = int(np.argmax(pmx)) if pmx else 0
+        i_mode_y = int(np.argmax(pmy)) if pmy else 0
+        sdof_summary = {
+            "x": {
+                "mode_index": i_mode_x + 1 if pmx else None,
+                "T":          round(periods[i_mode_x], 4) if periods else None,
+                "gamma":      round(parti_factor_x[i_mode_x], 6) if i_mode_x < len(parti_factor_x) else None,
+                "m_ast":      round(_m_ast(
+                                  parti_factor_x[i_mode_x] if i_mode_x < len(parti_factor_x) else 0.0,
+                                  parti_mass_x[i_mode_x]   if i_mode_x < len(parti_mass_x)   else 0.0,
+                              ), 6),
+                "mass_participation_pct": round(pmx[i_mode_x], 2) if pmx else 0.0,
+            },
+            "y": {
+                "mode_index": i_mode_y + 1 if pmy else None,
+                "T":          round(periods[i_mode_y], 4) if periods else None,
+                "gamma":      round(parti_factor_y[i_mode_y], 6) if i_mode_y < len(parti_factor_y) else None,
+                "m_ast":      round(_m_ast(
+                                  parti_factor_y[i_mode_y] if i_mode_y < len(parti_factor_y) else 0.0,
+                                  parti_mass_y[i_mode_y]   if i_mode_y < len(parti_mass_y)   else 0.0,
+                              ), 6),
+                "mass_participation_pct": round(pmy[i_mode_y], 2) if pmy else 0.0,
+            },
+        }
 
         # ── 11. Datos para el visor 3D ──────────────────────────────────────
         shapes_for_viewer = {
@@ -151,6 +197,7 @@ def run_modal(
             "num_modes":   num_modes,
             "num_floors":  num_modes,
             "modes_table": modes_table,
+            "sdof":        sdof_summary,
             "viewer": {
                 "nodes":       {str(k): v for k, v in node_coords.items()},
                 "mode_shapes": shapes_for_viewer,

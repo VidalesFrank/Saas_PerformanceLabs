@@ -39,6 +39,9 @@ from typing import Literal
 
 import numpy as np
 
+# Compatibilidad numpy 1.x (Docker prod) y 2.x (dev).
+_trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+
 from engine.analysis.moment_curvature import MomentCurvatureResult
 
 
@@ -185,7 +188,7 @@ def hysteretic_energy_capacity(mc: MomentCurvatureResult) -> float:
     moms = np.array([p.moment for p in mc.curve])
     if len(phis) < 2:
         return 0.0
-    return float(np.trapezoid(moms, phis))
+    return float(_trapz(moms, phis))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

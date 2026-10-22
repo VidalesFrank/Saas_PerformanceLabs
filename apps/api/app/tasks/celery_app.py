@@ -21,6 +21,7 @@ celery_app = Celery(
         "app.tasks.structural_nl_pushover_task",
         "app.tasks.structural_variant_pushover_task",
         "app.tasks.structural_frame_pushover_task",
+        "app.tasks.structural_nlth_task",
         # Módulo 5 — Análisis de Muros RC 3D
         "app.tasks.wall_analysis_task",
     ],
@@ -35,6 +36,11 @@ celery_app.conf.update(
     task_track_started=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
+    # Redis como broker: `visibility_timeout` controla cuánto espera Celery
+    # antes de considerar un task "perdido" y re-entregarlo a otro worker.
+    # Default 1h → re-entrega NLTHA largos (>1h) causando reinicios desde cero.
+    # Lo subimos a 24h para análisis no lineales largos.
+    broker_transport_options={"visibility_timeout": 86400},
 )
 
 # Límites de tiempo por tipo de análisis
@@ -54,6 +60,8 @@ celery_app.conf.task_annotations = {
     "app.tasks.structural_nl_pushover_task.run_nl_pushover":   {"time_limit": 7200, "soft_time_limit": 7000},
     "app.tasks.structural_variant_pushover_task.run_variant_pushover": {"time_limit": 7200, "soft_time_limit": 7000},
     "app.tasks.structural_frame_pushover_task.run_frame_pushover":     {"time_limit": 7200, "soft_time_limit": 7000},
+    # NLTHA puede ser muy largo con registros reales (duration 30-60s a dt_analysis 0.005)
+    "app.tasks.structural_nlth_task.run_nlth":                         {"time_limit": 14400, "soft_time_limit": 14000},
     # Módulo 5
     "app.tasks.wall_analysis_task.run_gravity":            {"time_limit": 1800, "soft_time_limit": 1700},
     "app.tasks.wall_analysis_task.run_modal":              {"time_limit": 900,  "soft_time_limit": 850},
