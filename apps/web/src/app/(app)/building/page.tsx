@@ -6,6 +6,7 @@ import { AppHeader } from "@/components/app-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/input";
+import { PageHero } from "@/components/ui/page-hero";
 import { ApiError } from "@/lib/api";
 import { buildingProjectsApi } from "@/lib/building-api";
 import type { BuildingProject } from "@/lib/building-types";
@@ -75,18 +76,15 @@ export default function BuildingProjectsPage() {
   return (
     <div className="flex flex-1 flex-col">
       <AppHeader crumb="Análisis No Lineal 3D" />
+      <PageHero
+        eyebrow="Modelación · Análisis NL"
+        title="Análisis No Lineal 3D de Edificios"
+        subtitle="Importa tu modelo de ETABS y ejecuta análisis modal, pushover (±X/±Y), NLTHA con registros FEMA P-695 e IDA multi-registro."
+        tone="cyan"
+        icon="skyscraper"
+        actions={<Button onClick={() => setShowNew(true)}>+ Nuevo proyecto</Button>}
+      />
       <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-10">
-
-        {/* Cabecera */}
-        <div className="mb-8 flex items-start justify-between">
-          <div>
-            <h1 className="text-xl font-semibold text-text">Análisis No Lineal 3D de Edificios</h1>
-            <p className="mt-1 text-sm text-text-muted">
-              Importa tu modelo de ETABS y ejecuta análisis modal, pushover e IDA.
-            </p>
-          </div>
-          <Button onClick={() => setShowNew(true)}>+ Nuevo proyecto</Button>
-        </div>
 
         {/* Formulario nuevo proyecto */}
         {showNew && (

@@ -2,6 +2,7 @@
 
 import { FormEvent, useMemo, useState } from "react";
 import { AppHeader } from "@/components/app-header";
+import { PageHero } from "@/components/ui/page-hero";
 import { PMMSurface3D, PMMEnvelopeChart, MxMyPanel } from "@/components/pmm-chart";
 import { SectionPreview } from "@/components/section-preview";
 import { applyBarEdit, applyBarDelete, applyBarDuplicate, computeBarSizesFromForm } from "@/lib/section-form-adapter";
@@ -195,16 +196,20 @@ export default function PMMPage() {
 
   return (
     <div className="flex flex-1 flex-col">
-      <AppHeader crumb="Interaccion Biaxial P-M-M" />
+      <AppHeader crumb="Interacción Biaxial P-M-M" />
+      <PageHero
+        eyebrow="Secciones · Análisis"
+        title="Superficie de interacción P-M-M"
+        subtitle="Interacción biaxial 3D con rotación de fibras. Secciones rectangulares, cuadradas, circulares o especiales."
+        tone="emerald"
+        icon="curve"
+      />
       <main className="mx-auto grid w-full max-w-7xl flex-1 grid-cols-1 gap-6 px-6 py-10 lg:grid-cols-[400px_1fr]">
 
         {/* ── Formulario ── */}
         <Card className="h-fit">
           <CardHeader>
-            <h1 className="text-lg font-semibold text-text">Superficie de interaccion P-M-M</h1>
-            <p className="mt-1 text-xs text-text-muted">
-              Interaccion biaxial completa. Secciones rectangular, cuadrada, circular o especial.
-            </p>
+            <h2 className="text-sm font-semibold text-text">Parámetros de la sección</h2>
           </CardHeader>
           <CardBody>
             <form onSubmit={onSubmit} className="flex flex-col gap-5">

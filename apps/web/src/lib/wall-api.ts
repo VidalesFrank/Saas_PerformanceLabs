@@ -269,6 +269,12 @@ export const wallProjectsApi = {
   get: (id: string) =>
     wpReq<WallProject5>(`/${id}`),
 
+  update: (id: string, payload: { name?: string; description?: string | null }) =>
+    wpReq<WallProject5>(`/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+
   delete: (id: string) =>
     wpReq<void>(`/${id}`, { method: "DELETE" }),
 

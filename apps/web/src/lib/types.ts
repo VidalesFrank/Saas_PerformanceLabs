@@ -1,5 +1,7 @@
 export type Nivel = "free" | "pro" | "premium" | null;
 export type Estado = "idea" | "en_desarrollo" | "listo";
+export type CatalogGroup = "modelacion" | "sismologia" | "secciones" | "campo" | "roadmap";
+export type CatalogColor = "cyan" | "blue" | "emerald" | "amber" | "violet";
 
 export interface CatalogProduct {
   id: string;
@@ -7,12 +9,24 @@ export interface CatalogProduct {
   nivel: Nivel;
   estado: Estado;
   route: string | null;
+  /** Bajada corta renderizada bajo el nombre en la card. */
+  subtitle?: string;
+  /** Aparece como atajo grande en el hero del dashboard. */
+  featured?: boolean;
 }
 
 export interface CatalogModule {
   id: string;
   name: string;
   products: CatalogProduct[];
+  /** Grupo de flujo al que pertenece el módulo en el dashboard. */
+  group?: CatalogGroup;
+  /** Bajada corta renderizada en el header del grupo. */
+  desc?: string;
+  /** Id del ícono en module-visuals.tsx ICON_D. */
+  icon?: string;
+  /** Token de paleta tech del hero/cards. */
+  color?: CatalogColor;
 }
 
 export interface User {

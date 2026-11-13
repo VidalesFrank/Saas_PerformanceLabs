@@ -36,6 +36,14 @@ class ProjectCreate(BaseModel):
     description: str | None = None
 
 
+class ProjectUpdate(BaseModel):
+    """Campos editables de un proyecto ya creado. Ambos opcionales — el PATCH
+    sólo actualiza los campos presentes. Los parámetros sísmicos NO se tocan
+    aquí (cambiarlos equivale a otro modelo). Jobs y archivos tampoco."""
+    name: str | None = None
+    description: str | None = None
+
+
 class SeismicParameters(BaseModel):
     """Parámetros sísmicos NSR-10 y configuración del análisis."""
     # Identificación
@@ -190,11 +198,40 @@ def get_project(project_id: str, user: CurrentUser, db: DB):
     return ProjectOut.from_orm_extra(_get_project_or_404(db, project_id, user))
 
 
+@router.patch("/{project_id}", response_model=ProjectOut)
+def update_project(project_id: str, payload: ProjectUpdate, user: CurrentUser, db: DB):
+    """Renombra o ajusta la descripción. Solo aplica cambios a campos presentes
+    en el body (patch parcial). No modifica parámetros sísmicos ni archivos."""
+    project = _get_project_or_404(db, project_id, user)
+
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="El nombre no puede estar vacío")
+        project.name = name
+
+    if payload.description is not None:
+        desc = payload.description.strip()
+        project.description = desc or None
+
+    db.commit()
+    db.refresh(project)
+    return ProjectOut.from_orm_extra(project)
+
+
 @router.delete("/{project_id}", status_code=204)
 def delete_project(project_id: str, user: CurrentUser, db: DB):
+    """Elimina el proyecto, sus jobs (cascade de SQLAlchemy) y los archivos
+    subidos en disco (XLSX ETABS, .e2k, rebar, modelo canónico, resultados)."""
     project = _get_project_or_404(db, project_id, user)
     db.delete(project)
     db.commit()
+
+    # Limpiar el directorio del proyecto en disco. No es crítico si falla;
+    # los jobs ya quedaron huérfanos en DB y no hay vuelta atrás.
+    project_dir = os.path.join(settings.upload_dir, str(project_id))
+    if os.path.isdir(project_dir):
+        shutil.rmtree(project_dir, ignore_errors=True)
 
 
 @router.put("/{project_id}/parameters", response_model=ProjectOut)

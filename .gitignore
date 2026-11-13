@@ -7,6 +7,27 @@ __pycache__/
 *.db
 *.sqlite3
 
+# Bibliotecas sísmicas — archivos pesados (~400 MB combinados).
+# Se copian al container en Docker build (COPY apps/api /app) desde el
+# directorio local. En máquina nueva: obtener de la fuente / release del repo.
+# Los CSV de metadata SÍ se trackean (livianos, documentan estructura).
+apps/api/colombia_library/**/*.AT2
+apps/api/fema_library/*.txt
+
+# Scripts de diagnóstico ad-hoc del ingeniero — no son parte del producto.
+# Si uno demuestra valor duradero, moverlo a tests o docs y trackearlo.
+apps/api/scripts/audit_short_beams.py
+apps/api/scripts/check_element_thresholds.py
+apps/api/scripts/check_npz_eds.py
+apps/api/scripts/deep_inspect_lafortuna.py
+apps/api/scripts/diagnose_prueba4*.py
+apps/api/scripts/find_prueba4*.py
+apps/api/scripts/inspect_lafortuna*.py
+apps/api/scripts/inspect_pathological_beam.py
+apps/api/scripts/inspect_prueba4*.py
+apps/api/scripts/match_prueba4*.py
+apps/api/scripts/recompute_lafortuna*.py
+
 # Claude Code harness — scheduled tasks lock (transient)
 .claude/scheduled_tasks.lock
 

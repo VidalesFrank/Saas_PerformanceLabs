@@ -7,6 +7,7 @@ import { SpectrumChart, interpolateSpectrum } from "@/components/seismic/Spectru
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/input";
+import { PageHero } from "@/components/ui/page-hero";
 import { api } from "@/lib/api";
 import type {
   EspectroMicrozonificacionResult,
@@ -320,6 +321,13 @@ export default function SeismicPage() {
   return (
     <div className="flex flex-1 flex-col">
       <AppHeader crumb="Espectros NSR-10" />
+      <PageHero
+        eyebrow="Sismología · Espectros"
+        title="Espectros de diseño NSR-10"
+        subtitle="Genera los espectros Sa, Sd y Sv por municipio y tipo de suelo, con microzonificación cuando aplica. Exportable a CSV y PDF."
+        tone="blue"
+        icon="wave"
+      />
 
       <main className="mx-auto grid w-full max-w-7xl flex-1 grid-cols-1 gap-6 px-6 py-8 lg:grid-cols-[360px_1fr]">
         {/* ── Panel izquierdo ── */}

@@ -129,6 +129,12 @@ class CreateProjectIn(BaseModel):
     initialize_document: bool = True
 
 
+class UpdateProjectIn(BaseModel):
+    """Campos editables sin afectar el modelo analítico. Ambos opcionales."""
+    name: str | None = Field(default=None, max_length=255)
+    description: str | None = None
+
+
 class MvlemBasicSetIn(BaseModel):
     fc_mpa:    float = 28.0
     fy_mpa:    float = 420.0
@@ -205,6 +211,23 @@ def create_project(body: CreateProjectIn, user: CurrentUser, db: DB):
         p.document_hash = _stable_hash(doc)
         p.status        = WallProjectStatus.ready
 
+    db.commit()
+    db.refresh(p)
+    return _project_out(p)
+
+
+@router.patch("/{project_id}")
+def update_project(project_id: str, body: UpdateProjectIn, user: CurrentUser, db: DB):
+    """Renombra o ajusta la descripción. No toca documento, jobs ni archivos."""
+    p = _get_project(project_id, user, db)
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="El nombre no puede estar vacío")
+        p.name = name
+    if body.description is not None:
+        desc = body.description.strip()
+        p.description = desc or None
     db.commit()
     db.refresh(p)
     return _project_out(p)

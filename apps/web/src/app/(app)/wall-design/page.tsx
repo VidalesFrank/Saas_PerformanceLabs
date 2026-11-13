@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { AppHeader } from "@/components/app-header";
+import { PageHero } from "@/components/ui/page-hero";
 import { useRequireAuth } from "@/lib/use-require-auth";
 import { useTheme } from "@/lib/theme";
 import { wallDesignApi } from "@/lib/wall-api";
@@ -304,31 +305,31 @@ export default function WallDesignPage() {
   }
 
   return (
-    <div className="min-h-screen bg-[var(--bg)]">
-      <AppHeader />
-
-      <main className="mx-auto max-w-7xl px-6 py-8">
-
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h1 className="text-xl font-bold text-[var(--text)]">Diseño de Muros RC</h1>
-            <p className="text-xs text-[var(--text-muted)] mt-0.5">
-              NSR-10 / ACI 318-25 — Secciones rectangulares — DMO / DES
-            </p>
-          </div>
-          {result && (
-            <div className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-semibold ${
-              result.ok
-                ? "bg-green-500/10 text-green-400"
-                : "bg-red-500/10 text-red-400"
-            }`}>
-              {result.ok
-                ? "Diseno OK"
-                : `${result.summary.failed_checks} verificaciones fallan`}
+    <div className="flex min-h-screen flex-col bg-[var(--bg)]">
+      <AppHeader crumb="Diseño de Muros RC" />
+      <PageHero
+        eyebrow="Modelación · Muros"
+        title="Diseño de Muros RC"
+        subtitle="NSR-10 / ACI 318-25 — Secciones rectangulares, DMO / DES, elemento de borde, cortante y verificación en tiempo real."
+        tone="cyan"
+        icon="wall"
+        actions={
+          result ? (
+            <div
+              className="inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs font-semibold"
+              style={{
+                background: result.ok ? "rgba(16, 185, 129, 0.14)" : "rgba(239, 68, 68, 0.14)",
+                color: result.ok ? "#10b981" : "#ef4444",
+                border: result.ok ? "1px solid rgba(16,185,129,0.3)" : "1px solid rgba(239,68,68,0.3)",
+              }}
+            >
+              {result.ok ? "Diseño OK" : `${result.summary.failed_checks} verificaciones fallan`}
             </div>
-          )}
-        </div>
+          ) : null
+        }
+      />
+
+      <main className="mx-auto w-full max-w-7xl flex-1 px-6 py-8">
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
 

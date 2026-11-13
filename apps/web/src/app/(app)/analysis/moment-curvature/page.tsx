@@ -2,6 +2,7 @@
 
 import { FormEvent, useState } from "react";
 import { AppHeader } from "@/components/app-header";
+import { PageHero } from "@/components/ui/page-hero";
 import { SectionPreview } from "@/components/section-preview";
 import { applyBarEdit, applyBarDelete, applyBarDuplicate, computeBarSizesFromForm, parsePairs } from "@/lib/section-form-adapter";
 import { Button } from "@/components/ui/button";
@@ -314,14 +315,14 @@ export default function MomentCurvaturePage() {
   return (
     <div className="flex flex-1 flex-col">
       <AppHeader crumb="Momento-Curvatura" />
+      <PageHero
+        eyebrow="Secciones · Análisis"
+        title="Curva Momento-Curvatura"
+        subtitle="Análisis de sección de fibras (Mander 1988) a carga axial constante. Fluencia por idealización bilineal igual-energía (ASCE 41)."
+        tone="emerald"
+        icon="curve"
+      />
       <main className="mx-auto w-full max-w-7xl flex-1 px-6 py-8">
-        <div className="mb-6">
-          <h1 className="text-xl font-semibold text-text">Curva Momento-Curvatura</h1>
-          <p className="mt-1 text-sm text-text-muted">
-            Análisis de sección de fibras (Mander 1988) a carga axial constante.
-            Fluencia identificada por idealización bilineal igual-energía (ASCE 41).
-          </p>
-        </div>
 
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_360px]">
 

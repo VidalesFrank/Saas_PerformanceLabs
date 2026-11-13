@@ -6,6 +6,7 @@ import Link from "next/link";
 import { AppHeader } from "@/components/app-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { EditableField } from "@/components/ui/editable-field";
 import { ValidationReport } from "@/components/linear/ValidationReport";
 import { LoadPatternSelector } from "@/components/linear/LoadPatternSelector";
 import { LinearModelViewer3D } from "@/components/linear/LinearModelViewer3D";
@@ -26,6 +27,9 @@ import WallDemandsPanel from "@/components/linear/WallDemandsPanel";
 import WallDesignPanel    from "@/components/linear/WallDesignPanel";
 import UnifiedPushoverPanel from "@/components/linear/UnifiedPushoverPanel";
 import ElementThresholdsPanel from "@/components/linear/ElementThresholdsPanel";
+import PerformanceVerifierPanel from "@/components/linear/PerformanceVerifierPanel";
+import IDAPanel from "@/components/linear/IDAPanel";
+import NLRHAPanel from "@/components/linear/NLRHAPanel";
 import NLTHPanel            from "@/components/linear/NLTHPanel";
 import ModelMaterialsPanel from "@/components/linear/ModelMaterialsPanel";
 import ModelSectionsPanel from "@/components/linear/ModelSectionsPanel";
@@ -34,6 +38,10 @@ import GridEditor from "@/components/linear/GridEditor";
 import MasonryMaterialsPanel from "@/components/linear/MasonryMaterialsPanel";
 import InfillsSplitView from "@/components/linear/InfillsSplitView";
 import { NonlinearSpecPanel } from "@/components/linear/NonlinearSpecPanel";
+import {
+  SECTION_ICON_MAP, type SectionIconId,
+  IconLock, IconChevronLeft, IconChevronRight, IconExportar,
+} from "@/components/linear/SectionIcons";
 import { ApiError } from "@/lib/api";
 import { structuralProjectsApi, structuralAnalysisApi, structuralDesignApi, structuralEditorApi } from "@/lib/structural-api";
 import { autoDesignAllWalls, designAndBuildAllWalls } from "@/lib/wall-api";
@@ -77,7 +85,10 @@ type SectionId =
   | "wall-design"
   | "pushover"
   | "nlth"
+  | "ida"
+  | "nlrha"
   | "evaluacion-elemento"
+  | "verif-desempeno"
   | "diseno"
   | "no-lineal";
 
@@ -132,7 +143,10 @@ function buildNav(hasSpectral: boolean, isValidated: boolean): NavGroup[] {
         { id: "muros",          label: "Asignar Muros (MVLEM_3D)",    locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "pushover",       label: "Pushover No Lineal",          locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "nlth",           label: "Análisis Cronológico (NLTHA)", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "ida",            label: "IDA (multi-registro FEMA)",     locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "nlrha",          label: "NLRHA (verificación NSR-10)",   locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "evaluacion-elemento", label: "Evaluación por elemento",  locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "verif-desempeno",     label: "Verificación por desempeño", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
       ],
     },
     {
@@ -197,9 +211,42 @@ export default function StructuralProjectPage() {
 
   const [project, setProject]           = useState<StructuralProject | null>(null);
   const [jobs, setJobs]                 = useState<StructuralJob[]>([]);
-  const [activeSection, setActiveSection] = useState<SectionId>("archivos");
+  const [activeSection, _setActiveSection] = useState<SectionId>("archivos");
   const [loading, setLoading]           = useState(true);
   const [error, setError]               = useState<string | null>(null);
+
+  // Sidebar collapsed (persistido global en localStorage)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  useEffect(() => {
+    try {
+      const v = localStorage.getItem("constructor-sidebar-collapsed");
+      if (v === "1") setSidebarCollapsed(true);
+    } catch { /* localStorage no disponible */ }
+  }, []);
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((v) => {
+      try { localStorage.setItem("constructor-sidebar-collapsed", v ? "0" : "1"); } catch {}
+      return !v;
+    });
+  }, []);
+
+  // Última sección activa persistida POR PROYECTO (abrir otro proyecto no
+  // contamina la vista del anterior). Se rehidrata cuando llega el params.id.
+  const projectId = params?.id;
+  const setActiveSection = useCallback((id: SectionId) => {
+    _setActiveSection(id);
+    if (projectId) {
+      try { localStorage.setItem(`project-section:${projectId}`, id); } catch {}
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId) return;
+    try {
+      const saved = localStorage.getItem(`project-section:${projectId}`);
+      if (saved) _setActiveSection(saved as SectionId);
+    } catch {}
+  }, [projectId]);
 
   // Estado de subida de archivo
   const [uploading, setUploading]       = useState(false);
@@ -617,6 +664,20 @@ export default function StructuralProjectPage() {
   const hasFile        = !!(project?.input_file_path || project?.e2k_file_path);
   const isValidated    = project?.validation_status === "ok" || project?.validation_status === "has_warnings";
   const isEditorMode   = activeSection === "vista-3d" && isValidated && !!modelGeometry;
+
+  // Si la sección persistida está bloqueada (p.ej. proyecto sin validar aún),
+  // fallback a "archivos" para no mostrar panel vacío. Se evalúa una sola vez
+  // cuando el proyecto termina de cargar.
+  useEffect(() => {
+    if (loading || !project) return;
+    const spectralOK = jobs.some((j) => j.analysis_type === "spectral" && j.status === "success");
+    const validated  = project.validation_status === "ok" || project.validation_status === "has_warnings";
+    const nav = buildNav(spectralOK, validated);
+    const current = nav.flatMap(g => g.items).find(it => it.id === activeSection);
+    if (current?.locked) {
+      _setActiveSection("archivos");
+    }
+  }, [loading, project, activeSection, jobs]);
   const hasModal       = jobs.some((j) => j.analysis_type === "modal"   && j.status === "success");
   const hasSpectral    = jobs.some((j) => j.analysis_type === "spectral" && j.status === "success");
   const hasDesign      = jobs.some((j) => j.analysis_type === "design_columns" && j.status === "success");
@@ -639,50 +700,129 @@ export default function StructuralProjectPage() {
     const vInfo = validationStatus ? VALIDATION_INFO[validationStatus] : null;
     const navGroups = buildNav(hasSpectral, isValidated);
     const activeJobs = jobs.filter((j) => j.status === "pending" || j.status === "running");
+    const collapsed  = sidebarCollapsed;
+    const initial    = (projectName ?? "P").trim().charAt(0).toUpperCase();
 
     return (
-      <aside className="w-56 flex-shrink-0 border-r border-[var(--border)] bg-[var(--surface)] flex flex-col overflow-hidden">
-        {/* Project name + validation status */}
-        <div className="px-3 pt-4 pb-3 border-b border-[var(--border)] flex-shrink-0">
-          <p className="text-xs font-semibold text-[var(--text)] truncate leading-tight">
-            {projectName ?? "Proyecto"}
-          </p>
-          {vInfo && (
-            <div className="flex items-center gap-1.5 mt-1">
-              <div
-                className="h-1.5 w-1.5 rounded-full flex-shrink-0"
-                style={{ background: vInfo.color }}
-              />
-              <span className="text-[10px]" style={{ color: vInfo.color }}>{vInfo.label}</span>
+      <aside className={[
+        "flex-shrink-0 border-r border-[var(--border)] bg-[var(--surface)]",
+        "flex flex-col overflow-hidden transition-[width] duration-200 ease-out",
+        collapsed ? "w-14" : "w-56",
+      ].join(" ")}>
+        {/* Project header — badge inicial + nombre + chip validación + toggle */}
+        <div className="px-2 pt-3 pb-3 border-b border-[var(--border)] flex-shrink-0">
+          <div className={`flex items-center gap-2 ${collapsed ? "flex-col" : ""}`}>
+            <div className="h-8 w-8 flex-shrink-0 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[color-mix(in_srgb,var(--accent)_55%,#000_45%)] text-white font-bold text-sm flex items-center justify-center shadow-sm">
+              {initial}
             </div>
-          )}
+            {!collapsed && (
+              <div className="min-w-0 flex-1">
+                <div className="text-xs font-semibold leading-tight text-[var(--text)]">
+                  {project ? (
+                    <EditableField
+                      value={project.name}
+                      as="span"
+                      ariaLabel="Renombrar proyecto"
+                      className="truncate"
+                      validate={(v) => (v.trim().length < 2 ? "Mínimo 2 caracteres" : null)}
+                      onSave={async (v) => {
+                        const updated = await structuralProjectsApi.update(project.id, { name: v });
+                        setProject(updated);
+                      }}
+                    />
+                  ) : (
+                    projectName ?? "Proyecto"
+                  )}
+                </div>
+                {vInfo && (
+                  <div className="flex items-center gap-1 mt-0.5">
+                    <span
+                      className="h-1.5 w-1.5 rounded-full flex-shrink-0"
+                      style={{ background: vInfo.color, boxShadow: `0 0 6px ${vInfo.color}` }}
+                    />
+                    <span className="text-[10px] font-medium" style={{ color: vInfo.color }}>
+                      {vInfo.label}
+                    </span>
+                  </div>
+                )}
+                {project && (
+                  <div className="mt-1 text-[10.5px] leading-snug text-[var(--text-muted)]">
+                    <EditableField
+                      value={project.description ?? ""}
+                      as="span"
+                      multiline
+                      placeholder="Añadir descripción…"
+                      ariaLabel="Editar descripción"
+                      onSave={async (v) => {
+                        const updated = await structuralProjectsApi.update(project.id, { description: v });
+                        setProject(updated);
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+            {/* Toggle colapsar — al lado del nombre (expanded) o debajo (collapsed) */}
+            <button
+              onClick={toggleSidebar}
+              title={collapsed ? "Expandir panel" : "Contraer panel"}
+              className="flex-shrink-0 h-7 w-7 rounded-md flex items-center justify-center text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)] transition-colors"
+            >
+              {collapsed
+                ? <IconChevronRight className="h-4 w-4" />
+                : <IconChevronLeft  className="h-4 w-4" />}
+            </button>
+          </div>
         </div>
 
         {/* Nav groups */}
-        <nav className="flex-1 overflow-y-auto py-1">
+        <nav className="flex-1 overflow-y-auto overflow-x-hidden py-1">
           {navGroups.map((group) => (
-            <div key={group.groupLabel}>
-              <p className="text-[10px] font-semibold uppercase tracking-widest text-[var(--text-muted)] px-3 pt-4 pb-1">
-                {group.groupLabel}
-              </p>
+            <div key={group.groupLabel} className="pt-2">
+              {!collapsed && (
+                <div className="flex items-center gap-2 px-3 pb-1 pt-1.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--text-muted)]">
+                    {group.groupLabel}
+                  </span>
+                  <span className="flex-1 h-px bg-[var(--border)]" />
+                </div>
+              )}
+              {collapsed && (
+                <div className="flex justify-center py-1.5">
+                  <span className="h-px w-6 bg-[var(--border)]" />
+                </div>
+              )}
               {group.items.map((item) => {
                 const isActive = activeSection === item.id;
                 const isLocked = item.locked;
+                const Icon = SECTION_ICON_MAP[item.id as SectionIconId] ?? IconExportar;
                 return (
                   <button
                     key={item.id}
                     onClick={() => !isLocked && setActiveSection(item.id)}
-                    title={isLocked ? item.lockReason : undefined}
+                    title={collapsed ? (isLocked ? `${item.label} — ${item.lockReason ?? ""}` : item.label)
+                                     : (isLocked ? item.lockReason : undefined)}
                     className={[
-                      "w-full text-left text-xs px-3 py-1.5 rounded-lg mx-0 transition-colors flex items-center gap-1.5",
+                      "group relative w-full flex items-center gap-2.5 text-xs transition-all duration-150",
+                      collapsed ? "justify-center px-0 py-2 mx-1 rounded-md" : "px-3 py-1.5",
                       isLocked
                         ? "opacity-40 cursor-not-allowed text-[var(--text-muted)]"
                         : isActive
-                        ? "bg-[color-mix(in_srgb,var(--accent)_15%,transparent)] text-[var(--accent)] font-medium border-l-2 border-[var(--accent)] pl-[10px]"
-                        : "text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
+                          ? "text-[var(--accent)] font-medium bg-[color-mix(in_srgb,var(--accent)_12%,transparent)]"
+                          : "text-[var(--text-muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
                     ].join(" ")}
                   >
-                    {item.label}
+                    {/* Active indicator — barra vertical con glow */}
+                    {isActive && !collapsed && (
+                      <span className="absolute left-0 top-1 bottom-1 w-[3px] rounded-r-full bg-[var(--accent)]"
+                            style={{ boxShadow: "0 0 8px var(--accent)" }} />
+                    )}
+                    {isActive && collapsed && (
+                      <span className="absolute left-0 top-1 bottom-1 w-[3px] rounded-r-full bg-[var(--accent)]" />
+                    )}
+                    <Icon className="h-4 w-4 flex-shrink-0" />
+                    {!collapsed && <span className="truncate text-left flex-1">{item.label}</span>}
+                    {!collapsed && isLocked && <IconLock className="h-3 w-3 flex-shrink-0 opacity-60" />}
                   </button>
                 );
               })}
@@ -690,17 +830,27 @@ export default function StructuralProjectPage() {
           ))}
         </nav>
 
-        {/* Active jobs indicator */}
+        {/* Active jobs indicator (pill) */}
         {activeJobs.length > 0 && (
-          <div className="border-t border-[var(--border)] py-2 flex-shrink-0">
+          <div className="border-t border-[var(--border)] px-2 py-2 flex-shrink-0 space-y-1">
             {activeJobs.map((j) => (
-              <div key={j.id} className="text-[10px] px-3 py-1 text-[var(--accent)] animate-pulse flex items-center gap-1">
-                <span>↻</span>
-                <span>{JOB_TYPE_LABEL[j.analysis_type] ?? j.analysis_type}</span>
+              <div key={j.id}
+                   title={JOB_TYPE_LABEL[j.analysis_type] ?? j.analysis_type}
+                   className={`flex items-center gap-1.5 rounded-full bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] ${collapsed ? "justify-center px-1 py-1" : "px-2 py-1"}`}>
+                <span className="relative flex h-2 w-2 flex-shrink-0">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--accent)] opacity-60" />
+                  <span className="relative inline-flex h-2 w-2 rounded-full bg-[var(--accent)]" />
+                </span>
+                {!collapsed && (
+                  <span className="text-[10px] font-medium text-[var(--accent)] truncate">
+                    {JOB_TYPE_LABEL[j.analysis_type] ?? j.analysis_type}
+                  </span>
+                )}
               </div>
             ))}
           </div>
         )}
+
       </aside>
     );
   }
@@ -2027,6 +2177,27 @@ export default function StructuralProjectPage() {
                 </p>
               </div>
               <ElementThresholdsPanel projectId={project.id} />
+            </div>
+          )}
+
+          {/* ── Verificación por desempeño (Ola 8) ──────────────────────────── */}
+          {activeSection === "verif-desempeno" && (
+            <div className="mx-auto max-w-7xl px-6 py-6">
+              <PerformanceVerifierPanel projectId={project.id} />
+            </div>
+          )}
+
+          {/* ── IDA multi-registro FEMA ───────────────────────────────────── */}
+          {activeSection === "ida" && (
+            <div className="mx-auto max-w-7xl px-6 py-6">
+              <IDAPanel projectId={project.id} />
+            </div>
+          )}
+
+          {/* ── NLRHA · Verificación NSR-10 / ASCE 7-22 Cap 16 ────────────── */}
+          {activeSection === "nlrha" && (
+            <div className="mx-auto max-w-7xl px-6 py-6">
+              <NLRHAPanel projectId={project.id} />
             </div>
           )}
 

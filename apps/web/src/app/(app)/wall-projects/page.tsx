@@ -5,7 +5,10 @@ import Link from "next/link";
 import { AppHeader } from "@/components/app-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { EditableField } from "@/components/ui/editable-field";
 import { Input, Label } from "@/components/ui/input";
+import { PageHero } from "@/components/ui/page-hero";
 import { ApiError } from "@/lib/api";
 import { wallProjectsApi } from "@/lib/wall-api";
 import type { WallProject5 } from "@/lib/wall-types";
@@ -32,6 +35,117 @@ function StatusBadge({ status }: { status: string }) {
       <span className="h-1.5 w-1.5 rounded-full" style={{ background: cfg.color }} />
       {cfg.label}
     </span>
+  );
+}
+
+function WallProjectCard({
+  project,
+  onUpdated,
+  onDeleted,
+}: {
+  project: WallProject5;
+  onUpdated: (updated: WallProject5) => void;
+  onDeleted: (id: string) => Promise<void>;
+}) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  return (
+    <Card className="group relative h-full hover:shadow-[0_8px_24px_-12px_rgba(34,211,238,0.3)] hover:border-[color-mix(in_srgb,var(--tech-cyan)_45%,var(--color-border))]">
+      <CardBody className="flex h-full flex-col gap-3 p-5">
+        <div className="flex items-start justify-between gap-2">
+          <h3 className="text-sm font-semibold leading-snug text-text line-clamp-2">
+            <EditableField
+              value={project.name}
+              as="span"
+              ariaLabel="Renombrar proyecto"
+              validate={(v) => (v.trim().length < 2 ? "Mínimo 2 caracteres" : null)}
+              onSave={async (v) => {
+                const updated = await wallProjectsApi.update(project.id, { name: v });
+                onUpdated(updated);
+              }}
+            />
+          </h3>
+          <div className="flex flex-shrink-0 items-center gap-1.5">
+            <StatusBadge status={project.status} />
+            <button
+              type="button"
+              onClick={() => setConfirmOpen(true)}
+              aria-label="Eliminar proyecto"
+              title="Eliminar proyecto"
+              className="flex h-7 w-7 items-center justify-center rounded-md text-text-muted opacity-0 transition-[opacity,color,background] group-hover:opacity-100 hover:bg-[rgba(239,68,68,0.10)] hover:text-danger focus:opacity-100"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 6h18" />
+                <path d="M19 6l-1.2 14a2 2 0 0 1-2 1.8H8.2a2 2 0 0 1-2-1.8L5 6" />
+                <path d="M10 11v6M14 11v6" />
+                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div className="text-xs leading-relaxed text-text-muted">
+          <EditableField
+            value={project.description ?? ""}
+            as="p"
+            multiline
+            placeholder="Añadir descripción…"
+            ariaLabel="Editar descripción"
+            onSave={async (v) => {
+              const updated = await wallProjectsApi.update(project.id, { description: v });
+              onUpdated(updated);
+            }}
+          />
+        </div>
+
+        <Link
+          href={`/wall-projects/${project.id}`}
+          className="mt-auto flex items-center justify-between border-t border-border pt-2.5 transition-colors hover:text-[var(--tech-cyan-strong)]"
+        >
+          <span className="text-[10px] text-text-muted">{fmtDate(project.created_at)}</span>
+          {project.latest_job && (
+            <span className="text-[10px] text-text-muted">
+              {project.latest_job.job_type} ·{" "}
+              <span style={{
+                color: project.latest_job.status === "success" ? "#22c55e"
+                     : project.latest_job.status === "failed"  ? "#ef4444"
+                     : project.latest_job.status === "running" ? "#f59e0b"
+                     : "var(--text-muted)"
+              }}>
+                {project.latest_job.status}
+              </span>
+            </span>
+          )}
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"
+            className="opacity-0 transition-opacity group-hover:opacity-100">
+            <path d="M5 12h14M13 5l7 7-7 7" />
+          </svg>
+        </Link>
+      </CardBody>
+
+      <ConfirmDialog
+        open={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        onConfirm={async () => { await onDeleted(project.id); setConfirmOpen(false); }}
+        title="¿Eliminar este proyecto de muros?"
+        description={<>Vas a eliminar <strong className="text-text">«{project.name}»</strong>. Esta acción no se puede deshacer.</>}
+        confirmLabel="Eliminar proyecto"
+        tone="danger"
+      >
+        <div className="rounded-lg border border-border bg-surface-2 px-3 py-2.5">
+          <div className="mb-1.5 text-[10.5px] font-bold uppercase tracking-wider text-text-muted">
+            Se perderá
+          </div>
+          <ul className="space-y-0.5 text-[12px] text-text">
+            <li>· Documento WRC del proyecto</li>
+            <li>· Todos los jobs de pushover y análisis asociados</li>
+            <li>· Resultados en disco (NPZ, scripts OpenSees)</li>
+          </ul>
+        </div>
+      </ConfirmDialog>
+    </Card>
   );
 }
 
@@ -69,36 +183,30 @@ export default function WallProjectsPage() {
     }
   }
 
-  async function handleDelete(id: string, e: React.MouseEvent) {
-    e.preventDefault();
-    if (!confirm("¿Eliminar este proyecto de muros?")) return;
-    try {
-      await wallProjectsApi.delete(id);
-      setProjects(prev => prev.filter(p => p.id !== id));
-    } catch {
-      setError("Error al eliminar el proyecto");
-    }
+  async function handleDelete(id: string) {
+    await wallProjectsApi.delete(id);
+    setProjects(prev => prev.filter(p => p.id !== id));
   }
 
   if (!ready) return null;
 
   return (
-    <div className="min-h-screen bg-[var(--bg)]">
-      <AppHeader />
-
-      <main className="mx-auto max-w-5xl px-6 py-10">
-        {/* Header */}
-        <div className="flex items-start justify-between mb-8">
-          <div>
-            <h1 className="text-2xl font-bold text-[var(--text)]">Muros RC 3D</h1>
-            <p className="text-sm text-[var(--text-muted)] mt-1">
-              Análisis no lineal de muros RC con E-SFI-MVLEM-3D / MVLEM_3D
-            </p>
-          </div>
+    <div className="flex min-h-screen flex-col bg-[var(--bg)]">
+      <AppHeader crumb="Muros RC 3D" />
+      <PageHero
+        eyebrow="Modelación · Muros"
+        title="Análisis de Muros RC 3D"
+        subtitle="Diseño automático y análisis no lineal con macroelementos E-SFI-MVLEM-3D / MVLEM_3D, pushover ±X/±Y y curvas de capacidad."
+        tone="cyan"
+        icon="wall"
+        actions={
           <Button onClick={() => setShowNew(v => !v)}>
             {showNew ? "Cancelar" : "+ Nuevo proyecto"}
           </Button>
-        </div>
+        }
+      />
+
+      <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-10">
 
         {/* New project form */}
         {showNew && (
@@ -147,42 +255,14 @@ export default function WallProjectsPage() {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {projects.map(p => (
-              <Link key={p.id} href={`/wall-projects/${p.id}`} className="block group">
-                <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5
-                  transition-all duration-150 hover:shadow-md hover:-translate-y-0.5
-                  group-hover:border-[var(--text-muted)]">
-                  <div className="flex items-start justify-between mb-3">
-                    <span className="text-sm font-semibold text-[var(--text)] line-clamp-1">{p.name}</span>
-                    <button
-                      onClick={e => handleDelete(p.id, e)}
-                      className="ml-2 shrink-0 text-[var(--text-muted)] hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity text-xs"
-                    >✕</button>
-                  </div>
-
-                  {p.description && (
-                    <p className="text-xs text-[var(--text-muted)] mb-3 line-clamp-2">{p.description}</p>
-                  )}
-
-                  <div className="flex items-center justify-between">
-                    <StatusBadge status={p.status} />
-                    <span className="text-[10px] text-[var(--text-muted)]">{fmtDate(p.created_at)}</span>
-                  </div>
-
-                  {p.latest_job && (
-                    <div className="mt-2 pt-2 border-t border-[var(--border)]">
-                      <span className="text-[10px] text-[var(--text-muted)]">
-                        Último análisis: {p.latest_job.job_type} —{" "}
-                        <span style={{
-                          color: p.latest_job.status === "success" ? "#22c55e"
-                               : p.latest_job.status === "failed"  ? "#ef4444"
-                               : p.latest_job.status === "running" ? "#f59e0b"
-                               : "var(--text-muted)"
-                        }}>{p.latest_job.status}</span>
-                      </span>
-                    </div>
-                  )}
-                </div>
-              </Link>
+              <WallProjectCard
+                key={p.id}
+                project={p}
+                onUpdated={(upd) =>
+                  setProjects(prev => prev.map(x => x.id === upd.id ? upd : x))
+                }
+                onDeleted={handleDelete}
+              />
             ))}
           </div>
         )}

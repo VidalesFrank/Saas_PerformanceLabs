@@ -6,7 +6,10 @@ import { useRouter } from "next/navigation";
 import { AppHeader } from "@/components/app-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { EditableField } from "@/components/ui/editable-field";
 import { Input, Label } from "@/components/ui/input";
+import { PageHero } from "@/components/ui/page-hero";
 import { ApiError } from "@/lib/api";
 import { structuralProjectsApi } from "@/lib/structural-api";
 import type { StructuralProject, ValidationStatus } from "@/lib/structural-types";
@@ -31,6 +34,164 @@ const VALIDATION_COLOR: Record<ValidationStatus, string> = {
   has_warnings: "var(--color-warning)",
   ok:           "var(--color-success)",
 };
+
+/**
+ * Tarjeta de un proyecto en la lista. Toda la card navega al detalle,
+ * EXCEPTO cuando el nombre o la descripción están en edición (inline). Para
+ * evitar que el click del input dispare la navegación del Link exterior, el
+ * nombre vive fuera del <Link> y la fila meta/fecha hace la navegación.
+ */
+function ProjectCard({
+  project,
+  onUpdated,
+  onDeleted,
+}: {
+  project: StructuralProject;
+  onUpdated: (updated: StructuralProject) => void;
+  onDeleted: (id: string) => void;
+}) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  async function handleDelete() {
+    await structuralProjectsApi.delete(project.id);
+    onDeleted(project.id);
+    setConfirmOpen(false);
+  }
+
+  const hasModel = Boolean(project.input_file_path || project.e2k_file_path);
+  const hasParams = Boolean(project.parameters_json);
+  const hasValidated = Boolean(project.canonical_model_path);
+
+  return (
+    <Card className="group relative h-full hover:shadow-[0_8px_24px_-12px_rgba(34,211,238,0.3)] hover:border-[color-mix(in_srgb,var(--tech-cyan)_45%,var(--color-border))]">
+      <CardBody className="flex h-full flex-col gap-3 p-5">
+
+        {/* Header: nombre editable + status + delete */}
+        <div className="flex items-start justify-between gap-2">
+          <h3 className="text-sm font-semibold leading-snug text-text line-clamp-2">
+            <EditableField
+              value={project.name}
+              as="span"
+              ariaLabel="Renombrar proyecto"
+              validate={(v) => (v.trim().length < 2 ? "Mínimo 2 caracteres" : null)}
+              onSave={async (v) => {
+                const updated = await structuralProjectsApi.update(project.id, { name: v });
+                onUpdated(updated);
+              }}
+            />
+          </h3>
+          <div className="flex flex-shrink-0 items-center gap-1.5">
+            <ProjectStatus project={project} />
+            <button
+              type="button"
+              onClick={() => setConfirmOpen(true)}
+              aria-label="Eliminar proyecto"
+              title="Eliminar proyecto"
+              className="flex h-7 w-7 items-center justify-center rounded-md text-text-muted opacity-0 transition-[opacity,color,background] group-hover:opacity-100 hover:bg-[rgba(239,68,68,0.10)] hover:text-danger focus:opacity-100 focus:outline-none focus:ring-2 focus:ring-[rgba(239,68,68,0.4)]"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 6h18" />
+                <path d="M19 6l-1.2 14a2 2 0 0 1-2 1.8H8.2a2 2 0 0 1-2-1.8L5 6" />
+                <path d="M10 11v6M14 11v6" />
+                <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Descripción editable */}
+        <div className="text-xs leading-relaxed text-text-muted">
+          <EditableField
+            value={project.description ?? ""}
+            as="p"
+            multiline
+            placeholder="Añadir descripción…"
+            ariaLabel="Editar descripción"
+            onSave={async (v) => {
+              const updated = await structuralProjectsApi.update(project.id, { description: v });
+              onUpdated(updated);
+            }}
+          />
+        </div>
+
+        {/* Parámetros */}
+        {project.parameters_json && (
+          <div className="flex flex-wrap gap-1.5">
+            {[
+              project.parameters_json.city,
+              `Suelo ${project.parameters_json.soil_type}`,
+              project.parameters_json.structure_system,
+              project.parameters_json.code,
+            ].filter(Boolean).map((tag) => (
+              <span
+                key={String(tag)}
+                className="rounded-full px-2 py-0.5 text-[10px] font-semibold"
+                style={{
+                  background: "color-mix(in srgb, var(--tech-cyan) 10%, transparent)",
+                  color: "var(--tech-cyan-strong)",
+                  border: "1px solid color-mix(in srgb, var(--tech-cyan) 25%, transparent)",
+                }}
+              >
+                {String(tag)}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Footer: link al detalle */}
+        <Link
+          href={`/projects/${project.id}`}
+          className="mt-auto flex items-center justify-between border-t border-border pt-2.5 transition-colors hover:text-[var(--tech-cyan-strong)]"
+        >
+          <div className="flex gap-3 text-[11px] text-text-muted">
+            {project.input_file_path || project.e2k_file_path
+              ? <span className="text-success">✓ Modelo</span>
+              : <span>Sin modelo</span>}
+            {project.parameters_json
+              ? <span className="text-success">✓ Parámetros</span>
+              : <span>Sin parámetros</span>}
+            {project.canonical_model_path
+              ? <span className="text-success">✓ Validado</span>
+              : null}
+          </div>
+          <span className="inline-flex items-center gap-1 text-[10px] text-text-muted group-hover:text-[var(--tech-cyan-strong)]">
+            {formatDate(project.updated_at)}
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 12h14M13 5l7 7-7 7" />
+            </svg>
+          </span>
+        </Link>
+
+      </CardBody>
+
+      <ConfirmDialog
+        open={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        onConfirm={handleDelete}
+        title="¿Eliminar este proyecto?"
+        description={<>Vas a eliminar <strong className="text-text">«{project.name}»</strong>. Esta acción no se puede deshacer.</>}
+        confirmLabel="Eliminar proyecto"
+        tone="danger"
+      >
+        {(hasModel || hasParams || hasValidated) && (
+          <div className="rounded-lg border border-border bg-surface-2 px-3 py-2.5">
+            <div className="mb-1.5 text-[10.5px] font-bold uppercase tracking-wider text-text-muted">
+              Se perderá
+            </div>
+            <ul className="space-y-0.5 text-[12px] text-text">
+              {hasModel      && <li>· Modelo subido (ETABS XLSX / .e2k) y refuerzo</li>}
+              {hasParams     && <li>· Parámetros sísmicos NSR-10 configurados</li>}
+              {hasValidated  && <li>· Modelo canónico validado y análisis ejecutados</li>}
+              <li>· Todos los jobs y resultados asociados</li>
+            </ul>
+          </div>
+        )}
+      </ConfirmDialog>
+    </Card>
+  );
+}
 
 function ProjectStatus({ project }: { project: StructuralProject }) {
   const hasFile = project.input_file_path || project.e2k_file_path;
@@ -115,17 +276,14 @@ export default function StructuralProjectsPage() {
   return (
     <div className="flex flex-1 flex-col">
       <AppHeader crumb="Constructor de Modelos" />
-      <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-10">
-
-        {/* Cabecera */}
-        <div className="mb-8 flex items-start justify-between">
-          <div>
-            <h1 className="text-xl font-semibold text-text">Constructor de Modelos Estructurales</h1>
-            <p className="mt-1 text-sm text-text-muted">
-              Importa tu modelo de ETABS y ejecuta análisis sísmico modal espectral con ajuste FHE NSR-10.
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
+      <PageHero
+        eyebrow="Modelación · Constructor"
+        title="Constructor de Modelos Estructurales"
+        subtitle="Importa tu modelo de ETABS (XLSX o .e2k), genera el modelo OpenSees y ejecuta análisis modal espectral con ajuste FHE NSR-10."
+        tone="cyan"
+        icon="building"
+        actions={
+          <>
             <input
               ref={importRef}
               type="file"
@@ -138,16 +296,19 @@ export default function StructuralProjectsPage() {
               }}
             />
             <Button
-              variant="ghost"
+              variant="secondary"
               onClick={() => importRef.current?.click()}
               disabled={importing}
               title="Importar un modelo .plabs.json exportado desde otra cuenta"
             >
-              {importing ? "Importando…" : "⬆ Importar modelo"}
+              {importing ? "Importando…" : "↑ Importar modelo"}
             </Button>
             <Button onClick={() => setShowNew(true)}>+ Nuevo proyecto</Button>
-          </div>
-        </div>
+          </>
+        }
+      />
+
+      <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-10">
 
         {/* Formulario nuevo proyecto */}
         {showNew && (
@@ -206,57 +367,16 @@ export default function StructuralProjectsPage() {
         ) : (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {projects.map((p) => (
-              <Link key={p.id} href={`/projects/${p.id}`} className="group block">
-                <Card className="h-full transition-shadow group-hover:shadow-md">
-                  <CardBody className="flex flex-col gap-3 p-5">
-
-                    <div className="flex items-start justify-between gap-2">
-                      <h3 className="text-sm font-semibold text-text leading-snug line-clamp-2 group-hover:text-accent transition-colors">
-                        {p.name}
-                      </h3>
-                      <ProjectStatus project={p} />
-                    </div>
-
-                    {p.description && (
-                      <p className="text-xs text-text-muted line-clamp-2">{p.description}</p>
-                    )}
-
-                    {p.parameters_json && (
-                      <div className="flex flex-wrap gap-2">
-                        {[
-                          p.parameters_json.city,
-                          `Suelo ${p.parameters_json.soil_type}`,
-                          p.parameters_json.structure_system,
-                          p.parameters_json.code,
-                        ].filter(Boolean).map((tag) => (
-                          <span
-                            key={tag}
-                            className="rounded-full px-2 py-0.5 text-[10px] font-medium"
-                            style={{ background: "var(--color-accent)15", color: "var(--color-accent)" }}
-                          >
-                            {tag}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-
-                    <div className="mt-auto flex items-center justify-between pt-2 border-t border-border">
-                      <div className="flex gap-3 text-[11px] text-text-muted">
-                        {p.input_file_path || p.e2k_file_path
-                          ? <span className="text-success">✓ Modelo</span>
-                          : <span>Sin modelo</span>}
-                        {p.parameters_json
-                          ? <span className="text-success">✓ Parámetros</span>
-                          : <span>Sin parámetros</span>}
-                        {p.canonical_model_path
-                          ? <span className="text-success">✓ Validado</span>
-                          : null}
-                      </div>
-                      <span className="text-[10px] text-text-muted">{formatDate(p.updated_at)}</span>
-                    </div>
-                  </CardBody>
-                </Card>
-              </Link>
+              <ProjectCard
+                key={p.id}
+                project={p}
+                onUpdated={(upd) =>
+                  setProjects((prev) => prev.map((x) => (x.id === upd.id ? upd : x)))
+                }
+                onDeleted={(id) =>
+                  setProjects((prev) => prev.filter((x) => x.id !== id))
+                }
+              />
             ))}
           </div>
         )}

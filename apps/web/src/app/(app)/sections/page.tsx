@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { AppHeader } from "@/components/app-header";
 import { Button } from "@/components/ui/button";
+import { PageHero } from "@/components/ui/page-hero";
 import { ApiError } from "@/lib/api";
 import { sectionEditorApi } from "@/lib/editor-api";
 import type { SectionSummary } from "@/lib/section-document";
@@ -102,27 +103,25 @@ export default function SectionsPage() {
 
   return (
     <div className="flex min-h-screen flex-col bg-bg">
-      <AppHeader />
-      <main className="flex-1 p-6">
-        {/* Header */}
-        <div className="mb-5 flex items-center justify-between">
-          <div>
-            <h1 className="text-xl font-bold text-text">Biblioteca de Secciones</h1>
-            <p className="text-sm text-text-muted">
-              Diseña secciones transversales y ejecuta análisis P-M, M-φ y P-M-M.
-            </p>
-          </div>
-          <div className="flex gap-2">
+      <AppHeader crumb="Biblioteca de Secciones" />
+      <PageHero
+        eyebrow="Secciones · Editor"
+        title="Biblioteca de Secciones"
+        subtitle="Diseña secciones transversales de columnas, vigas, muros y pilas. Ejecuta análisis P-M, M-φ y P-M-M con confinamiento Mander."
+        tone="emerald"
+        icon="section"
+        actions={
+          <>
             <Link href="/sections/design">
-              <Button variant="secondary" className="whitespace-nowrap">
-                ⚙ Diseño paramétrico
-              </Button>
+              <Button variant="secondary">Diseño paramétrico</Button>
             </Link>
             <Button onClick={() => setShowTemplates(true)} disabled={creating}>
               {creating ? "Creando…" : "+ Nueva sección"}
             </Button>
-          </div>
-        </div>
+          </>
+        }
+      />
+      <main className="flex-1 p-6">
 
         {/* Barra de búsqueda */}
         {sections.length > 0 && (

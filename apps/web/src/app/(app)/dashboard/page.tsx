@@ -1,66 +1,306 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
-import { AppHeader } from "@/components/app-header";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
+import { clearToken } from "@/lib/auth";
+import { HeroShowcase3D } from "@/components/dashboard/HeroShowcase3D";
+import { ThemeToggle } from "@/components/ui/theme-toggle";
+import { Icon, ModuleIcon, moduleVisual } from "@/lib/module-visuals";
 import type { CatalogModule, CatalogProduct, User } from "@/lib/types";
-import { useRequireAuth } from "@/lib/use-require-auth";
-import { Icon, moduleStats, moduleVisual } from "@/lib/module-visuals";
 
-const PLAN_CFG: Record<string, { label: string; color: string; bg: string }> = {
-  free:    { label: "Free",    color: "#0e7fa8", bg: "#0e7fa812" },
-  pro:     { label: "Pro",     color: "#087f5b", bg: "#087f5b12" },
-  premium: { label: "Premium", color: "#7c3aed", bg: "#7c3aed12" },
+/* ──────────────────────────────────────────────────────────────────────────
+   Dashboard — hero dark + grupos de flujo + roadmap colapsable.
+   ────────────────────────────────────────────────────────────────────────── */
+
+const PLAN_CFG: Record<string, { label: string; dot: string; text: string }> = {
+  free:    { label: "Free",    dot: "#38bdf8", text: "#7dd3fc" },
+  pro:     { label: "Pro",     dot: "#34d399", text: "#6ee7b7" },
+  premium: { label: "Premium", dot: "#c084fc", text: "#d8b4fe" },
 };
 
-// ── Skeleton shimmer ──────────────────────────────────────────────────────────
+const ESTADO_LABEL: Record<string, string> = {
+  listo: "Disponible",
+  en_desarrollo: "En desarrollo",
+  idea: "Planificado",
+};
+
+const NIVEL_LABEL: Record<string, string> = {
+  free: "Free",
+  pro: "Pro",
+  premium: "Premium",
+};
+
+// ── Skeleton shimmer ─────────────────────────────────────────────────────────
+
 function Sk({ w, h, className = "" }: { w?: number | string; h?: number; className?: string }) {
+  return <div className={`pl-skeleton ${className}`} style={{ width: w ?? "100%", height: h ?? 14 }} />;
+}
+
+// ── Chips de meta (normativas / tecnologías) ─────────────────────────────────
+
+function MetaChip({ label, icon }: { label: string; icon: React.ReactNode }) {
   return (
-    <div className={`pl-skeleton ${className}`} style={{ width: w ?? "100%", height: h ?? 14 }} />
+    <span className="pl-hero-chip">
+      <span className="pl-hero-chip-icon">{icon}</span>
+      {label}
+    </span>
   );
 }
 
-// ── Hero section (compacta) ───────────────────────────────────────────────────
-function Hero({ user, modules }: { user: User | null; modules: CatalogModule[] | null }) {
+// ── Atajo premium (3 tarjetas grandes bajo CTA) ──────────────────────────────
+
+function ShortcutCard({
+  product,
+  grad,
+  accent,
+}: {
+  product: CatalogProduct;
+  grad: string;
+  accent: string;
+}) {
+  if (!product.route) return null;
+  return (
+    <Link
+      href={product.route}
+      className="pl-shortcut-card"
+      style={{ "--_accent-grad": grad } as React.CSSProperties}
+    >
+      <div className="flex items-start justify-between">
+        <div className="pl-shortcut-icon" style={{ background: grad, boxShadow: `0 6px 18px -6px ${accent}66` }}>
+          <Icon id={product.id} color="#050b18" size={22} strokeWidth={2} />
+        </div>
+        <span
+          className="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
+          style={{
+            background: "rgba(34,211,238,0.10)",
+            color: "#67e8f9",
+            border: "1px solid rgba(34,211,238,0.28)",
+          }}
+        >
+          Abrir →
+        </span>
+      </div>
+      <div>
+        <div className="text-[14.5px] font-semibold text-slate-100">{product.name}</div>
+        {product.subtitle && (
+          <div className="mt-1 line-clamp-2 text-[11.5px] leading-snug text-slate-400">
+            {product.subtitle}
+          </div>
+        )}
+      </div>
+    </Link>
+  );
+}
+
+// ── Hero oscuro ──────────────────────────────────────────────────────────────
+
+function Hero({
+  user,
+  modules,
+  onLogout,
+}: {
+  user: User | null;
+  modules: CatalogModule[] | null;
+  onLogout: () => void;
+}) {
   const plan    = user?.plan ?? "free";
   const planCfg = PLAN_CFG[plan] ?? PLAN_CFG.free;
   const first   = user?.full_name?.split(" ")[0];
 
-  const all      = modules?.flatMap(m => m.products) ?? [];
-  const active   = all.filter(p => p.route).length;
-  const inDev    = all.filter(p => p.estado === "en_desarrollo").length;
-  const nModules = modules?.length ?? 0;
+  // Atajos destacados: productos con `featured: true` en catalog.py
+  const featured = useMemo(() => {
+    if (!modules) return [];
+    const list: Array<{ product: CatalogProduct; grad: string; accent: string }> = [];
+    for (const mod of modules) {
+      const visual = moduleVisual(mod.id);
+      for (const p of mod.products) {
+        if (p.featured && p.route) {
+          list.push({ product: p, grad: visual.gradient, accent: visual.accent });
+        }
+      }
+    }
+    return list.slice(0, 3);
+  }, [modules]);
+
+  // Links directos a módulos destacados (CTA principal + secundaria)
+  const constructor = featured.find((f) => f.product.id === "constructor-modelos") ?? featured[0];
+  const spectrum    = featured.find((f) => f.product.id === "espectros-nsr10") ?? featured[1];
 
   return (
-    <div className="mb-5 flex flex-wrap items-center justify-between gap-4 rounded-xl border border-border bg-surface px-6 py-4 animate-[pl-fade-up_0.4s_ease-out_both]">
-      <div>
-        <div className="mb-1 text-[10.5px] font-bold uppercase tracking-[.1em] text-text-muted">Bienvenido</div>
-        <div className="flex items-center gap-2.5">
-          {user
-            ? <h1 className="text-[19px] font-semibold text-text">{first ?? "Frank"}</h1>
-            : <Sk w={140} h={22} />
-          }
-          {user ? (
-            <span
-              className="inline-flex items-center gap-1.5 rounded-full border px-3 py-1"
-              style={{ borderColor: `${planCfg.color}40`, background: planCfg.bg }}
-            >
-              <span className="h-1.5 w-1.5 rounded-full" style={{ background: planCfg.color }} />
-              <span className="text-[11px] font-bold" style={{ color: planCfg.color }}>{planCfg.label}</span>
-            </span>
-          ) : <Sk w={60} h={22} />}
+    <section className="pl-hero-dark">
+      {/* Controles superiores (theme + logout) flotando sobre el hero */}
+      <div className="absolute right-6 top-5 z-10 flex items-center gap-2">
+        <ThemeToggle />
+        <button
+          type="button"
+          onClick={onLogout}
+          className="rounded-lg border px-3 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:bg-white/5"
+          style={{ borderColor: "rgba(148, 163, 184, 0.25)" }}
+        >
+          Cerrar sesión
+        </button>
+      </div>
+
+      <div className="mx-auto grid max-w-7xl grid-cols-1 gap-8 px-8 pb-12 pt-14 lg:grid-cols-[1.1fr_1fr] lg:gap-10 lg:pt-16">
+        {/* ── Columna izquierda: pill + headline + subtexto + CTAs + chips ─── */}
+        <div className="flex flex-col justify-center" style={{ animation: "pl-fade-up 0.5s ease-out both" }}>
+          <div className="pl-hero-pill mb-5">
+            <span className="pl-hero-pill-dot" />
+            PerformanceLabs
+            {user && (
+              <>
+                <span className="opacity-40">·</span>
+                <span style={{ color: planCfg.text }}>{planCfg.label}</span>
+              </>
+            )}
+          </div>
+
+          <h1 className="pl-hero-headline text-[38px] md:text-[48px] lg:text-[52px]">
+            Ingeniería estructural
+            <br />
+            <span className="pl-hero-gradient-text">de alto desempeño.</span>
+          </h1>
+
+          <p className="mt-5 max-w-xl text-[14.5px] leading-relaxed text-slate-300/90">
+            {first ? `Bienvenido, ${first}. ` : ""}
+            Plataforma OpenSees para análisis no lineal 3D, evaluación sísmica
+            avanzada y toma de decisiones basadas en desempeño. NSR-10, ASCE 41 y FEMA integrados.
+          </p>
+
+          {/* CTAs */}
+          <div className="mt-7 flex flex-wrap items-center gap-3">
+            {constructor?.product.route && (
+              <Link href={constructor.product.route} className="pl-cta-primary">
+                Abrir {constructor.product.name}
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}
+                  strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M5 12h14M13 5l7 7-7 7" />
+                </svg>
+              </Link>
+            )}
+            {spectrum?.product.route && (
+              <Link href={spectrum.product.route} className="pl-cta-ghost">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+                  strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M2 12C4 8 6 8 8 12s4 8 6 4 4-8 6-4" />
+                </svg>
+                {spectrum.product.name}
+              </Link>
+            )}
+          </div>
+
+          {/* Chips de meta */}
+          <div className="mt-6 flex flex-wrap items-center gap-5">
+            <MetaChip
+              label="OpenSees · OpenSeesPy"
+              icon={
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+                  strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
+                </svg>
+              }
+            />
+            <MetaChip
+              label="NSR-10 · ASCE 41 · FEMA"
+              icon={
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+                  strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M9 12l2 2 4-4M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              }
+            />
+            <MetaChip
+              label="Análisis no lineal 3D"
+              icon={
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+                  strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 21h18M3 7l9-4 9 4M4 21V7M20 21V7M9 21v-4h6v4" />
+                </svg>
+              }
+            />
+          </div>
+        </div>
+
+        {/* ── Columna derecha: wireframe 3D vivo ─────────────────────────── */}
+        <div
+          className="relative flex items-center justify-center"
+          style={{ animation: "pl-fade-up 0.6s 0.1s ease-out both" }}
+        >
+          <div className="w-full">
+            {modules ? (
+              <HeroShowcase3D height={440} />
+            ) : (
+              <div
+                className="w-full rounded-xl"
+                style={{ height: 440, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(148,163,184,0.1)" }}
+              />
+            )}
+          </div>
         </div>
       </div>
 
-      <div className="flex gap-2.5">
-        {([[nModules, "Módulos"], [active, "Herramientas activas"], [inDev, "En desarrollo"]] as [number, string][]).map(([val, label]) => (
-          <div key={label} className="min-w-[88px] rounded-lg bg-surface-2 px-4 py-2 text-center">
-            {modules
-              ? <div className="font-mono text-lg font-bold text-text">{val}</div>
-              : <Sk w={30} h={20} className="mx-auto mb-1" />
-            }
-            <div className="mt-0.5 text-[10px] text-text-muted">{label}</div>
+      {/* ── Atajos premium (3 cards bajo el hero) ─────────────────────────── */}
+      <div className="mx-auto max-w-7xl px-8 pb-10">
+        <div className="mb-3 flex items-end justify-between">
+          <div>
+            <div className="text-[10.5px] font-bold uppercase tracking-[.14em] text-cyan-400/80">Atajos</div>
+            <div className="text-[13.5px] text-slate-400">Las herramientas que más usas</div>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+          {modules === null ? (
+            <>
+              <Sk h={134} />
+              <Sk h={134} />
+              <Sk h={134} />
+            </>
+          ) : (
+            featured.map(({ product, grad, accent }) => (
+              <ShortcutCard key={product.id} product={product} grad={grad} accent={accent} />
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* ── Banda de stats ────────────────────────────────────────────────── */}
+      <StatsBand modules={modules} />
+    </section>
+  );
+}
+
+// ── Banda de stats (parte inferior del hero) ─────────────────────────────────
+
+function StatsBand({ modules }: { modules: CatalogModule[] | null }) {
+  const all     = modules?.flatMap((m) => m.products) ?? [];
+  const active  = all.filter((p) => p.route).length;
+  const mods    = modules?.filter((m) => m.id !== "roadmap").length ?? 0;
+  const inDev   = all.filter((p) => p.estado === "en_desarrollo").length;
+
+  const items: [string, string, React.ReactNode][] = [
+    [String(mods), "Flujos activos",
+      <svg key="m" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+        strokeLinecap="round" strokeLinejoin="round"><path d="M3 12h18M3 6h18M3 18h18" /></svg>],
+    [String(active), "Herramientas disponibles",
+      <svg key="a" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+        strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>],
+    [String(inDev), "En desarrollo",
+      <svg key="d" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+        strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>],
+    ["356", "Tests automatizados",
+      <svg key="t" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+        strokeLinecap="round" strokeLinejoin="round"><path d="M9 11H3V3h6zM21 21h-6v-8h6zM15 11h6V3h-6zM3 21h6v-8H3z" /></svg>],
+  ];
+
+  return (
+    <div className="border-t border-white/5 px-8 py-5" style={{ background: "rgba(5, 11, 24, 0.5)" }}>
+      <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-center gap-3 md:justify-between">
+        {items.map(([val, label, icon]) => (
+          <div key={label} className="pl-stat-chip">
+            <span style={{ color: "#67e8f9" }}>{icon}</span>
+            {modules ? <span className="pl-stat-chip-num">{val}</span> : <Sk w={28} h={18} />}
+            <span>{label}</span>
           </div>
         ))}
       </div>
@@ -68,196 +308,217 @@ function Hero({ user, modules }: { user: User | null; modules: CatalogModule[] |
   );
 }
 
-// ── Filtro / búsqueda ─────────────────────────────────────────────────────────
-type FilterMode = "disponibles" | "en_desarrollo" | "roadmap";
+// ── Tabs de flujo ────────────────────────────────────────────────────────────
 
-const FILTER_LABEL: Record<FilterMode, string> = {
-  disponibles: "Disponibles",
-  en_desarrollo: "En desarrollo",
-  roadmap: "Roadmap completo",
-};
-
-function FilterBar({
-  mode, onModeChange, search, onSearchChange,
+function GroupTabs({
+  modules,
+  active,
+  onChange,
 }: {
-  mode: FilterMode; onModeChange: (m: FilterMode) => void;
-  search: string; onSearchChange: (s: string) => void;
+  modules: CatalogModule[];
+  active: string;
+  onChange: (id: string) => void;
 }) {
+  const nonRoadmap = modules.filter((m) => m.id !== "roadmap");
   return (
-    <div className="mb-4 flex flex-wrap items-center justify-between gap-4">
-      <div className="flex gap-0.5 rounded-lg bg-surface-2 p-1">
-        {(Object.keys(FILTER_LABEL) as FilterMode[]).map((m) => (
-          <button
-            key={m}
-            type="button"
-            onClick={() => onModeChange(m)}
-            className="rounded-md px-4 py-1.5 text-[12.5px] font-medium transition-colors"
-            style={mode === m
-              ? { background: "var(--color-surface)", color: "var(--color-text)", boxShadow: "0 1px 3px rgba(0,0,0,.08)", fontWeight: 600 }
-              : { color: "var(--color-text-muted)" }}
-          >
-            {FILTER_LABEL[m]}
-          </button>
-        ))}
-      </div>
-      <div className="relative w-[260px]">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)" strokeWidth={2}
-          strokeLinecap="round" strokeLinejoin="round" className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2">
-          <circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" />
+    <div className="flex flex-wrap items-center gap-1.5">
+      <button
+        type="button"
+        onClick={() => onChange("all")}
+        className="pl-group-tab"
+        data-active={active === "all"}
+        style={{ "--_tab-grad": "linear-gradient(135deg, #22d3ee, #6366f1)" } as React.CSSProperties}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+          strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" />
+          <rect x="14" y="14" width="7" height="7" /><rect x="3" y="14" width="7" height="7" />
         </svg>
-        <input
-          value={search}
-          onChange={(e) => onSearchChange(e.target.value)}
-          placeholder="Buscar módulo o herramienta…"
-          className="w-full rounded-md border border-border bg-surface-2 py-2 pl-9 pr-3 text-[12.5px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
-        />
-      </div>
+        Todos los flujos
+      </button>
+      {nonRoadmap.map((mod) => {
+        const visual = moduleVisual(mod.id);
+        return (
+          <button
+            key={mod.id}
+            type="button"
+            onClick={() => onChange(mod.id)}
+            className="pl-group-tab"
+            data-active={active === mod.id}
+            style={{ "--_tab-grad": visual.gradient } as React.CSSProperties}
+          >
+            <ModuleIcon type={visual.icon} color="currentColor" size={14} strokeWidth={2} />
+            {mod.name}
+          </button>
+        );
+      })}
     </div>
   );
 }
 
-// ── Tarjeta de producto ───────────────────────────────────────────────────────
-const ESTADO_LABEL: Record<string, string> = {
-  listo: "Disponible", en_desarrollo: "En desarrollo", idea: "Planificado",
-};
-const ESTADO_COLOR: Record<string, string> = {
-  listo: "#087f5b", en_desarrollo: "#b45309", idea: "#6b7280",
-};
-const NIVEL_LABEL: Record<string, string> = {
-  free: "Free", pro: "Pro", premium: "Premium",
-};
+// ── Tarjeta de herramienta (grid de secciones) ───────────────────────────────
 
-function ProductCard({ product, color, delay }: { product: CatalogProduct; color: string; delay: number }) {
-  const [hov, setHov] = useState(false);
+function ToolCard({
+  product,
+  accent,
+  delay,
+}: {
+  product: CatalogProduct;
+  accent: string;
+  delay: number;
+}) {
   const active = !!product.route;
 
-  const card = (
+  const body = (
     <div
-      onMouseEnter={() => active && setHov(true)}
-      onMouseLeave={() => setHov(false)}
+      className="pl-tool-card"
+      data-active={active}
       style={{
-        animation: `pl-fade-up 0.35s ease-out ${delay}ms both`,
-        borderRadius: 12,
-        padding: "20px 20px 16px",
-        display: "flex", flexDirection: "column", gap: 12,
-        height: "100%",
-        cursor: active ? "pointer" : "default",
-        transition: "transform 0.18s ease, box-shadow 0.18s ease",
-        ...(active ? {
-          background: "var(--color-surface)",
-          borderTop:    "1px solid var(--color-border)",
-          borderRight:  "1px solid var(--color-border)",
-          borderBottom: "1px solid var(--color-border)",
-          borderLeft:   `3px solid ${color}`,
-          boxShadow: hov ? `0 8px 24px ${color}1a, 0 2px 8px rgba(0,0,0,.06)` : "0 1px 4px rgba(0,0,0,.04)",
-          transform: hov ? "translateY(-3px)" : "translateY(0)",
-        } : {
-          background: "var(--color-surface)",
-          border: "1px dashed var(--color-border)",
-          opacity: 0.55,
-        }),
-      }}
+        "--_card-accent": accent,
+        animation: `pl-fade-up 0.4s ${delay}ms ease-out both`,
+      } as React.CSSProperties}
     >
-      <Icon id={product.id} color={active ? color : "var(--color-text-muted)"} size={22} />
-
-      <div style={{ fontSize: 13.5, fontWeight: 600, lineHeight: 1.45, color: "var(--color-text)", flex: 1 }}>
-        {product.name}
+      <div className="flex items-start justify-between">
+        <div className="pl-tool-card-icon">
+          <Icon id={product.id} color={active ? accent : "var(--color-text-muted)"} size={20} strokeWidth={2} />
+        </div>
+        {active && (
+          <svg
+            width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={accent} strokeWidth={2}
+            strokeLinecap="round" strokeLinejoin="round"
+          >
+            <path d="M5 12h14M13 5l7 7-7 7" />
+          </svg>
+        )}
       </div>
 
-      <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+      <div className="flex-1">
+        <div className="text-[14px] font-semibold leading-tight text-text">{product.name}</div>
+        {product.subtitle && (
+          <div className="mt-1.5 text-[11.5px] leading-relaxed text-text-muted">{product.subtitle}</div>
+        )}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-1.5">
         {product.nivel && (
-          <span style={{
-            fontSize:10, fontWeight:700, padding:"2px 8px", borderRadius:50,
-            letterSpacing:".05em",
-            background: active ? `${color}14` : "var(--color-surface-2)",
-            color:      active ? color : "var(--color-text-muted)",
-            border:     `1px solid ${active ? color + "35" : "var(--color-border)"}`,
-          }}>
+          <span
+            className="rounded-full border px-2 py-0.5 text-[9.5px] font-bold uppercase tracking-wider"
+            style={{
+              background: active ? `color-mix(in srgb, ${accent} 12%, transparent)` : "var(--color-surface-2)",
+              color: active ? accent : "var(--color-text-muted)",
+              borderColor: active ? `color-mix(in srgb, ${accent} 35%, transparent)` : "var(--color-border)",
+            }}
+          >
             {NIVEL_LABEL[product.nivel] ?? product.nivel}
           </span>
         )}
-        <span style={{
-          fontSize:10, fontWeight:600, padding:"2px 8px", borderRadius:50,
-          background: `${ESTADO_COLOR[product.estado] ?? "#6b7280"}14`,
-          color:      ESTADO_COLOR[product.estado] ?? "#6b7280",
-          border:     `1px solid ${(ESTADO_COLOR[product.estado] ?? "#6b7280") + "30"}`,
-        }}>
+        <span
+          className="rounded-full border px-2 py-0.5 text-[9.5px] font-semibold"
+          style={{
+            background:   product.estado === "listo" ? "rgba(16, 185, 129, 0.10)"
+                        : product.estado === "en_desarrollo" ? "rgba(245, 158, 11, 0.10)"
+                        : "var(--color-surface-2)",
+            color:        product.estado === "listo" ? "#059669"
+                        : product.estado === "en_desarrollo" ? "#b45309"
+                        : "var(--color-text-muted)",
+            borderColor:  product.estado === "listo" ? "rgba(16, 185, 129, 0.30)"
+                        : product.estado === "en_desarrollo" ? "rgba(245, 158, 11, 0.30)"
+                        : "var(--color-border)",
+          }}
+        >
           {ESTADO_LABEL[product.estado] ?? product.estado}
         </span>
-
-        {active && (
-          <span style={{
-            marginLeft:"auto", fontSize:18,
-            color: hov ? color : "var(--color-border)",
-            transition: "color 0.18s ease, transform 0.18s ease",
-            transform: hov ? "translateX(4px)" : "translateX(0)",
-            display: "inline-block",
-          }}>→</span>
-        )}
       </div>
     </div>
   );
 
-  return active
-    ? <Link href={product.route!} style={{ display:"block", height:"100%" }}>{card}</Link>
-    : card;
+  return active ? (
+    <Link href={product.route!} className="block h-full">{body}</Link>
+  ) : (
+    <div className="h-full">{body}</div>
+  );
 }
 
-// ── Sección de módulo ─────────────────────────────────────────────────────────
-function ModuleSection({ mod, visibleProducts, index }: { mod: CatalogModule; visibleProducts: CatalogProduct[]; index: number }) {
-  const visual = moduleVisual(mod.id, index);
-  const stats = moduleStats(mod);
-  const pct = Math.round((stats.done / stats.total) * 100);
+// ── Sección de grupo (cabecera + cards) ──────────────────────────────────────
+
+function GroupSection({
+  mod,
+  products,
+  index,
+}: {
+  mod: CatalogModule;
+  products: CatalogProduct[];
+  index: number;
+}) {
+  const visual = moduleVisual(mod.id);
+  const desc = mod.desc ?? visual.desc;
 
   return (
-    <section id={mod.id} style={{ animation: `pl-fade-up 0.4s ease-out ${index * 55}ms both`, scrollMarginTop: 24 }}>
-      {/* Cabecera */}
-      <div style={{ position:"relative", marginBottom:20, paddingLeft:16, borderLeft:`3px solid ${visual.color}`, overflow:"hidden" }}>
-        <div style={{
-          position:"absolute", right:0, top:"50%", transform:"translateY(-50%)",
-          fontSize:84, fontWeight:900, lineHeight:1,
-          color:`${visual.color}09`, userSelect:"none",
-          fontFamily:"var(--font-jetbrains-mono)",
-        }}>
-          {String(index + 1).padStart(2, "0")}
+    <section
+      id={mod.id}
+      style={{ animation: `pl-fade-up 0.4s ${index * 60}ms ease-out both`, scrollMarginTop: 24 }}
+    >
+      <div className="mb-5 flex items-center gap-3">
+        <div
+          className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl"
+          style={{ background: visual.gradient, boxShadow: `0 8px 24px -10px ${visual.accent}80` }}
+        >
+          <ModuleIcon type={visual.icon} color="#050b18" size={18} strokeWidth={2.2} />
         </div>
-
-        <div style={{ position:"relative" }}>
-          <div style={{ display:"flex", alignItems:"baseline", gap:12, flexWrap:"wrap" }}>
-            <h2 style={{ fontSize:15, fontWeight:700, color:"var(--color-text)", letterSpacing:"-.01em" }}>
-              {mod.name}
-            </h2>
-            <span style={{ fontSize:11, fontWeight:600, color:visual.color }}>
-              {stats.done}/{stats.total} disponibles
-            </span>
-          </div>
-
-          <p style={{ fontSize:12, color:"var(--color-text-muted)", margin:"3px 0 10px" }}>
-            {visual.desc}
-          </p>
-
-          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-            <div style={{ width:180, height:4, background:"var(--color-surface-2)", borderRadius:4, overflow:"hidden" }}>
-              <div style={{
-                height:"100%", width:`${pct}%`,
-                background: pct > 0 ? visual.color : "var(--color-border)",
-                borderRadius:4, transition:"width 0.7s ease",
-              }} />
-            </div>
-            <span style={{ fontSize:10, fontWeight:600, color:"var(--color-text-muted)" }}>
-              {pct}%
-            </span>
-          </div>
+        <div className="min-w-0 flex-1">
+          <h2 className="text-[16px] font-bold leading-tight tracking-tight text-text">{mod.name}</h2>
+          {desc && <p className="mt-0.5 text-[12px] text-text-muted">{desc}</p>}
         </div>
       </div>
 
-      {/* Grid de tarjetas filtradas */}
-      {visibleProducts.length === 0 ? (
-        <p className="text-xs text-text-muted">Ningún producto coincide con el filtro actual.</p>
-      ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {visibleProducts.map((p, pi) => (
-            <ProductCard key={p.id} product={p} color={visual.color} delay={index * 55 + pi * 35} />
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {products.map((p, i) => (
+          <ToolCard key={p.id} product={p} accent={visual.accent} delay={index * 60 + i * 40} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// ── Roadmap colapsable ───────────────────────────────────────────────────────
+
+function RoadmapSection({ mod }: { mod: CatalogModule }) {
+  const [open, setOpen] = useState(false);
+  const visual = moduleVisual(mod.id);
+  return (
+    <section className="mt-14">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between rounded-xl border border-border bg-surface px-5 py-4 text-left transition-colors hover:bg-surface-2"
+      >
+        <div className="flex items-center gap-3">
+          <div
+            className="flex h-9 w-9 items-center justify-center rounded-lg"
+            style={{ background: visual.gradient, boxShadow: `0 6px 20px -10px ${visual.accent}70` }}
+          >
+            <ModuleIcon type={visual.icon} color="#050b18" size={16} strokeWidth={2.2} />
+          </div>
+          <div>
+            <div className="text-[13.5px] font-semibold text-text">{mod.name}</div>
+            <div className="text-[11.5px] text-text-muted">
+              {mod.desc ?? visual.desc} · {mod.products.length} módulos planificados
+            </div>
+          </div>
+        </div>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+          strokeLinecap="round" strokeLinejoin="round"
+          style={{ transition: "transform 0.18s ease", transform: open ? "rotate(180deg)" : "rotate(0)", color: "var(--color-text-muted)" }}>
+          <polyline points="6 9 12 15 18 9" />
+        </svg>
+      </button>
+      {open && (
+        <div
+          className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3"
+          style={{ animation: "pl-fade-up 0.3s ease-out both" }}
+        >
+          {mod.products.map((p, i) => (
+            <ToolCard key={p.id} product={p} accent={visual.accent} delay={i * 35} />
           ))}
         </div>
       )}
@@ -265,82 +526,100 @@ function ModuleSection({ mod, visibleProducts, index }: { mod: CatalogModule; vi
   );
 }
 
-// ── Skeleton de carga ─────────────────────────────────────────────────────────
-function CatalogSkeleton() {
-  return (
-    <div className="flex flex-col gap-12">
-      {[8, 6, 3].map((n, mi) => (
-        <div key={mi}>
-          <div style={{ paddingLeft:16, borderLeft:"3px solid var(--color-border)", marginBottom:20 }}>
-            <Sk w={260} h={18} className="mb-2" />
-            <Sk w={400} h={12} className="mb-2" />
-            <Sk w={140} h={5} />
-          </div>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {Array.from({ length: n }).map((_, i) => (
-              <div key={i} className="pl-skeleton" style={{ height:116, borderRadius:12, opacity: Math.max(0.2, 1 - i * 0.07) }} />
-            ))}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
+// ── Página ───────────────────────────────────────────────────────────────────
 
-// ── Página ────────────────────────────────────────────────────────────────────
 export default function DashboardPage() {
-  const ready = useRequireAuth();
+  const router = useRouter();
   const [modules, setModules] = useState<CatalogModule[] | null>(null);
-  const [user,    setUser]    = useState<User | null>(null);
-  const [filterMode, setFilterMode] = useState<FilterMode>("disponibles");
+  const [user, setUser] = useState<User | null>(null);
+  const [activeGroup, setActiveGroup] = useState<string>("all");
   const [search, setSearch] = useState("");
+  const toolsAnchorRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!ready) return;
     api.get<CatalogModule[]>("/api/v1/catalog").then(setModules).catch(() => setModules([]));
     api.get<User>("/api/v1/auth/me").then(setUser).catch(() => {});
-  }, [ready]);
+  }, []);
 
-  const filteredModules = useMemo(() => {
-    if (!modules) return null;
+  function logout() {
+    clearToken();
+    router.push("/login");
+  }
+
+  const roadmap = modules?.find((m) => m.id === "roadmap") ?? null;
+  const nonRoadmap = modules?.filter((m) => m.id !== "roadmap") ?? [];
+
+  const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
-    return modules.map((mod) => ({
-      mod,
-      visibleProducts: mod.products.filter((p) => {
-        if (filterMode === "disponibles" && !p.route) return false;
-        if (filterMode === "en_desarrollo" && p.estado !== "en_desarrollo") return false;
-        if (term && !p.name.toLowerCase().includes(term)) return false;
-        return true;
-      }),
-    })).filter(({ visibleProducts }) => visibleProducts.length > 0);
-  }, [modules, filterMode, search]);
-
-  if (!ready) return null;
+    return nonRoadmap
+      .filter((m) => activeGroup === "all" || m.id === activeGroup)
+      .map((m) => ({
+        mod: m,
+        products: m.products.filter((p) => !term || p.name.toLowerCase().includes(term) || (p.subtitle ?? "").toLowerCase().includes(term)),
+      }))
+      .filter(({ products }) => products.length > 0);
+  }, [nonRoadmap, activeGroup, search]);
 
   return (
     <div className="flex flex-1 flex-col">
-      <AppHeader crumb="Dashboard" />
-      <main className="flex-1 px-8 py-6">
-        <Hero user={user} modules={modules} />
+      <Hero user={user} modules={modules} onLogout={logout} />
 
-        {!modules ? (
-          <CatalogSkeleton />
-        ) : modules.length === 0 ? (
-          <p className="text-sm text-text-muted">No se pudo cargar el catálogo.</p>
-        ) : (
-          <>
-            <FilterBar mode={filterMode} onModeChange={setFilterMode} search={search} onSearchChange={setSearch} />
-            {filteredModules && filteredModules.length === 0 ? (
-              <p className="text-sm text-text-muted">Ningún módulo coincide con el filtro actual.</p>
+      <main className="flex-1 px-6 py-10 md:px-8">
+        <div ref={toolsAnchorRef} className="mx-auto max-w-7xl">
+          {/* Tabs de flujo + buscador */}
+          <div className="mb-8 flex flex-wrap items-center justify-between gap-4">
+            {modules ? (
+              <GroupTabs modules={modules} active={activeGroup} onChange={setActiveGroup} />
             ) : (
-              <div className="flex flex-col gap-12">
-                {filteredModules?.map(({ mod, visibleProducts }, i) => (
-                  <ModuleSection key={mod.id} mod={mod} visibleProducts={visibleProducts} index={i} />
-                ))}
-              </div>
+              <Sk w={520} h={38} />
             )}
-          </>
-        )}
+            <div className="relative w-[260px]">
+              <svg
+                width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--color-text-muted)"
+                strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"
+                className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"
+              >
+                <circle cx="11" cy="11" r="7" />
+                <path d="M21 21l-4.3-4.3" />
+              </svg>
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Buscar herramienta…"
+                className="w-full rounded-lg border border-border bg-surface py-2 pl-9 pr-3 text-[12.5px] text-text placeholder:text-text-muted focus:border-accent focus:outline-none"
+              />
+            </div>
+          </div>
+
+          {/* Contenido: stack de grupos o grupo único */}
+          {!modules ? (
+            <div className="flex flex-col gap-10">
+              {[1, 2, 3].map((i) => (
+                <div key={i}>
+                  <Sk w={300} h={20} className="mb-4" />
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                    {[1, 2, 3].map((j) => (
+                      <Sk key={j} h={160} />
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : filtered.length === 0 ? (
+            <p className="py-20 text-center text-sm text-text-muted">
+              Ninguna herramienta coincide con la búsqueda actual.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-14">
+              {filtered.map(({ mod, products }, i) => (
+                <GroupSection key={mod.id} mod={mod} products={products} index={i} />
+              ))}
+            </div>
+          )}
+
+          {/* Roadmap colapsable */}
+          {roadmap && <RoadmapSection mod={roadmap} />}
+        </div>
       </main>
     </div>
   );

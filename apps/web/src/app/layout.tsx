@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
+import Script from "next/script";
 import "./globals.css";
 
 const inter = Inter({
@@ -38,7 +39,19 @@ export default function RootLayout({
           } catch {}
         `}} />
       </head>
-      <body className="min-h-full flex flex-col bg-bg text-text">{children}</body>
+      <body className="min-h-full flex flex-col bg-bg text-text">
+        {/* Plotly CDN cargado a nivel de app para que todos los paneles con
+            gráficos lo tengan disponible desde el primer render. Antes algunos
+            componentes lo inyectaban por su cuenta y, si el usuario aterrizaba
+            directo en un panel que no lo cargaba, los gráficos quedaban en
+            blanco (bug descubierto 2026-11-04 al persistir la última sección). */}
+        <Script
+          src="https://cdn.plot.ly/plotly-2.35.2.min.js"
+          strategy="beforeInteractive"
+          data-plotly-cdn="1"
+        />
+        {children}
+      </body>
     </html>
   );
 }

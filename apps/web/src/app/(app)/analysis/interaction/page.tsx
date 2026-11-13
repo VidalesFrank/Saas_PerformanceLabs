@@ -2,6 +2,7 @@
 
 import { FormEvent, useMemo, useState } from "react";
 import { AppHeader } from "@/components/app-header";
+import { PageHero } from "@/components/ui/page-hero";
 import { InteractionChart, type LoadCombination } from "@/components/interaction-chart";
 import { SectionPreview } from "@/components/section-preview";
 import { applyBarEdit, applyBarDelete, applyBarDuplicate, computeBarSizesFromForm } from "@/lib/section-form-adapter";
@@ -243,14 +244,18 @@ export default function InteractionDiagramPage() {
 
   return (
     <div className="flex flex-1 flex-col">
-      <AppHeader crumb="Diagrama de interaccion" />
+      <AppHeader crumb="Diagrama de interacción P-M" />
+      <PageHero
+        eyebrow="Secciones · Análisis"
+        title="Diagrama de interacción P-M"
+        subtitle="Columnas, muros y pilas: secciones rectangulares, cuadradas, circulares o especiales con combinaciones de carga NSR-10."
+        tone="emerald"
+        icon="section"
+      />
       <main className="mx-auto grid w-full max-w-6xl flex-1 grid-cols-1 gap-6 px-6 py-10 lg:grid-cols-[420px_1fr]">
         <Card className="h-fit">
           <CardHeader>
-            <h1 className="text-lg font-semibold text-text">Diagrama de interaccion P-M</h1>
-            <p className="mt-1 text-xs text-text-muted">
-              Columnas, muros y pilas: rectangular, cuadrada, circular o especial.
-            </p>
+            <h2 className="text-sm font-semibold text-text">Parámetros de la sección</h2>
           </CardHeader>
           <CardBody>
             <form onSubmit={onSubmit} className="flex flex-col gap-5">
