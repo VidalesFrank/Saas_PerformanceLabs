@@ -64,6 +64,35 @@ def _resolve_factor(record_units: str, scale: float) -> float:
     raise ValueError(f"record_units desconocidas: {record_units!r} (usa 'g' | 'mps2' | 'cm/s2')")
 
 
+def _load_record_mps2(path: str, dtrec: float, factor: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Lee el archivo clean (una aceleración por línea en unidades originales) y
+    aplica `factor` para devolver (t_rec_s, a_rec_mps2). El tiempo asume dtrec
+    constante, coherente con `timeSeries('Path', ..., -dt dtrec)` de OpenSees.
+    """
+    a_raw = np.loadtxt(path, dtype=float).reshape(-1)
+    a_mps2 = a_raw * float(factor)
+    t_rec = np.arange(len(a_mps2), dtype=float) * float(dtrec)
+    return t_rec, a_mps2
+
+
+def _absolute_accel(node_rel: np.ndarray, tiempo: np.ndarray,
+                    t_rec: np.ndarray, a_rec: np.ndarray) -> np.ndarray:
+    """
+    Convierte aceleración relativa de nodos a absoluta sumando el ground motion
+    interpolado a los tiempos del análisis.
+
+    `node_rel` shape (n_steps, n_nodes) con ü_rel por nodo (ops.nodeAccel bajo
+    UniformExcitation). `tiempo` shape (n_steps,) con los tiempos reales del
+    análisis (puede incluir pasos con dt reducido).  Fuera del rango del record
+    la aceleración del suelo se toma como 0 (free vibration tail).
+    """
+    if node_rel.size == 0 or tiempo.size == 0 or t_rec.size == 0:
+        return node_rel.copy()
+    ag_at_t = np.interp(tiempo, t_rec, a_rec, left=0.0, right=0.0)
+    return node_rel + ag_at_t[:, None]
+
+
 def _classify_hinge(theta_p_max: float, th: dict) -> str:
     """Clasifica una rótula por su |θ_p| máximo histórico. Devuelve io|ls|cp|collapse|none."""
     if theta_p_max >= th["collapse"]: return "collapse"
@@ -223,8 +252,8 @@ def run_nlth(
         nodes_control = nodes_control,
         elements      = elements,
         modes         = (0, 2),
-        Kswitch       = 1,
-        Tol           = 1e-4,
+        Kswitch       = 1,  # Rayleigh con K_tangente (ESTABLE con fibras+plasticidad)
+        Tol           = None,  # dejar que _compute_tol escale por tamaño del modelo
         eletype       = eletype,
         progress_cb   = progress_cb,
         progress_every= 25,
@@ -236,7 +265,15 @@ def run_nlth(
     sect_def_arr:    Optional[np.ndarray] = None
     sect_t_arr:      Optional[np.ndarray] = None
     infill_elong_arr: Optional[np.ndarray] = None
-    if len(result_tuple) == 18:
+    health: dict = {}
+    # Las longitudes dependen de qué captura se pidió (Vb / sect_def / infills)
+    # más el `health` dict que SIEMPRE se añade al final (Ola 2).
+    if len(result_tuple) == 19:
+        (tiempo, techo1, techo2, techoT,
+         node_disp, node_vel, node_acel, node_disp2, node_acel2,
+         driftX, driftY, Prot, Eds, Vb_x, Vb_y,
+         sect_def_arr, sect_t_arr, infill_elong_arr, health) = result_tuple
+    elif len(result_tuple) == 18:
         (tiempo, techo1, techo2, techoT,
          node_disp, node_vel, node_acel, node_disp2, node_acel2,
          driftX, driftY, Prot, Eds, Vb_x, Vb_y,
@@ -254,6 +291,10 @@ def run_nlth(
     t_elapsed = float(tiempo[-1]) if len(tiempo) > 0 else 0.0
     t_target  = dtrec * nPts
     status    = "success" if t_elapsed + 1e-6 >= t_target else "partial"
+    # Si el motor señaló abort explícito, usar su status (puede ser partial
+    # aunque tiempo haya alcanzado el target por redondeo).
+    if health.get("aborted"):
+        status = "partial"
 
     # ── Envolventes ─────────────────────────────────────────────────────────
     max_abs_x = float(np.max(np.abs(techo1))) if techo1.size else 0.0
@@ -268,13 +309,64 @@ def run_nlth(
     max_drift_x_pct = max(drift_max_by_story_x, default=0.0)
     max_drift_y_pct = max(drift_max_by_story_y, default=0.0)
 
-    # Envolvente de aceleración absoluta por piso (m/s² y g). Se omite base.
-    accel_max_x_mps2: list[float] = []
-    accel_max_y_mps2: list[float] = []
+    # Desplazamiento pico por piso (relativo al suelo). Se omite la base (idx 0).
+    disp_max_by_story_x_m: list[float] = []
+    disp_max_by_story_y_m: list[float] = []
+    if node_disp.size and node_disp.ndim == 2 and node_disp.shape[1] > 1:
+        for i in range(1, node_disp.shape[1]):
+            disp_max_by_story_x_m.append(float(np.max(np.abs(node_disp[:, i]))))
+            disp_max_by_story_y_m.append(float(np.max(np.abs(node_disp2[:, i]))))
+
+    # Deriva residual: valor del último paso. Métrica forense clave — un
+    # edificio con residual > 0.5 % suele considerarse "no reparable" (FEMA
+    # P-58 §5.4 / Ramirez & Miranda 2009). Se expone deriva techo residual
+    # (max sobre pisos) + perfil por entrepiso para cada dirección.
+    residual_drift_by_story_x_pct: list[float] = []
+    residual_drift_by_story_y_pct: list[float] = []
+    if driftX.size:
+        residual_drift_by_story_x_pct = [float(np.abs(driftX[-1, i])) * 100.0 for i in range(driftX.shape[1])]
+    if driftY.size:
+        residual_drift_by_story_y_pct = [float(np.abs(driftY[-1, i])) * 100.0 for i in range(driftY.shape[1])]
+    residual_drift_x_pct = max(residual_drift_by_story_x_pct, default=0.0)
+    residual_drift_y_pct = max(residual_drift_by_story_y_pct, default=0.0)
+
+    # ── Aceleración del suelo (en m/s²) interpolada a los tiempos del análisis ─
+    # `ops.nodeAccel` bajo UniformExcitation devuelve ü_rel; para obtener la
+    # absoluta (que es lo que registra un acelerómetro en el piso y lo que la
+    # NSR-10 A.9 / FEMA E-74 piden para evaluar daño a contenido) hay que sumar
+    # el ground motion ü_g(t) escalado por `factor`.
+    t_rec_x, a_rec_x = _load_record_mps2(record_x_path, dtrec, factor)
+    t_rec_y, a_rec_y = _load_record_mps2(record_y_path, dtrec, factor)
+    pga_x_mps2 = float(np.max(np.abs(a_rec_x))) if a_rec_x.size else 0.0
+    pga_y_mps2 = float(np.max(np.abs(a_rec_y))) if a_rec_y.size else 0.0
+    pga_vector_mps2 = float(np.sqrt(pga_x_mps2**2 + pga_y_mps2**2))
+
+    node_acel_abs_x = _absolute_accel(node_acel,  tiempo, t_rec_x, a_rec_x)
+    node_acel_abs_y = _absolute_accel(node_acel2, tiempo, t_rec_y, a_rec_y)
+
+    # Envolventes relativas (lo que teníamos, útil para interpretación
+    # estructural: deformación del edificio) y absolutas (acelerómetro / daño a
+    # contenido). Se omite la base (idx 0) en ambas.
+    accel_max_x_rel_mps2: list[float] = []
+    accel_max_y_rel_mps2: list[float] = []
+    accel_max_x_abs_mps2: list[float] = []
+    accel_max_y_abs_mps2: list[float] = []
     if node_acel.size and node_acel.ndim == 2:
-        for i in range(1, node_acel.shape[1]):   # skip base (idx 0)
-            accel_max_x_mps2.append(float(np.max(np.abs(node_acel[:, i]))))
-            accel_max_y_mps2.append(float(np.max(np.abs(node_acel2[:, i]))))
+        for i in range(1, node_acel.shape[1]):
+            accel_max_x_rel_mps2.append(float(np.max(np.abs(node_acel[:, i]))))
+            accel_max_y_rel_mps2.append(float(np.max(np.abs(node_acel2[:, i]))))
+            accel_max_x_abs_mps2.append(float(np.max(np.abs(node_acel_abs_x[:, i]))))
+            accel_max_y_abs_mps2.append(float(np.max(np.abs(node_acel_abs_y[:, i]))))
+
+    # Factor de amplificación por piso PFA/PGA (adimensional). Si el PGA del
+    # record aplicado es nulo (edge case), se devuelve 0.
+    def _amp(peaks: list[float], pga: float) -> list[float]:
+        if pga <= 1e-9:
+            return [0.0 for _ in peaks]
+        return [p / pga for p in peaks]
+
+    accel_amp_x = _amp(accel_max_x_abs_mps2, pga_x_mps2)
+    accel_amp_y = _amp(accel_max_y_abs_mps2, pga_y_mps2)
 
     # Vb máximos
     max_Vb_x_kN = float(np.max(np.abs(Vb_x))) if Vb_x is not None and Vb_x.size else 0.0
@@ -291,6 +383,7 @@ def run_nlth(
     # ── Persistir NPZ con historia completa (opcional) ──────────────────────
     hist_meta: Optional[dict] = None
     if history_path is not None:
+        history_path = Path(history_path)
         history_path.parent.mkdir(parents=True, exist_ok=True)
         npz_payload: dict = dict(
             t          = tiempo.astype(np.float32),
@@ -298,8 +391,13 @@ def run_nlth(
             techo_y    = techo2.astype(np.float32),
             node_disp_x= node_disp.astype(np.float32),
             node_disp_y= node_disp2.astype(np.float32),
-            node_acel_x= node_acel.astype(np.float32),
-            node_acel_y= node_acel2.astype(np.float32),
+            node_acel_x    = node_acel.astype(np.float32),
+            node_acel_y    = node_acel2.astype(np.float32),
+            node_acel_abs_x= node_acel_abs_x.astype(np.float32),
+            node_acel_abs_y= node_acel_abs_y.astype(np.float32),
+            ground_acel_x  = a_rec_x.astype(np.float32),
+            ground_acel_y  = a_rec_y.astype(np.float32),
+            ground_t       = t_rec_x.astype(np.float32),
             drift_x    = driftX.astype(np.float32),
             drift_y    = driftY.astype(np.float32),
             Vb_x       = Vb_x.astype(np.float32) if Vb_x is not None else np.zeros((0,), np.float32),
@@ -360,8 +458,38 @@ def run_nlth(
             "max_drift_pct":           round(max(max_drift_x_pct, max_drift_y_pct), 4),
             "max_drift_by_story_x":    [round(d, 4) for d in drift_max_by_story_x],
             "max_drift_by_story_y":    [round(d, 4) for d in drift_max_by_story_y],
-            "max_accel_by_story_x_mps2": [round(a, 4) for a in accel_max_x_mps2],
-            "max_accel_by_story_y_mps2": [round(a, 4) for a in accel_max_y_mps2],
+            # Desplazamiento pico por piso (m) — deformación dinámica absoluta.
+            "max_disp_by_story_x_m":   [round(d, 6) for d in disp_max_by_story_x_m],
+            "max_disp_by_story_y_m":   [round(d, 6) for d in disp_max_by_story_y_m],
+            # Deriva residual: último paso. Indicador forense de que el
+            # edificio quedó torcido tras el sismo. Umbral FEMA P-58 /
+            # Ramirez-Miranda 2009: >0.5 % → probablemente no reparable.
+            "residual_drift_x_pct":          round(residual_drift_x_pct, 4),
+            "residual_drift_y_pct":          round(residual_drift_y_pct, 4),
+            "residual_drift_pct":            round(max(residual_drift_x_pct, residual_drift_y_pct), 4),
+            "residual_drift_by_story_x_pct": [round(d, 4) for d in residual_drift_by_story_x_pct],
+            "residual_drift_by_story_y_pct": [round(d, 4) for d in residual_drift_by_story_y_pct],
+            # Aceleración relativa al suelo (deformación dinámica del edificio).
+            "max_rel_accel_by_story_x_mps2": [round(a, 4) for a in accel_max_x_rel_mps2],
+            "max_rel_accel_by_story_y_mps2": [round(a, 4) for a in accel_max_y_rel_mps2],
+            # Aceleración absoluta (= ü_rel + ü_g). Es la que mide un acelerómetro
+            # en el piso y la relevante para evaluar daño a contenido (NSR-10 A.9).
+            "max_abs_accel_by_story_x_mps2": [round(a, 4) for a in accel_max_x_abs_mps2],
+            "max_abs_accel_by_story_y_mps2": [round(a, 4) for a in accel_max_y_abs_mps2],
+            # Alias legacy (apunta a la absoluta, que es la métrica correcta).
+            # Puede retirarse una vez que el frontend consuma los campos nuevos.
+            "max_accel_by_story_x_mps2": [round(a, 4) for a in accel_max_x_abs_mps2],
+            "max_accel_by_story_y_mps2": [round(a, 4) for a in accel_max_y_abs_mps2],
+            # PGA del record aplicado (ya con `factor` y `scale`).
+            "pga_x_mps2":                   round(pga_x_mps2, 4),
+            "pga_y_mps2":                   round(pga_y_mps2, 4),
+            "pga_x_g":                      round(pga_x_mps2 / 9.81, 4),
+            "pga_y_g":                      round(pga_y_mps2 / 9.81, 4),
+            "pga_vector_g":                 round(pga_vector_mps2 / 9.81, 4),
+            # Factor de amplificación por piso = PFA_i / PGA (adimensional).
+            "accel_amplification_by_story_x": [round(a, 3) for a in accel_amp_x],
+            "accel_amplification_by_story_y": [round(a, 3) for a in accel_amp_y],
+            "max_accel_amplification":        round(max([*accel_amp_x, *accel_amp_y], default=0.0), 3),
             "max_Vb_x_kN":             round(max_Vb_x_kN, 2),
             "max_Vb_y_kN":             round(max_Vb_y_kN, 2),
             "max_roof_disp_total_m":   round(float(np.max(np.abs(techoT))), 6) if techoT.size else 0.0,
@@ -369,6 +497,11 @@ def run_nlth(
             "t_target_s":              round(t_target, 4),
         },
         "damage": damage,
+        # Deriva por piso en fracción (no %) para post-procesos que necesitan
+        # la envolvente cruda (p.ej. daño de mampostería por entrepiso).
+        "drift_envelope_x":  [float(np.max(np.abs(driftX[:, i]))) for i in range(driftX.shape[1])] if driftX.size else [],
+        "drift_envelope_y":  [float(np.max(np.abs(driftY[:, i]))) for i in range(driftY.shape[1])] if driftY.size else [],
+        "stories_z":         [float(z) for z in stories_z],
         "meta": {
             "dtrec":          dtrec,
             "dt_analysis":    dt_analysis,
@@ -383,4 +516,8 @@ def run_nlth(
             "ductility":      ductility,
         },
         "history": hist_meta,
+        # Diagnóstico de salud del solver (Ola 2). Permite al UI avisar al
+        # usuario si hubo bisecciones severas, fallbacks de algoritmo, o abort
+        # por elemento patológico. Se devuelve siempre (incluso en success).
+        "health": health,
     }

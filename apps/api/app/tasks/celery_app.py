@@ -22,6 +22,7 @@ celery_app = Celery(
         "app.tasks.structural_variant_pushover_task",
         "app.tasks.structural_frame_pushover_task",
         "app.tasks.structural_nlth_task",
+        "app.tasks.structural_ida_task",
         # Módulo 5 — Análisis de Muros RC 3D
         "app.tasks.wall_analysis_task",
     ],
@@ -62,6 +63,10 @@ celery_app.conf.task_annotations = {
     "app.tasks.structural_frame_pushover_task.run_frame_pushover":     {"time_limit": 7200, "soft_time_limit": 7000},
     # NLTHA puede ser muy largo con registros reales (duration 30-60s a dt_analysis 0.005)
     "app.tasks.structural_nlth_task.run_nlth":                         {"time_limit": 14400, "soft_time_limit": 14000},
+    # IDA: orquestador puede durar horas esperando hijos
+    "app.tasks.structural_ida_task.run_ida":                           {"time_limit": 86400, "soft_time_limit": 85800},
+    "app.tasks.structural_ida_task.run_ida_pair_level":                {"time_limit": 1800,  "soft_time_limit": 1650},
+    "app.tasks.structural_ida_task.consolidate_ida":                   {"time_limit": 600,   "soft_time_limit": 540},
     # Módulo 5
     "app.tasks.wall_analysis_task.run_gravity":            {"time_limit": 1800, "soft_time_limit": 1700},
     "app.tasks.wall_analysis_task.run_modal":              {"time_limit": 900,  "soft_time_limit": 850},

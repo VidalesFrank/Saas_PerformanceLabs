@@ -41,8 +41,13 @@ EventType = Literal[
 _DEFAULT_EPS_SY        = 0.0021   # fy=420 / E=200000
 _DEFAULT_EPS_SU        = 0.10     # A615 Gr60 nominal
 _DEFAULT_EPS_CU_COVER  = 0.006    # recubrimiento no confinado
-_DEFAULT_EPS_BK_CONF   = 0.025    # pandeo con s/db ≤ 6 (confinamiento DMO/DES)
-_DEFAULT_EPS_BK_POOR   = 0.015    # pandeo con s/db > 6 (bajo confinamiento)
+_DEFAULT_EPS_BK_CONF   = 0.05     # pandeo con s/db ≤ 8 (confinamiento DMO/DES, valor probado)
+_DEFAULT_EPS_BK_POOR   = 0.025    # pandeo con s/db > 10 (bajo confinamiento)
+# Umbrales del núcleo según s/db — mismo criterio que pandeo: un núcleo bien
+# confinado tolera deformaciones mucho mayores antes de aplastarse. Si s/db > 10
+# el estribo pierde eficacia y el núcleo se comporta cerca del no-confinado.
+_DEFAULT_EPS_CU_CORE_CONF = 0.05  # núcleo bien confinado (s/db ≤ 8)
+_DEFAULT_EPS_CU_CORE_POOR = 0.025 # núcleo pobremente confinado (s/db > 10)
 _EPS_PRECISION         = 1e-6
 
 
@@ -87,20 +92,48 @@ def _buckling_strain(s_mm: float, db_mm: float, ratio: str = "auto") -> float:
     Umbral de pandeo del refuerzo longitudinal.
 
     Criterio simplificado (adaptado de Dhakal-Maekawa 2002):
-      - s/db ≤ 6  → ε_bk = 0.025  (buen confinamiento DMO/DES)
-      - 6 < s/db ≤ 10 → ε_bk interpolado lineal 0.025 → 0.015
-      - s/db > 10 → ε_bk = 0.015  (bajo confinamiento)
+      - s/db ≤ 8  → ε_bk = 0.05   (buen confinamiento DMO/DES, valor probado)
+      - 8 < s/db ≤ 10 → ε_bk interpolado lineal 0.05 → 0.025
+      - s/db > 10 → ε_bk = 0.025  (bajo confinamiento)
     """
     if db_mm <= 0 or s_mm <= 0:
         return _DEFAULT_EPS_BK_CONF
     r = s_mm / db_mm
-    if r <= 6.0:
+    if r <= 8.0:
         return _DEFAULT_EPS_BK_CONF
     if r >= 10.0:
         return _DEFAULT_EPS_BK_POOR
-    # lineal entre 6 y 10
-    t = (r - 6.0) / 4.0
+    # lineal entre 8 y 10
+    t = (r - 8.0) / 2.0
     return _DEFAULT_EPS_BK_CONF + t * (_DEFAULT_EPS_BK_POOR - _DEFAULT_EPS_BK_CONF)
+
+
+def _core_crush_strain(s_mm: float, db_mm: float) -> float:
+    """
+    Umbral de aplastamiento del núcleo confinado basado en s/db.
+
+    Un núcleo con s/db ≤ 8 trabaja como confinado efectivo (estribos próximos
+    sostienen el concreto más allá de su resistencia nominal), mientras que
+    con s/db > 10 el estribo pierde su rol de confinamiento y el núcleo se
+    comporta cerca del concreto no-confinado.
+
+      - s/db ≤ 8  → ε_cu,core = 0.05   (confinamiento DMO/DES efectivo)
+      - 8 < s/db ≤ 10 → interpolado lineal 0.05 → 0.025
+      - s/db > 10 → ε_cu,core = 0.025  (confinamiento ineficaz)
+
+    Esta regla reemplaza al valor Mander-based del spec en el detector de
+    eventos post-análisis, para evitar sub-estimar la capacidad del núcleo y
+    reportar aplastamientos espurios en elementos bien detallados.
+    """
+    if db_mm <= 0 or s_mm <= 0:
+        return _DEFAULT_EPS_CU_CORE_CONF
+    r = s_mm / db_mm
+    if r <= 8.0:
+        return _DEFAULT_EPS_CU_CORE_CONF
+    if r >= 10.0:
+        return _DEFAULT_EPS_CU_CORE_POOR
+    t = (r - 8.0) / 2.0
+    return _DEFAULT_EPS_CU_CORE_CONF + t * (_DEFAULT_EPS_CU_CORE_POOR - _DEFAULT_EPS_CU_CORE_CONF)
 
 
 def _column_bar_positions(reinf: dict, b: float, h: float, cover: float,
@@ -199,9 +232,72 @@ def _beam_bar_positions(reinf: dict, b: float, h: float, cover: float) -> list[t
     return out
 
 
+_OVERRIDE_KEYS = (
+    "eps_sy", "eps_cu_cover", "eps_cu_core", "eps_su", "eps_bk",
+)
+
+
+def default_thresholds() -> dict[str, float]:
+    """Umbrales globales por defecto que puede sobrescribir el usuario."""
+    return {
+        "eps_sy":       _DEFAULT_EPS_SY,
+        "eps_cu_cover": _DEFAULT_EPS_CU_COVER,
+        # Núcleo confinado DMO/DES con s/db≤8 — mismo valor probado que el pandeo.
+        "eps_cu_core":  _DEFAULT_EPS_CU_CORE_CONF,
+        "eps_su":       _DEFAULT_EPS_SU,
+        "eps_bk":       _DEFAULT_EPS_BK_CONF,
+    }
+
+
+def observed_threshold_ranges(elements_meta: dict[str, ElementMeta]) -> dict[str, dict]:
+    """
+    Devuelve el rango min/max observado por elemento para los umbrales que
+    varían entre elementos (ε_cu_core y ε_bk). Útil para informar al usuario
+    cuánta heterogeneidad hay antes de forzar un valor global.
+    """
+    core = [m.eps_cu_core for m in elements_meta.values()]
+    bk   = [m.eps_bk       for m in elements_meta.values()]
+    def _stats(xs: list[float]) -> dict:
+        if not xs:
+            return {"min": 0.0, "max": 0.0, "mean": 0.0, "n": 0}
+        return {
+            "min":  round(float(min(xs)), 5),
+            "max":  round(float(max(xs)), 5),
+            "mean": round(float(sum(xs) / len(xs)), 5),
+            "n":    len(xs),
+        }
+    return {"eps_cu_core": _stats(core), "eps_bk": _stats(bk)}
+
+
+def _apply_overrides(meta: ElementMeta, override: Optional[dict]) -> ElementMeta:
+    """Sustituye los umbrales globales en una metadata ya construida.
+
+    Solo se aplican las claves presentes en el dict. Claves ausentes conservan
+    el valor computado desde el spec (Mander, s/db).
+    """
+    if not override:
+        return meta
+    kwargs = {k: getattr(meta, k) for k in _OVERRIDE_KEYS}
+    for k in _OVERRIDE_KEYS:
+        v = override.get(k)
+        if v is None:
+            continue
+        try:
+            kwargs[k] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return ElementMeta(
+        fid=meta.fid, kind=meta.kind, story=meta.story, ele_tag=meta.ele_tag,
+        b_m=meta.b_m, h_m=meta.h_m, cover_m=meta.cover_m,
+        cover_corners=meta.cover_corners, core_corners=meta.core_corners,
+        bar_positions=meta.bar_positions, **kwargs,
+    )
+
+
 def build_elements_meta(
     spec: dict,
     element_lines: list[dict],
+    thresholds_override: Optional[dict] = None,
 ) -> dict[str, ElementMeta]:
     """
     Construye el diccionario `fid → ElementMeta` para columnas y vigas del
@@ -222,15 +318,17 @@ def build_elements_meta(
         cover = float(geo.get("cover_m", 0.040))
         fy_mpa = float(geo.get("fy_MPa", 420.0))
 
-        conf_end = (col.get("confinement") or {}).get("end", {}) or {}
-        eps_cu_core = float(conf_end.get("eps_cu", 0.016))
-
         reinf = col.get("reinforcement", {}) or {}
         tran  = reinf.get("transverse", {}) or {}
         s_conf = float(tran.get("s_confined_mm", 100.0))
         long_r = reinf.get("longitudinal", {}) or {}
         db_mm  = _bar_diam_m(long_r.get("bar_label", "#5")) * 1000.0
         eps_bk = _buckling_strain(s_conf, db_mm)
+        # Umbral del núcleo según s/db (criterio consistente con el pandeo).
+        # Si el spec expone un ε_cu Mander más conservador se descarta: la
+        # evidencia experimental de confinamiento efectivo con s/db≤8 soporta
+        # 0.05 como piso real para núcleos DMO/DES bien detallados.
+        eps_cu_core = _core_crush_strain(s_conf, db_mm)
         eps_sy = fy_mpa / 200_000.0
 
         # Esquinas del recubrimiento (cover) y del núcleo
@@ -257,14 +355,16 @@ def build_elements_meta(
         cover = float(geo.get("cover_m", 0.040))
         fy_mpa = float(geo.get("fy_MPa", 420.0))
 
-        conf_end = (bm.get("confinement") or {}).get("end", {}) or {}
-        eps_cu_core = float(conf_end.get("eps_cu", 0.012))
-
         reinf = bm.get("reinforcement", {}) or {}
-        s_conf = float((reinf.get("transverse", {}) or {}).get("s_confined_mm", 100.0))
+        # Vigas: el spec guarda estribos en `shear` (ver element_data._beam_transverse);
+        # columnas en `transverse`. Fallback mutuo para cualquier modelo histórico.
+        tran = reinf.get("shear") or reinf.get("transverse") or {}
+        s_conf = float(tran.get("s_confined_mm", 100.0))
         top = (reinf.get("zones", {}) or {}).get("end_i", {}).get("top", {}) or {}
         db_mm = _bar_diam_m(top.get("bar_label", "#5")) * 1000.0
         eps_bk = _buckling_strain(s_conf, db_mm)
+        # Umbral del núcleo según s/db (ver nota en _meta_for_column).
+        eps_cu_core = _core_crush_strain(s_conf, db_mm)
         eps_sy = fy_mpa / 200_000.0
 
         cover_corners = [(-b/2, -h/2), (b/2, -h/2), (-b/2, h/2), (b/2, h/2)]
@@ -286,13 +386,17 @@ def build_elements_meta(
         el = el_by_fid.get(str(fid))
         if not el or el.get("kind") != "column":
             continue
-        out[str(fid)] = _meta_for_column(str(fid), col, el)
+        out[str(fid)] = _apply_overrides(
+            _meta_for_column(str(fid), col, el), thresholds_override,
+        )
 
     for fid, bm in beams.items():
         el = el_by_fid.get(str(fid))
         if not el or el.get("kind") != "beam":
             continue
-        out[str(fid)] = _meta_for_beam(str(fid), bm, el)
+        out[str(fid)] = _apply_overrides(
+            _meta_for_beam(str(fid), bm, el), thresholds_override,
+        )
 
     return out
 
@@ -482,11 +586,11 @@ def _time_at(t_vec: Optional[np.ndarray], step: int) -> Optional[float]:
 
 def detect_events_pushover(
     *, npz_path: str, spec: dict, element_lines: list[dict],
-    direction: str,
+    direction: str, thresholds_override: Optional[dict] = None,
 ) -> dict:
     """Carga el NPZ del pushover y devuelve `{events, summary}`."""
     data = np.load(npz_path, allow_pickle=False)
-    elements_meta = build_elements_meta(spec, element_lines)
+    elements_meta = build_elements_meta(spec, element_lines, thresholds_override)
     tag_to_fid: dict[int, str] = {
         int(el["ele_tag"]): str(el["fid"]) for el in element_lines
     }
@@ -512,17 +616,21 @@ def detect_events_pushover(
 
 def detect_events_nlth(
     *, npz_path: str, spec: dict, element_lines: list[dict],
+    thresholds_override: Optional[dict] = None,
 ) -> dict:
     """
     Carga el NPZ de NLTHA (que debe tener `sect_def` capturado con stride) y
     devuelve `{events, summary}` con tiempo en segundos (no step index).
+
+    `thresholds_override` sustituye los umbrales globales calculados desde el
+    spec/geometría; útil para re-evaluar sin re-correr el NLTHA.
     """
     data = np.load(npz_path, allow_pickle=False)
     if "sect_def" not in data.files:
         return {"events": [], "summary": _empty_summary(),
                 "status": "no_sect_def_captured"}
 
-    elements_meta = build_elements_meta(spec, element_lines)
+    elements_meta = build_elements_meta(spec, element_lines, thresholds_override)
     tag_to_fid: dict[int, str] = {
         int(el["ele_tag"]): str(el["fid"]) for el in element_lines
     }
@@ -534,7 +642,15 @@ def detect_events_nlth(
         tag_to_fid=tag_to_fid, elements_meta=elements_meta,
         time_vector=t_sampled, direction=None,
     )
-    return _finalize(events)
+    out = _finalize(events)
+    # Metadata para el panel editable del frontend. `user_override` guarda lo
+    # que el usuario mandó; `defaults` y `observed` ayudan a elegir sliders
+    # (los dos últimos son por elemento, no un único valor global).
+    out["thresholds_user_override"] = {k: float(v) for k, v in (thresholds_override or {}).items()
+                                        if v is not None and k in _OVERRIDE_KEYS}
+    out["thresholds_defaults"] = default_thresholds()
+    out["thresholds_observed"] = observed_threshold_ranges(elements_meta)
+    return out
 
 
 def _finalize(events: list[Event]) -> dict:

@@ -22,6 +22,29 @@ from pathlib import Path
 from app.tasks.celery_app import celery_app
 
 
+def _enrich_pushover_health(health: dict, element_lines: list[dict]) -> None:
+    """Añade fid/kind/story al `pathological_element` del pushover (Ola 2)."""
+    if not health or not element_lines:
+        return
+    tag_to_info = {
+        int(el["ele_tag"]): {
+            "fid":   str(el["fid"]),
+            "kind":  str(el.get("kind", "?")),
+            "story": str(el.get("story", "")),
+        }
+        for el in element_lines
+    }
+    def _enrich_one(d: dict) -> dict:
+        info = tag_to_info.get(int(d.get("ele_tag", 0)))
+        if info:
+            d.update(info)
+        return d
+    if health.get("pathological_element"):
+        _enrich_one(health["pathological_element"])
+    for d in health.get("pathological_ranking", []) or []:
+        _enrich_one(d)
+
+
 def _update_job_progress(job_id: str, progress: dict) -> None:
     """
     Actualiza `progress_json` del StructuralJob en una sesión corta aislada.
@@ -114,6 +137,8 @@ def run_frame_pushover(
         directions      = params.get("directions", ["X", "Y"])
         n_ip            = int(params.get("n_integration_pts", 5))
         history_stride  = int(params.get("history_stride", 1))
+        collapse_mode   = str(params.get("collapse_mode", "ductile")).lower()
+        print(f"[frame_pushover] collapse_mode = {collapse_mode}")
 
         if pattern_type not in ("triangular", "uniforme", "modal"):
             raise ValueError(
@@ -142,6 +167,7 @@ def run_frame_pushover(
                 canonical         = canonical,
                 spec              = spec,
                 n_integration_pts = n_ip,
+                collapse_mode     = collapse_mode,
             )
             try:
                 info = builder.build()
@@ -183,6 +209,8 @@ def run_frame_pushover(
                 push["infill_lines"]  = info.get("infill_lines", [])
                 push["stories_z"]     = info["stories_z"]
                 push["total_height"]  = info["total_height"]
+                # Enriquecer health con fid/kind/story (Ola 2)
+                _enrich_pushover_health(push.get("health", {}), info["element_lines"])
 
                 print(f"[frame_pushover] Pushover {direction}: {push['status']} "
                       f"| {push['converged_steps']}/{push['total_steps']} pasos "

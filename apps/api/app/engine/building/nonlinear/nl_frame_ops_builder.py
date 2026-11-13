@@ -87,13 +87,27 @@ class NLFrameOPSBuilder:
         self,
         canonical:         dict,
         spec:              dict,
-        n_integration_pts: int = 5,
+        n_integration_pts: int = 5,       # 5 IPs es suficiente con HingeRadau
+                                           # (localiza integración en rótulas con
+                                           # pesos adaptativos; subir a 7 no mejora
+                                           # precisión pero sube 30% costo)
         plastic_hinge_len: float = 0.0,   # 0 → auto = max(h_m/2, 0.1)
+        collapse_mode:     str   = "ductile",  # "physical" | "ductile"
     ):
         self._c       = canonical
         self._s       = spec
         self._n_ip    = n_integration_pts
         self._lp_user = plastic_hinge_len
+        # "physical": MinMax wraps Concrete02/Steel02 → fibras mueren al cruzar
+        #             crush/fractura, captura colapso físico, puede causar
+        #             non-convergence cuando varias fibras mueren a la vez.
+        # "ductile":  SIN MinMax, los materiales mantienen su rama descendente
+        #             al residual (20%/40%) indefinidamente, nunca "mueren".
+        #             Mejor convergencia, obtiene curva/historia completa, pero
+        #             no captura crush físico.
+        self._collapse_mode = str(collapse_mode).lower().strip()
+        if self._collapse_mode not in ("physical", "ductile"):
+            self._collapse_mode = "ductile"
 
         # Materiales / secciones cacheadas
         self._mat_ctr   = _MAT_OFFSET
@@ -391,15 +405,57 @@ class NLFrameOPSBuilder:
 
         steps_out: list[dict] = []
         converged = 0
+        # Health tracking (Ola 2) — mismo esquema que dinámico para que el UI
+        # pueda consumir el mismo bloque independiente del tipo de análisis.
+        health: dict = {
+            "status":                "success",
+            "aborted":               False,
+            "abort_reason":          None,
+            "abort_step":            None,
+            "abort_drift_pct":       None,
+            "n_failed_steps":        0,
+            "n_bisections_total":    0,
+            "pathological_element":  None,
+            "pathological_ranking":  [],
+        }
+
+        # Tracking del cortante pico para detectar colapso del edificio (Ola 4).
+        # Criterio de parada: al perder 75 % de la resistencia lateral pico
+        # (Vb/Vb_pico ≤ 0.25) el pushover se detiene — continuar después pierde
+        # significado físico. Esto evita:
+        #   - oscilaciones residuales por MinMax post-crush
+        #   - curvas que caen "casi a cero" y luego rebotan por redistribución
+        #     numérica (no refleja capacidad real del edificio después de pandeo
+        #     del refuerzo y aplastamiento del núcleo)
+        # Valor acordado con el ingeniero estructural (Frank Vidales, 2026-11-04).
+        # Más agresivo que el criterio ATC-40 clásico (0.80 = early softening)
+        # y más conservador que llegar a 0 absoluto.
+        VB_PEAK_MIN_KN       = 50.0   # Vb_pico debe superarse para habilitar el check
+        VB_COLLAPSE_FRAC     = 0.25   # Vb ≤ 25 % del pico → colapso (75 % pérdida)
+        VB_COLLAPSE_STEPS    = 2      # 2 pasos consecutivos bajo el umbral confirman
+        vb_peak_abs          = 0.0
+        vb_collapse_streak   = 0
 
         for step_idx in range(n_steps):
             if cancel_flag and cancel_flag[0]:
+                health["status"]       = "partial"
+                health["aborted"]      = True
+                health["abort_reason"] = "user_cancel"
+                health["abort_step"]   = converged
                 break
             # Primero paso completo; si falla, bisection progresivo.
             # Esto permite "atravesar" fallos locales (una fibra entra a crush
             # con MinMax) sin detener el pushover global — el edificio todavía
             # tiene capacidad por redistribución.
             if self._try_step_with_bisection(sign, inc_m, dof) != 0:
+                health["status"]          = "partial"
+                health["aborted"]         = True
+                health["abort_reason"]    = "step_fail"
+                health["abort_step"]      = converged
+                health["abort_drift_pct"] = (
+                    round(abs(float(ops.nodeDisp(self._control_node, dof))) / total_h * 100.0, 4)
+                )
+                self._populate_pathological_frames(health, col_tags + bm_tags)
                 break
             converged += 1
             ctrl_disp  = float(ops.nodeDisp(self._control_node, dof))
@@ -413,6 +469,33 @@ class NLFrameOPSBuilder:
                 "base_shear_kN":  round(base_shear, 2),
             }
             steps_out.append(step_info)
+
+            # Detección de colapso del edificio — Vb ya perdió 75 % del pico.
+            vb_abs = abs(base_shear)
+            if vb_abs > vb_peak_abs:
+                vb_peak_abs = vb_abs
+            if vb_peak_abs > VB_PEAK_MIN_KN:
+                if vb_abs <= VB_COLLAPSE_FRAC * vb_peak_abs:
+                    vb_collapse_streak += 1
+                else:
+                    vb_collapse_streak = 0
+                if vb_collapse_streak >= VB_COLLAPSE_STEPS:
+                    pct_loss = (1.0 - vb_abs / vb_peak_abs) * 100.0
+                    health["status"]          = "partial"
+                    health["aborted"]         = True
+                    health["abort_reason"]    = "vb_near_zero"
+                    health["abort_step"]      = converged
+                    health["abort_drift_pct"] = round(drift_pct, 4)
+                    health["vb_peak_kN"]      = round(vb_peak_abs, 2)
+                    health["vb_at_abort_kN"]  = round(vb_abs, 2)
+                    health["vb_loss_pct"]     = round(pct_loss, 1)
+                    self._populate_pathological_frames(health, col_tags + bm_tags)
+                    print(
+                        f"[frame_pushover] Dir {direction}: COLAPSO — Vb cayó "
+                        f"{pct_loss:.0f} % (de {vb_peak_abs:.1f} kN a {vb_abs:.1f} kN) "
+                        f"en drift {drift_pct:.3f}% → análisis detenido"
+                    )
+                    break
 
             if capture and (converged % max(1, history_stride) == 0):
                 _capture()
@@ -485,6 +568,11 @@ class NLFrameOPSBuilder:
             "success" if converged == n_steps
             else ("partial" if converged > 0 else "failed")
         )
+        # Si salió success pero no hubo abort registrado, igual poblamos el top
+        # ranking para contexto del usuario.
+        if status == "success" and not health["aborted"]:
+            self._populate_pathological_frames(health, col_tags + bm_tags)
+
         result = {
             "status":           status,
             "direction":        direction,
@@ -498,6 +586,7 @@ class NLFrameOPSBuilder:
                 "max_base_shear_kN":   max((s["base_shear_kN"] for s in steps_out), default=0.0),
                 "last_displacement_m": steps_out[-1]["displacement_m"] if steps_out else 0.0,
             } if steps_out else {},
+            "health":           health,
         }
         if history_meta:
             result["history"] = history_meta
@@ -667,38 +756,52 @@ class NLFrameOPSBuilder:
     ) -> int:
         """Concrete02 Mander envuelto en MinMax.
 
-        El MinMax wrapper hace que la fibra devuelva σ=0 definitivamente al
-        superar εcu (crush físico). Sin esto, Concrete02 mantiene su residual
-        del 20% para siempre y el modelo subestima drásticamente el colapso.
+        Dos esquemas según confinamiento:
 
-        Buffer de 20% más allá de εcu antes de activar el crush — ayuda a la
-        convergencia numérica cerca de la deformación última sin perder
-        realismo (el crush real ocurre en el rango εcu ± 20%).
+          - `label == "conf"` (núcleo confinado DMO/DES):
+             * Residual post-pico: 40% de f'c (consistente con Mander para
+               confinamiento efectivo s/db≤8 — el estribo mantiene al núcleo
+               trabajando mucho más allá de εcu nominal).
+             * MinMax crush en -4.0·εcu (en el rango 0.08-0.10 típico Mander),
+               para no "matar" la fibra prematuramente y evitar snap-throughs
+               numéricos cuando múltiples fibras cruzan simultáneamente.
+
+          - `label != "conf"` (recubrimiento sin confinar):
+             * Residual 20% (el no-confinado no retiene mucho post-pico).
+             * MinMax crush en -3.0·εcu (sin estribo cercano, el crush físico
+               ocurre más rápido pero necesitamos margen para que la columna
+               redistribuya a las caras internas).
+
+        Esto permite capturar comportamiento DMO completo hasta drift ≥ 4%
+        sin perder convergencia en edificios bien detallados.
         """
         key = (round(fcc_MPa, 2), round(eps_cc, 5), round(eps_cu, 5), label)
         if key in self._mat_concrete:
             return self._mat_concrete[key]
 
-        # Material base Concrete02 (Mander) — tag "interno"
+        confined = (label == "conf")
+
+        # Material base Concrete02 — residual depende del nivel de confinamiento.
         tag_base = self._next_mat()
         fcc_kPa = fcc_MPa * 1000.0
-        f_cu    = 0.20 * fcc_kPa          # 20% residual (rama descendente)
-        ft      = 0.10 * fcc_kPa          # resistencia a tracción
+        f_cu    = (0.40 if confined else 0.20) * fcc_kPa   # residual
+        ft      = 0.10 * fcc_kPa                            # tracción
         Ets     = ft / max(eps_cc * 0.5, 0.0005)
         self._ops.uniaxialMaterial(
             "Concrete02", tag_base,
-            -fcc_kPa, -eps_cc,            # fpc, epsc0
-            -f_cu,    -eps_cu,            # fpcu, epsU
-            0.1, ft, Ets,                 # lambda, ft, Ets
+            -fcc_kPa, -eps_cc,
+            -f_cu,    -eps_cu,
+            0.1, ft, Ets,
         )
 
-        # MinMax wrapper — fuerza σ=0 fuera del rango de deformación válido.
-        # Buffer generoso 2.5·εcu: el Concrete02 ya tiene rama descendente al
-        # 20% residual, dejamos que esa rama actúe en un rango amplio antes
-        # del crush físico. Evita que una fibra sola rompa la convergencia
-        # cuando la columna todavía puede redistribuir carga a vecinas.
+        # Modo ductile → no envolvemos; Concrete02 mantiene residual indefinido.
+        if self._collapse_mode == "ductile":
+            self._mat_concrete[key] = tag_base
+            return tag_base
+
+        # Modo physical → MinMax wrapper con crush físico adaptado al confinamiento.
         tag_wrap = self._next_mat()
-        eps_crush   = -2.5 * eps_cu
+        eps_crush   = (-4.0 if confined else -3.0) * eps_cu
         eps_tension = +5.0 * (ft / 1000.0 / 24000.0)
         self._ops.uniaxialMaterial(
             "MinMax", tag_wrap, tag_base,
@@ -726,11 +829,15 @@ class NLFrameOPSBuilder:
             0.01,                   # b (hardening)
             15.0, 0.925, 0.15,      # R0, cR1, cR2
         )
-        # Buffer 1.2·εsu — permite deformación plástica adicional antes de
-        # fractura (varias barras pueden "estirarse" un 10-20% más allá de
-        # εsu nominal en edificios reales por hardening residual).
+        # Modo ductile → no envolvemos; Steel02 no fractura y mantiene
+        # resistencia post-fluencia con hardening residual.
+        if self._collapse_mode == "ductile":
+            self._mat_steel[key] = tag_base
+            return tag_base
+
+        # Modo physical → MinMax con buffer 1.5·εsu (A615 Gr60 real).
         tag_wrap = self._next_mat()
-        eps_fail = 1.2 * eps_su
+        eps_fail = 1.5 * eps_su
         self._ops.uniaxialMaterial(
             "MinMax", tag_wrap, tag_base,
             "-min", -eps_fail,
@@ -799,9 +906,14 @@ class NLFrameOPSBuilder:
             yc1, yc2 = y1 * 0.5, y2 * 0.5
             zc1, zc2 = z1 * 0.5, z2 * 0.5
 
-        n_fib_core_y = 8
-        n_fib_core_z = 8
+        # Mallado reducido alineado con estrucmed-web (archetype_1 original).
+        # Previamente 8×8 core + laterales 2×10 = 136 fibras/sección; ahora
+        # 6×6 core + laterales 2×6 = 84 fibras. Se mantiene resolución suficiente
+        # para captar la ley momento-curvatura; speedup del solver ~1.4×.
+        n_fib_core_y = 6
+        n_fib_core_z = 6
         n_fib_cov_t  = 2   # transverse (through cover thickness)
+        n_fib_lat_lo = 6   # longitudinal subdivs en los covers laterales
 
         # Rigidez torsional elástica (G ≈ Ec/2.4, J ≈ b·h³/3 para rect sólida)
         G_kPa = (4700.0 * (fc_MPa ** 0.5)) * 1000.0 / 2.4
@@ -817,9 +929,9 @@ class NLFrameOPSBuilder:
                   yc1, z1,  yc2, zc1)         # bottom
         ops.patch("rect", mat_cover, n_fib_core_y, n_fib_cov_t,
                   yc1, zc2, yc2, z2)          # top
-        ops.patch("rect", mat_cover, n_fib_cov_t, 10,
+        ops.patch("rect", mat_cover, n_fib_cov_t, n_fib_lat_lo,
                   y1,  z1,  yc1, z2)          # left (abarca esquinas)
-        ops.patch("rect", mat_cover, n_fib_cov_t, 10,
+        ops.patch("rect", mat_cover, n_fib_cov_t, n_fib_lat_lo,
                   yc2, z1,  y2,  z2)          # right (abarca esquinas)
 
         # Barras longitudinales
@@ -1051,8 +1163,13 @@ class NLFrameOPSBuilder:
                     "HingeRadau", integ_tag,
                     sec_end, float(lp), sec_end, float(lp), sec_mid,
                 )
+                # -iter 50 1e-8: itera hasta 50 veces internamente para encontrar
+                # fuerzas/deformaciones compatibles de la sección (defaults de
+                # OpenSees son 10 iter / 1e-16, muy estrictos en no-linealidad
+                # fuerte y causan "failed to get compatible element forces").
                 ops.element(
                     "forceBeamColumn", ele_tag, ni, nj, _TRANSF_COL, integ_tag,
+                    "-iter", 50, 1.0e-8,
                 )
             except Exception as exc:
                 print(f"[NLFrameOPSBuilder] columna {fid}: {exc}")
@@ -1075,6 +1192,7 @@ class NLFrameOPSBuilder:
     def _build_beams(self) -> None:
         ops = self._ops
         beams = self._s.get("elements", {}).get("beams", {})
+        n_elastic_short = 0
 
         for fid, bm in beams.items():
             ni_lbl = bm["node_i"]; nj_lbl = bm["node_j"]
@@ -1087,6 +1205,53 @@ class NLFrameOPSBuilder:
             fc     = float(geo.get("fc_MPa", 21.0))
             fy     = float(geo.get("fy_MPa", 420.0))
             cover  = float(geo.get("cover_m", 0.040))
+
+            # ── Vigas cortas (L/h < 2): modelar como elasticBeamColumn ──────
+            # ACI 318 §18.10.7 las trata como "coupling beams" con formulación
+            # aparte. forceBeamColumn + HingeRadau en L/h < 2 genera oscilación
+            # numérica porque los 6 IPs (2 Lobatto por hinge + 2 Gauss interior)
+            # quedan amontonados: intervalo elástico interior = L − 2·lp
+            # puede ser < 0.5·L y los IPs se superponen. El elemento pelea con
+            # el solver aún a deformaciones pequeñas (verificado 2026-11-04 con
+            # viga 80000249 de Prueba 4: θ_p = 0.0007 rad y hacía bulldozer).
+            # Modelarlas elásticas es conservador: la demanda se transfiere a
+            # los pórticos principales adyacentes (que son los que diseñamos).
+            if L / h < 2.0:
+                Ec_mpa = 4700 * (fc ** 0.5)  # NSR-10 C.8.5.1
+                Ec_kpa = Ec_mpa * 1000.0
+                Ag   = b * h
+                Iy   = b * (h ** 3) / 12.0
+                Iz   = h * (b ** 3) / 12.0
+                Jx   = 0.21 * b * (h ** 3) * (
+                    1.0 - 0.63 * b / h + 0.052 * (b / h) ** 5
+                ) if b < h else 0.21 * h * (b ** 3)
+                Gc_kpa = Ec_kpa / (2.0 * (1.0 + 0.2))
+                ele_tag = _ELE_BM_OFFSET + len(self._ele_bm_map) + 1
+                ni = _joint_tag(ni_lbl); nj = _joint_tag(nj_lbl)
+                try:
+                    ops.element(
+                        "elasticBeamColumn", ele_tag, ni, nj,
+                        float(Ag), float(Ec_kpa), float(Gc_kpa),
+                        float(Jx), float(Iy), float(Iz),
+                        _TRANSF_BM,
+                    )
+                except Exception as exc:
+                    print(f"[NLFrameOPSBuilder] viga corta fid={fid} L/h={L/h:.2f}: {exc}")
+                    continue
+                self._ele_bm_map[fid] = ele_tag
+                self._element_lines.append({
+                    "fid":        str(fid),
+                    "kind":       "beam",
+                    "model":      "elastic",   # distinción vs "fiber"
+                    "story":      bm.get("story", ""),
+                    "ele_tag":    ele_tag,
+                    "node_i":     ni, "node_j": nj,
+                    "node_i_lbl": ni_lbl, "node_j_lbl": nj_lbl,
+                    "b_m": b, "h_m": h, "L_m": L, "lp_m": 0.0,
+                    "reason_elastic": f"L/h={L/h:.2f} < 2 (coupling beam, estabilidad numérica)",
+                })
+                n_elastic_short += 1
+                continue
 
             # Armado: usamos zona "end_i" como representativo (crítica)
             zones  = bm.get("reinforcement", {}).get("zones", {})
@@ -1123,8 +1288,11 @@ class NLFrameOPSBuilder:
                     "HingeRadau", integ_tag,
                     sec_end, float(lp), sec_end, float(lp), sec_mid,
                 )
+                # -iter: ver nota en columnas; mismo criterio para vigas que
+                # entran a plasticidad rápido (vigas DMO con θ_IO ≈ 0.005).
                 ops.element(
                     "forceBeamColumn", ele_tag, ni, nj, _TRANSF_BM, integ_tag,
+                    "-iter", 50, 1.0e-8,
                 )
             except Exception as exc:
                 print(f"[NLFrameOPSBuilder] viga {fid}: {exc}")
@@ -1141,6 +1309,11 @@ class NLFrameOPSBuilder:
                 "b_m": b, "h_m": h, "L_m": L,
                 "lp_m": round(lp, 4),
             })
+
+        if n_elastic_short > 0:
+            print(f"[NLFrameOPSBuilder] {n_elastic_short} vigas cortas (L/h < 2) "
+                  f"modeladas como elasticBeamColumn — coupling/spandrel beams, "
+                  f"no participan en mecanismo de colapso.")
 
     # ── Infills (puntales equivalentes RCF-AD) ────────────────────────────────
 
@@ -1458,6 +1631,33 @@ class NLFrameOPSBuilder:
 
     # ── Análisis helpers ──────────────────────────────────────────────────────
 
+    def _populate_pathological_frames(
+        self, health: dict, elements: list[int], top_n: int = 5
+    ) -> None:
+        """
+        Al abortar el pushover, sondea elementos para rankearlos por rotación
+        plástica acumulada. Permite al usuario ver qué elemento tumbó el análisis.
+        """
+        ops = self._ops
+        ranked: list[dict] = []
+        for tag in elements:
+            try:
+                pd = ops.eleResponse(int(tag), 'plasticDeformation')
+                if pd is None:
+                    continue
+                theta_max = max((abs(float(x)) for x in pd), default=0.0)
+                ranked.append({
+                    "ele_tag":     int(tag),
+                    "theta_p_max": round(theta_max, 5),
+                })
+            except Exception:
+                continue
+        if not ranked:
+            return
+        ranked.sort(key=lambda r: -r["theta_p_max"])
+        health["pathological_element"] = dict(ranked[0])
+        health["pathological_ranking"] = ranked[:top_n]
+
     def _try_step(self) -> int:
         """Intenta un paso con varios algoritmos / tolerancias. Retorna 0 si
         convergió."""
@@ -1483,7 +1683,7 @@ class NLFrameOPSBuilder:
         sign:   float,
         inc_m:  float,
         dof:    int,
-        max_subdivisions: tuple[int, ...] = (2, 4, 10, 20),
+        max_subdivisions: tuple[int, ...] = (2, 4, 10, 20, 50, 100),
     ) -> int:
         """Intenta un paso completo. Si falla, subdivide el incremento
         progresivamente y reintenta hasta `max_subdivisions`.

@@ -211,6 +211,7 @@ class StructuralAnalysisType(str, enum.Enum):
     variant_pushover = "variant_pushover" # Re-análisis pushover NL de una variante de rediseño
     frame_pushover  = "frame_pushover"   # Pushover no lineal de pórticos RC (forceBeamColumn + fibras)
     nlth            = "nlth"             # Análisis cronológico no lineal (time-history) bidireccional
+    ida             = "ida"              # Incremental Dynamic Analysis (N pares FEMA × M niveles Sa)
 
 
 class StructuralJobStatus(str, enum.Enum):

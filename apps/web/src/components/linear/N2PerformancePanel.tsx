@@ -132,7 +132,7 @@ export default function N2PerformancePanel({ projectId, direction, system = "fra
   }, [result, k, uLabel]);
 
   return (
-    <div className="flex flex-col gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+    <div className="flex flex-col gap-3 pl-glass rounded-xl p-4">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <div className="flex flex-col">
           <h4 className="text-sm font-semibold uppercase tracking-wider">

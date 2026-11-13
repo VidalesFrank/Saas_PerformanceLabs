@@ -58,6 +58,18 @@ from .element_thresholds import (
     compute_element_thresholds,
     compute_from_project_dir,
 )
+from .reinforcement_recommender import (
+    ElementDiagnosis,
+    ReinforcementOption,
+    diagnose_element,
+    recommend_reinforcement_fixes,
+)
+from .performance_verifier import (
+    ElementVerification,
+    PerformanceVerificationResult,
+    apply_verification_fixes,
+    verify_performance_capacity,
+)
 
 __all__ = [
     "NLSpecBuilder",
@@ -104,4 +116,12 @@ __all__ = [
     "classify_demand_by_element",
     "compute_element_thresholds",
     "compute_from_project_dir",
+    "ElementDiagnosis",
+    "ReinforcementOption",
+    "diagnose_element",
+    "recommend_reinforcement_fixes",
+    "ElementVerification",
+    "PerformanceVerificationResult",
+    "apply_verification_fixes",
+    "verify_performance_capacity",
 ]

@@ -173,7 +173,7 @@ export default function DriftProfileChart({
 
   if (profile.length === 0) {
     return (
-      <div className="flex items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--surface)]"
+      <div className="flex items-center justify-center pl-glass rounded-xl"
            style={{ height }}>
         <p className="text-xs text-[var(--text-muted)]">
           Sin datos de perfil para este frame.
@@ -185,7 +185,7 @@ export default function DriftProfileChart({
   const maxDrift = Math.max(...profile.map(p => Math.abs(p.drift_pct)));
 
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3">
+    <div className="pl-glass rounded-xl p-3">
       <div className="flex items-baseline justify-between mb-2">
         <p className="text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wider">
           Perfil de deriva · Frame {frameIdx + 1} / {data.frames.length}

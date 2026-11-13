@@ -25,7 +25,7 @@ import type { ElementDemandResult } from "@/lib/structural-api";
 import type {
   NLTHResult, LocalEvent, LocalEventType, HingeDamageLevel,
   NLFramePushoverHistory, ElementLine, InfillLine, InfillDamageLevel,
-  InfillDamagePanel,
+  InfillDamagePanel, InfillDamageByDriftPanel, FailureModeElement,
 } from "@/lib/structural-types";
 
 import { EVENT_STYLE } from "./LocalEventsPanel";
@@ -326,7 +326,9 @@ export default function NLTHFinalState3D({ projectId, result, demand }: Props) {
     }
 
     // ── Infills (paneles de mampostería) ─────────────────────────────────
-    // Fuente de daño: result.infill_damage (si existe).
+    // Fuentes de daño combinadas (toma el peor nivel por panel):
+    //   1. result.infill_damage           → elongación del puntal RCF-AD
+    //   2. result.infill_damage_by_drift  → deriva de entrepiso FEMA 356/HAZUS
     // Fuente de geometría: result.infill_lines ?? geom.infill_lines.
     const infillLines: InfillLine[] =
       result.infill_lines ?? geom.infill_lines ?? [];
@@ -334,6 +336,15 @@ export default function NLTHFinalState3D({ projectId, result, demand }: Props) {
     for (const p of (result.infill_damage?.panels ?? [])) {
       infillDmgMap[p.panel_id] = p;
     }
+    const infillDriftMap: Record<string, InfillDamageByDriftPanel> = {};
+    for (const p of (result.infill_damage_by_drift?.panels ?? [])) {
+      infillDriftMap[p.panel_id] = p;
+    }
+    const LEVEL_RANK: Record<InfillDamageLevel, number> =
+      { none: 0, cracking: 1, degrading: 2, collapse: 3 };
+    const worstLevel = (
+      a: InfillDamageLevel, b: InfillDamageLevel,
+    ): InfillDamageLevel => (LEVEL_RANK[a] >= LEVEL_RANK[b] ? a : b);
     if (infillLines.length > 0) {
       type Bucket = {
         px: number[]; py: number[]; pz: number[];
@@ -355,8 +366,11 @@ export default function NLTHFinalState3D({ projectId, result, demand }: Props) {
       for (const inf of infillLines) {
         const bl = inf.coords.bl, br = inf.coords.br;
         const tr = inf.coords.tr, tl = inf.coords.tl;
-        const d = infillDmgMap[String(inf.panel_id)];
-        const level: InfillDamageLevel = d?.max_level ?? "none";
+        const d  = infillDmgMap[String(inf.panel_id)];
+        const dd = infillDriftMap[String(inf.panel_id)];
+        const lvlElong: InfillDamageLevel = d?.max_level  ?? "none";
+        const lvlDrift: InfillDamageLevel = dd?.max_level ?? "none";
+        const level: InfillDamageLevel = worstLevel(lvlElong, lvlDrift);
         const b = buckets[level];
         const base = b.px.length;
         b.px.push(bl[0], br[0], tr[0], tl[0]);
@@ -376,12 +390,19 @@ export default function NLTHFinalState3D({ projectId, result, demand }: Props) {
           ? `paso ${d.step_first_cracking}` : "—";
         const whenColl  = d && d.step_first_collapse >= 0
           ? `paso ${d.step_first_collapse}` : "—";
+        const driftLine = dd
+          ? `Deriva piso: ${dd.max_drift_pct.toFixed(2)}% (${dd.orientation}) → <b>${INFILL_LABEL[lvlDrift]}</b><br>`
+          : "";
+        const elongLine = d
+          ? `Elongación puntal: damage ${dmgPct}% → <b>${INFILL_LABEL[lvlElong]}</b><br>`
+          : "";
         b.hoverText.push(
           `<b>Infill ${inf.panel_id}</b> · Piso ${inf.story}<br>` +
           `L=${inf.L_m.toFixed(2)} m · H=${inf.H_m.toFixed(2)} m · t=${inf.thickness_m.toFixed(3)} m<br>` +
           `Ancho equivalente ${inf.effective_width_m.toFixed(3)} m · λ_aberturas=${inf.lambda_openings.toFixed(2)}<br>` +
-          `<b>Estado: ${INFILL_LABEL[level]}</b> · damage ${dmgPct}%<br>` +
-          `Primera fisura: ${whenCrack} · Primer colapso: ${whenColl}`
+          driftLine + elongLine +
+          `<b>Estado consolidado: ${INFILL_LABEL[level]}</b><br>` +
+          `Primera fisura (elong): ${whenCrack} · Primer colapso (elong): ${whenColl}`
         );
         b.count++;
       }
@@ -423,6 +444,93 @@ export default function NLTHFinalState3D({ projectId, result, demand }: Props) {
       }
     }
 
+    // ── Marcadores de modo de falla por columna (ASCE 41 × hinges) ───────
+    // Se dibujan en los dos extremos de cada columna marcada, superpuestos
+    // sobre el color de daño actual. Rayo ⚡ para shear_failed, cruz ✕ para
+    // flexure_shear_risk. No reemplazan el coloreo, lo complementan.
+    const failureElements: FailureModeElement[] = result.failure_modes?.elements ?? [];
+    const failureByFid = new Map<string, FailureModeElement>();
+    for (const e of failureElements) {
+      if (e.needs_marker) failureByFid.set(e.fid, e);
+    }
+    if (failureByFid.size > 0 && geomStatus === "ok" && geom) {
+      type MkBucket = {
+        x: number[]; y: number[]; z: number[]; text: string[];
+      };
+      const markers: Record<"lightning" | "cross", MkBucket> = {
+        lightning: { x: [], y: [], z: [], text: [] },
+        cross:     { x: [], y: [], z: [], text: [] },
+      };
+      for (const el of geom.element_lines) {
+        if (el.kind !== "column") continue;
+        const fm = failureByFid.get(String(el.fid));
+        if (!fm) continue;
+        const ri = geom.joints_ref[String(el.node_i)];
+        const rj = geom.joints_ref[String(el.node_j)];
+        if (!ri || !rj) continue;
+        const sym = fm.marker_symbol === "lightning" ? "lightning" : "cross";
+        const b = markers[sym];
+        // Marcador a 15% desde cada extremo (misma convención que rótulas).
+        const t = 0.15;
+        for (const [x1, y1, z1, x2, y2, z2] of [
+          [ri[0], ri[1], ri[2], rj[0], rj[1], rj[2]],
+          [rj[0], rj[1], rj[2], ri[0], ri[1], ri[2]],
+        ]) {
+          b.x.push(x1 + t * (x2 - x1));
+          b.y.push(y1 + t * (y2 - y1));
+          b.z.push(z1 + t * (z2 - z1));
+          const label = sym === "lightning" ? "⚡ Falla por cortante"
+                                              : "✕ Riesgo flexión-cortante";
+          b.text.push(
+            `<b>${label}</b><br>` +
+            `Columna ${fm.fid} · ${fm.section} · Piso ${fm.story}<br>` +
+            `Predicción ASCE 41 §10.3: ${fm.asce_prediction} (cond. ${fm.asce_condition})<br>` +
+            `Vp/Vn = ${fm.Vp_over_Vn.toFixed(2)} · Vn = ${fm.Vn_kN.toFixed(0)} kN<br>` +
+            `Rótula observada: ${fm.observed_hinge.toUpperCase()} · DCR = ${fm.max_dcr.toFixed(2)}<br>` +
+            (fm.flags.length ? `Flags detallado: ${fm.flags.join(", ")}` : "")
+          );
+        }
+      }
+      // Plotly scatter3d: no soporta "lightning" literal; usamos symbol
+      // alternativos que recuerden al concepto.
+      if (markers.lightning.x.length > 0) {
+        traces.push({
+          type: "scatter3d", mode: "markers+text",
+          x: markers.lightning.x, y: markers.lightning.y, z: markers.lightning.z,
+          marker: {
+            size: 10, symbol: "diamond-open",
+            color: "#dc2626", line: { color: "#991b1b", width: 2 },
+          },
+          text: markers.lightning.x.map(() => "⚡"),
+          textposition: "middle center",
+          textfont: { size: 14, color: "#dc2626" },
+          hovertext: markers.lightning.text,
+          hoverinfo: "text",
+          name: `Falla por cortante (${markers.lightning.x.length / 2})`,
+          legendgroup: "fm-shear",
+          showlegend: true,
+        });
+      }
+      if (markers.cross.x.length > 0) {
+        traces.push({
+          type: "scatter3d", mode: "markers+text",
+          x: markers.cross.x, y: markers.cross.y, z: markers.cross.z,
+          marker: {
+            size: 10, symbol: "x",
+            color: "#ea580c", line: { color: "#9a3412", width: 2 },
+          },
+          text: markers.cross.x.map(() => "✕"),
+          textposition: "middle center",
+          textfont: { size: 12, color: "#ea580c" },
+          hovertext: markers.cross.text,
+          hoverinfo: "text",
+          name: `Riesgo flexión-cortante (${markers.cross.x.length / 2})`,
+          legendgroup: "fm-flexshear",
+          showlegend: true,
+        });
+      }
+    }
+
     const layout = {
       paper_bgcolor: "transparent",
       scene: {
@@ -445,7 +553,7 @@ export default function NLTHFinalState3D({ projectId, result, demand }: Props) {
       { responsive: true, displayModeBar: false });
 
     return () => { if (divRef.current) Plotly.purge(divRef.current); };
-  }, [geom, geomStatus, damageByFid, viewMode]);
+  }, [geom, geomStatus, damageByFid, viewMode, result.failure_modes]);
 
   // ── Resumen por estado (pills arriba) ─────────────────────────────────
   const counts: Record<number, number> = {};
@@ -518,14 +626,33 @@ export default function NLTHFinalState3D({ projectId, result, demand }: Props) {
         </span>
       </div>
 
-      {/* Resumen por nivel de daño — infills (si hay) */}
-      {result.infill_damage && result.infill_damage.status === "success" &&
-       result.infill_damage.n_total > 0 && (() => {
-        const d = result.infill_damage;
+      {/* Resumen por nivel de daño — infills (consolidado: elong + deriva) */}
+      {(() => {
+        const dElong = result.infill_damage;
+        const dDrift = result.infill_damage_by_drift;
+        const hasElong = dElong && dElong.status === "success" && dElong.n_total > 0;
+        const hasDrift = dDrift && dDrift.status === "success" && dDrift.n_total > 0;
+        if (!hasElong && !hasDrift) return null;
+
+        const LEVEL_RANK: Record<InfillDamageLevel, number> =
+          { none: 0, cracking: 1, degrading: 2, collapse: 3 };
         const by: Record<InfillDamageLevel, number> = {
           none: 0, cracking: 0, degrading: 0, collapse: 0,
         };
-        for (const p of d.panels) by[p.max_level] = (by[p.max_level] ?? 0) + 1;
+        const perPanel: Record<string, InfillDamageLevel> = {};
+        if (hasElong) {
+          for (const p of dElong!.panels) {
+            perPanel[p.panel_id] = p.max_level;
+          }
+        }
+        if (hasDrift) {
+          for (const p of dDrift!.panels) {
+            const cur = perPanel[p.panel_id] ?? "none";
+            perPanel[p.panel_id] = LEVEL_RANK[p.max_level] > LEVEL_RANK[cur] ? p.max_level : cur;
+          }
+        }
+        for (const lvl of Object.values(perPanel)) by[lvl] += 1;
+        const total = Object.keys(perPanel).length;
         const pills: Array<[string, string, number]> = [
           ["Infill colapsado",   INFILL_FILL.collapse,  by.collapse],
           ["Infill degradando",  INFILL_FILL.degrading, by.degrading],
@@ -545,7 +672,38 @@ export default function NLTHFinalState3D({ projectId, result, demand }: Props) {
               )
             ))}
             <span className="text-slate-500 text-[10px] ml-auto">
-              {d.n_total} paneles de mampostería · damage máx {(d.max_damage * 100).toFixed(1)}%
+              {total} paneles de mampostería
+              {hasElong && ` · damage máx (elong) ${(dElong!.max_damage * 100).toFixed(1)}%`}
+              {hasDrift && ` · deriva máx (piso) ${dDrift!.max_drift_pct.toFixed(2)}%`}
+            </span>
+          </div>
+        );
+      })()}
+
+      {/* Resumen por categoría de modo de falla (ASCE 41 × hinges NLTHA) */}
+      {result.failure_modes?.status === "success" &&
+       result.failure_modes.n_total > 0 && (() => {
+        const c = result.failure_modes!.counts;
+        const pills: Array<[string, string, number, string]> = [
+          ["⚡ Falla por cortante",      "#dc2626", c.shear_failed       ?? 0, "shear_failed"],
+          ["✕ Riesgo flexión-cortante", "#ea580c", c.flexure_shear_risk ?? 0, "flexure_shear_risk"],
+          ["Flexión dúctil",            "#eab308", c.flexural_ductile   ?? 0, "flexural_ductile"],
+          ["Sin daño",                  "#64748b", c.no_damage          ?? 0, "no_damage"],
+        ];
+        return (
+          <div className="flex items-center gap-2 flex-wrap text-xs">
+            {pills.map(([label, col, n, key]) => (
+              n === 0 ? null : (
+                <span key={key}
+                      className="px-2 py-0.5 rounded font-semibold text-[11px] border"
+                      style={{ background: `${col}18`, color: col,
+                               borderColor: `${col}44` }}>
+                  {label}: {n}
+                </span>
+              )
+            ))}
+            <span className="text-slate-500 text-[10px] ml-auto">
+              {result.failure_modes!.n_total} columnas · ASCE 41 §10.3 × rótulas observadas
             </span>
           </div>
         );

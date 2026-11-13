@@ -13,11 +13,12 @@ import hashlib
 import json
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
@@ -1911,6 +1912,191 @@ def list_nlth_records(project_id: str, user: CurrentUser, db: DB):
     return result
 
 
+class SelectLibraryPairRequest(BaseModel):
+    """
+    Request para `POST /{project_id}/nlth/select-library-pair`.
+    Modos de escalado:
+      - "manual":    usa `scale_manual` directamente (default 1.0).
+      - "sa_target": usuario pasa `T1_s` + `sa_target_g` → backend calcula scale.
+      - "nsr10":     backend lee el espectro NSR-10 guardado del proyecto y
+                     usa Sa_NSR10(T1) como sa_target; T1 también puede venir
+                     del modal result si no se envía.
+    """
+    pair_id:       int   = Field(..., ge=1, le=22)
+    scale_mode:    str   = Field("manual", pattern="^(manual|sa_target|nsr10)$")
+    scale_manual:  float = Field(1.0, gt=0, le=10.0)
+    T1_s:          float | None = None
+    sa_target_g:   float | None = None
+    xi:            float = Field(0.05, ge=0, le=0.2)
+
+
+@router.post("/{project_id}/nlth/select-library-pair")
+def select_library_pair(
+    project_id: str, req: SelectLibraryPairRequest,
+    user: CurrentUser, db: DB,
+) -> dict:
+    """
+    Copia los 2 archivos del par FEMA seleccionado a los paths estándar del
+    proyecto (`record_x.acc`, `record_y.acc`) y calcula el factor de escala
+    según el modo elegido. Devuelve metadata compatible con `upload-record`
+    para que el panel pre-llene `uploadX`/`uploadY` automáticamente.
+    """
+    import shutil
+
+    from app.engine.building.fema_catalog import (
+        FEMA_PAIRS, compute_scale_for_pair, get_record_path, get_record_dt,
+        read_record_timeseries, library_available,
+    )
+
+    if not library_available():
+        raise HTTPException(503, "Biblioteca FEMA no disponible en el servidor.")
+
+    pair = next((p for p in FEMA_PAIRS if p["pair"] == req.pair_id), None)
+    if pair is None:
+        raise HTTPException(404, f"Par FEMA {req.pair_id} no existe.")
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    rec_dir  = os.path.join(work_dir, "records")
+    os.makedirs(rec_dir, exist_ok=True)
+
+    # ── Resolver scale según el modo ─────────────────────────────────────────
+    scale_info: dict = {"mode": req.scale_mode}
+    if req.scale_mode == "manual":
+        scale = float(req.scale_manual)
+        scale_info["scale"] = round(scale, 5)
+    elif req.scale_mode == "sa_target":
+        if not req.T1_s or not req.sa_target_g:
+            raise HTTPException(400, "scale_mode=sa_target requiere T1_s y sa_target_g.")
+        res = compute_scale_for_pair(req.pair_id, req.T1_s, req.sa_target_g, req.xi)
+        scale = res.scale
+        scale_info.update({
+            "T1_s":                  res.T1_s,
+            "sa_target_g":           res.sa_target,
+            "sa_h1_unscaled_g":      round(res.sa_h1_unscaled, 5),
+            "sa_h2_unscaled_g":      round(res.sa_h2_unscaled, 5),
+            "sa_geomean_unscaled_g": round(res.sa_geomean_unscaled, 5),
+            "scale":                 round(res.scale, 5),
+        })
+    elif req.scale_mode == "nsr10":
+        # Lee T1 del modal_results.json y Sa(T1) del spectral_results.json
+        res_dir = os.path.join(work_dir, "results")
+        modal_path    = os.path.join(res_dir, "modal_results.json")
+        spectral_path = os.path.join(res_dir, "spectral_results.json")
+        if not os.path.exists(modal_path):
+            raise HTTPException(400, "Falta modal_results.json — corre el análisis modal antes.")
+        if not os.path.exists(spectral_path):
+            raise HTTPException(400, "Falta spectral_results.json — corre el análisis espectral antes.")
+        with open(modal_path, encoding="utf-8") as f:
+            modal = json.load(f)
+        with open(spectral_path, encoding="utf-8") as f:
+            spectral = json.load(f)
+        T1 = req.T1_s or float(modal.get("T1") or modal.get("T1_x") or 0.0)
+        if T1 <= 0:
+            raise HTTPException(400, "No se pudo determinar T1 del análisis modal.")
+        # Sa(T1) desde el espectro guardado: busca el más cercano en la curva.
+        spectrum = spectral.get("spectrum") or {}
+        T_vals  = spectrum.get("T_values")  or spectrum.get("T") or []
+        Sa_vals = spectrum.get("Sa")        or spectrum.get("Sa_g") or []
+        if not T_vals or not Sa_vals:
+            raise HTTPException(400, "Espectro NSR-10 no encontrado en spectral_results.json.")
+        import numpy as _np
+        sa_nsr10 = float(_np.interp(T1, _np.asarray(T_vals), _np.asarray(Sa_vals)))
+        res = compute_scale_for_pair(req.pair_id, T1, sa_nsr10, req.xi)
+        scale = res.scale
+        scale_info.update({
+            "T1_s":                  T1,
+            "sa_nsr10_g":            round(sa_nsr10, 5),
+            "sa_target_g":           round(sa_nsr10, 5),
+            "sa_h1_unscaled_g":      round(res.sa_h1_unscaled, 5),
+            "sa_h2_unscaled_g":      round(res.sa_h2_unscaled, 5),
+            "sa_geomean_unscaled_g": round(res.sa_geomean_unscaled, 5),
+            "scale":                 round(res.scale, 5),
+        })
+    else:
+        raise HTTPException(400, f"scale_mode desconocido: {req.scale_mode}")
+
+    # ── Copiar los 2 archivos al workspace ───────────────────────────────────
+    gm_h1, gm_h2 = pair["files"]
+    results = {}
+    for direction, gm_name in (("X", gm_h1), ("Y", gm_h2)):
+        src = get_record_path(gm_name)
+        dst_clean  = os.path.join(rec_dir, f"record_{direction.lower()}.acc")
+        dst_source = os.path.join(rec_dir, f"record_{direction.lower()}_source.txt")
+        shutil.copy(src, dst_clean)
+        shutil.copy(src, dst_source)
+        preview = read_record_timeseries(gm_name, max_points=600)
+        dt_rec   = get_record_dt(gm_name)
+        pga      = preview["pga"]
+        duration = preview["duration_s"]
+        results[direction] = {
+            "ok":           True,
+            "direction":    direction,
+            "path":         dst_clean,
+            "source_path":  dst_source,
+            "filename":     f"FEMA par {pair['pair']:02d} — {pair['earthquake']} "
+                            f"({pair['year']}, Mw {pair['mw']}, {pair['station']}) · {gm_name}",
+            "format":       "fema_flat",
+            "n_samples":    preview["n_full"],
+            "dt_detected":  dt_rec,
+            "duration_s":   duration,
+            "pga":          pga,
+            "units_hint":   "g",
+            "header_lines": [],
+            "description":  f"FEMA P-695 Far-Field — par {pair['pair']}, {gm_name}",
+            "preview":      {"t": preview["t"], "a": preview["a"],
+                             "stride": max(1, preview["n_full"] // 600)},
+            "fema_pair_id":  pair["pair"],
+            "fema_gm_name":  gm_name,
+        }
+
+    return {
+        "pair":        {
+            "pair_id":    pair["pair"],
+            "earthquake": pair["earthquake"],
+            "year":       pair["year"],
+            "mw":         pair["mw"],
+            "station":    pair["station"],
+            "rrup_km":    pair["rrup_km"],
+            "files":      pair["files"],
+        },
+        "scale":    round(scale, 5),
+        "scale_info": scale_info,
+        "upload_x": results["X"],
+        "upload_y": results["Y"],
+    }
+
+
+@router.get("/{project_id}/modal/result")
+def get_modal_result(project_id: str, user: CurrentUser, db: DB):
+    """Último `modal_results.json` del proyecto (si existe)."""
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    path = os.path.join(work_dir, "results", "modal_results.json")
+    if not os.path.exists(path):
+        raise HTTPException(404, "No hay resultados modales.")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.get("/{project_id}/spectral/result")
+def get_spectral_result(project_id: str, user: CurrentUser, db: DB):
+    """Último `spectral_results.json` del proyecto (incluye espectro NSR-10)."""
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    path = os.path.join(work_dir, "results", "spectral_results.json")
+    if not os.path.exists(path):
+        raise HTTPException(404, "No hay resultados espectrales.")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 @router.get("/{project_id}/nlth/result")
 def get_nlth_result(project_id: str, user: CurrentUser, db: DB):
     """Devuelve el último `nlth_results.json` persistido."""
@@ -1925,9 +2111,1104 @@ def get_nlth_result(project_id: str, user: CurrentUser, db: DB):
         return json.load(f)
 
 
+@router.get("/{project_id}/nlth/jobs")
+def list_nlth_jobs(project_id: str, user: CurrentUser, db: DB):
+    """Historial de análisis NLTH del proyecto.
+
+    Lee cada `nlth/<job_id>/meta.json` (liviano, ~1 KB) para evitar cargar el
+    JSON completo del resultado. Devuelve ordenado por fecha descendente.
+    """
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    jobs_dir = os.path.join(work_dir, "nlth")
+    if not os.path.isdir(jobs_dir):
+        return {"jobs": []}
+
+    out: list[dict] = []
+    for name in os.listdir(jobs_dir):
+        meta_file = os.path.join(jobs_dir, name, "meta.json")
+        if not os.path.isfile(meta_file):
+            continue
+        try:
+            with open(meta_file, encoding="utf-8") as f:
+                meta = json.load(f)
+            meta["has_history_npz"] = os.path.isfile(
+                os.path.join(jobs_dir, name, "nlth_history.npz")
+            )
+            out.append(meta)
+        except Exception as e:
+            out.append({
+                "job_id": name, "status": "parse_error", "error": str(e),
+            })
+    out.sort(key=lambda m: m.get("computed_at", ""), reverse=True)
+    return {"jobs": out}
+
+
+@router.get("/{project_id}/nlth/result/{job_id}")
+def get_nlth_result_by_job(
+    project_id: str, job_id: str, user: CurrentUser, db: DB,
+):
+    """Devuelve el `nlth_results.json` de un job histórico específico."""
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    path = os.path.join(work_dir, "nlth", job_id, "nlth_results.json")
+    if not os.path.exists(path):
+        raise HTTPException(404, f"NLTH job {job_id} no encontrado")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@router.post("/{project_id}/nlth/activate/{job_id}")
+def activate_nlth_job(
+    project_id: str, job_id: str, user: CurrentUser, db: DB,
+):
+    """Copia un job histórico al shim `results/` para que los módulos que leen
+    "el último" (verificador, export XLSX, diagnóstico por elemento) operen
+    sobre este análisis específico. No borra nada — solo re-apunta el shim.
+    """
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir   = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    src_json   = Path(work_dir) / "nlth" / job_id / "nlth_results.json"
+    src_npz    = Path(work_dir) / "nlth" / job_id / "nlth_history.npz"
+    if not src_json.exists():
+        raise HTTPException(404, f"NLTH job {job_id} no encontrado")
+    res_dir = Path(work_dir) / "results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    (res_dir / "nlth_results.json").write_bytes(src_json.read_bytes())
+    if src_npz.exists():
+        (res_dir / "nlth_history.npz").write_bytes(src_npz.read_bytes())
+    return {"ok": True, "activated_job_id": job_id}
+
+
+@router.delete("/{project_id}/nlth/{job_id}")
+def delete_nlth_job(
+    project_id: str, job_id: str, user: CurrentUser, db: DB,
+):
+    """Borra un análisis NLTH del historial (carpeta `nlth/<job_id>/` + DB)."""
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    job_dir  = Path(work_dir) / "nlth" / job_id
+    if not job_dir.exists():
+        raise HTTPException(404, f"NLTH job {job_id} no encontrado")
+    import shutil as _shutil
+    _shutil.rmtree(job_dir, ignore_errors=True)
+    # También marcar el StructuralJob en DB (si existe) para que no aparezca
+    # en otras listas. No borramos el registro completo por auditoría.
+    db_job = db.get(StructuralJob, job_id)
+    if db_job is not None:
+        db_job.result_path = None
+        db.commit()
+    return {"ok": True, "deleted_job_id": job_id}
+
+
+class NLTHImportRequest(BaseModel):
+    """Bundle NLTH exportado desde otro proyecto / sesión (Fase 2 export/import).
+
+    Acepta tanto el formato bundle (`{export_meta, result}`) como el payload
+    crudo (`NLTHResult`): se detecta por la presencia del campo `envelope`.
+    """
+    export_meta: dict | None = None
+    result:      dict | None = None
+    # Compatibilidad con payload crudo
+    envelope:    dict | None = None
+
+
+@router.post("/{project_id}/nlth/import")
+def import_nlth_bundle(
+    project_id: str,
+    payload:    NLTHImportRequest,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """Persiste un bundle JSON NLTH exportado como un job real del proyecto.
+
+    Flujo:
+      1. Detecta si es bundle o payload crudo.
+      2. Genera nuevo `job_id`, crea `work_dir/nlth/<job_id>/` con
+         `nlth_results.json` + `meta.json` (derivado del payload).
+      3. Crea StructuralJob(analysis_type=nlth, status=success) marcado como
+         `imported=true`. No persiste `.npz` (el bundle solo lleva el summary).
+      4. Devuelve `job_id` y status 201 para que el cliente navegue al nuevo job.
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    project = _get_project(db, project_id, user)
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+
+    # ── Normalizar payload ──
+    body = payload.model_dump(exclude_none=True)
+    export_meta = body.get("export_meta") or {}
+    if "result" in body and isinstance(body["result"], dict):
+        result = body["result"]
+    elif "envelope" in body:
+        result = {k: v for k, v in body.items() if k not in ("export_meta",)}
+    else:
+        raise HTTPException(400, "Bundle inválido: no se encontró ni `result` ni `envelope`.")
+
+    env = result.get("envelope") or {}
+    if not env:
+        raise HTTPException(400, "El payload no contiene `envelope` — no es un NLTHResult válido.")
+
+    # ── Persistir en work_dir/nlth/<job_id>/ ──
+    job_id = str(uuid.uuid4())
+    job_dir = Path(work_dir) / "nlth" / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "nlth_results.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+    # Derivar meta.json liviano a partir del result (mismo shape que al correr)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    meta = {
+        "job_id":       job_id,
+        "project_id":   project.id,
+        "status":       "success",
+        "imported":     True,
+        "source":       export_meta.get("exporter") or "external_bundle",
+        "exported_at":  export_meta.get("exported_at"),
+        "record_x":     export_meta.get("record_x") or env.get("record_x"),
+        "record_y":     export_meta.get("record_y") or env.get("record_y"),
+        "scale":        export_meta.get("scale")    or env.get("scale"),
+        "dtrec":        env.get("dtrec"),
+        "max_drift_pct": env.get("max_drift_pct"),
+        "residual_drift_pct": env.get("residual_drift_pct"),
+        "pga_vector_g":  env.get("pga_vector_g"),
+        "Vb_peak_kN":    env.get("Vb_peak_kN"),
+        "computed_at":   now_iso,
+    }
+    (job_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+    # ── Crear StructuralJob en DB ──
+    job = StructuralJob(
+        id             = job_id,
+        project_id     = project.id,
+        owner_id       = user.id,
+        analysis_type  = StructuralAnalysisType.nlth,
+        status         = StructuralJobStatus.success,
+        result_path    = str(job_dir / "nlth_results.json"),
+        progress_json  = {
+            "stage":     "imported",
+            "imported":  True,
+            "export_meta": export_meta,
+        },
+        finished_at    = datetime.now(timezone.utc),
+    )
+    db.add(job); db.commit(); db.refresh(job)
+
+    return {
+        "ok":      True,
+        "job_id":  job.id,
+        "meta":    meta,
+        "message": (
+            f"Bundle NLTH importado como job {job.id[:8]}… "
+            f"(registro={meta['record_x'] or '?'}, scale={meta['scale']})"
+        ),
+    }
+
+
+# ── Umbrales editables para re-evaluación del cronológico ────────────────────
+
+class RecomputeEventsRequest(BaseModel):
+    """
+    Umbrales globales que sobrescriben los calculados por elemento. Todos
+    opcionales — una clave ausente conserva el valor del spec/geometría.
+    """
+    eps_sy:       float | None = None   # fluencia del acero (ε_sy = fy/E)
+    eps_cu_cover: float | None = None   # aplastamiento del recubrimiento
+    eps_cu_core:  float | None = None   # aplastamiento del núcleo confinado
+    eps_su:       float | None = None   # fractura por tensión del acero
+    eps_bk:       float | None = None   # pandeo del refuerzo longitudinal
+
+
+def _nlth_paths(project: StructuralProject) -> tuple[str, str, str]:
+    """Devuelve (work_dir, nlth_results.json, nlth_history.npz)."""
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    return (
+        work_dir,
+        os.path.join(work_dir, "results", "nlth_results.json"),
+        os.path.join(work_dir, "results", "nlth_history.npz"),
+    )
+
+
+@router.get("/{project_id}/nlth/thresholds-meta")
+def get_nlth_thresholds_meta(project_id: str, user: CurrentUser, db: DB):
+    """Defaults globales + rangos observados por elemento (para poblar sliders)."""
+    from app.engine.building.nonlinear.event_detector import (
+        build_elements_meta, default_thresholds, observed_threshold_ranges,
+    )
+    project = _get_project(db, project_id, user)
+    _work_dir, result_path, _hist_path = _nlth_paths(project)
+    if not os.path.exists(result_path):
+        raise HTTPException(404, "No hay resultados NLTHA. Lanza un job primero.")
+    with open(result_path, encoding="utf-8") as f:
+        result = json.load(f)
+    element_lines = result.get("element_lines") or []
+    spec_path = _ensure_nonlinear_spec(project)
+    with open(spec_path, encoding="utf-8") as f:
+        spec = json.load(f)
+    elements_meta = build_elements_meta(spec, element_lines)
+    return {
+        "defaults":            default_thresholds(),
+        "observed":            observed_threshold_ranges(elements_meta),
+        "user_override":       result.get("events", {}).get("thresholds_user_override", {}),
+        "n_elements_detected": len(elements_meta),
+    }
+
+
+@router.post("/{project_id}/nlth/recompute-events")
+def recompute_nlth_events(
+    project_id: str, req: RecomputeEventsRequest, user: CurrentUser, db: DB,
+):
+    """
+    Re-ejecuta el detector de eventos locales sobre el NPZ existente con los
+    umbrales dados y actualiza `nlth_results.json`. No re-corre el NLTHA — solo
+    reclasifica el estado de daño de cada elemento. Toma segundos.
+    """
+    from app.engine.building.nonlinear.event_detector import detect_events_nlth
+
+    project = _get_project(db, project_id, user)
+    _work_dir, result_path, hist_path = _nlth_paths(project)
+    if not os.path.exists(result_path):
+        raise HTTPException(404, "No hay resultados NLTHA. Lanza un job primero.")
+    if not os.path.exists(hist_path):
+        raise HTTPException(404, "nlth_history.npz no encontrado. "
+                            "Relanza el NLTHA con el motor actual para persistir sect_def.")
+
+    with open(result_path, encoding="utf-8") as f:
+        result = json.load(f)
+    element_lines = result.get("element_lines") or []
+    if not element_lines:
+        raise HTTPException(400, "El resultado NLTHA no persistió element_lines; relanzarlo.")
+
+    spec_path = _ensure_nonlinear_spec(project)
+    with open(spec_path, encoding="utf-8") as f:
+        spec = json.load(f)
+
+    override = {k: v for k, v in req.model_dump().items() if v is not None}
+    ev = detect_events_nlth(
+        npz_path=hist_path, spec=spec, element_lines=element_lines,
+        thresholds_override=override,
+    )
+    result["events"] = ev
+    result["events_recomputed_at"] = datetime.now(timezone.utc).isoformat()
+
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    return {
+        "status":   ev.get("status", "unknown"),
+        "events":   ev,
+        "n_events": len(ev.get("events", [])),
+    }
+
+
+@router.post("/{project_id}/nlth/recompute-failure-modes")
+def recompute_failure_modes(project_id: str, user: CurrentUser, db: DB):
+    """
+    Clasifica cada columna por modo de falla combinando:
+      1. Predicción ASCE 41-17 §10.3 (Vp/Vn desde element_thresholds.json).
+      2. Rótulas observadas durante el NLTHA (damage.hinges).
+      3. Demanda real: M(t) por extremo (M-φ bilineal) + V(t) por equilibrio
+         doble curvatura — desde `sect_def` del NPZ. Permite verificar si la
+         capacidad Mp o Vn fue efectivamente superada por el sismo.
+
+    No re-corre análisis.
+    """
+    import numpy as _np
+    from app.engine.building.nonlinear.failure_classification import (
+        classify_frame_failure_modes, compute_demand_dcr_per_column,
+    )
+    project = _get_project(db, project_id, user)
+    _work_dir, result_path, hist_path = _nlth_paths(project)
+    if not os.path.exists(result_path):
+        raise HTTPException(404, "No hay resultados NLTHA. Lanza un job primero.")
+
+    with open(result_path, encoding="utf-8") as f:
+        result = json.load(f)
+
+    wd = _project_work_dir(project)
+    et_path = wd / "nonlinear" / "element_thresholds.json"
+    if not et_path.exists():
+        raise HTTPException(
+            422,
+            "Falta `element_thresholds.json` (Fase 7). "
+            "Corre `/element-thresholds` antes de clasificar el modo de falla.",
+        )
+    with open(et_path, encoding="utf-8") as f:
+        et = json.load(f)
+    rows = et.get("rows") or []
+
+    # Umbrales por fid (para M-φ bilineal).
+    thresholds_by_fid = {
+        str(r.get("fid")): r for r in rows if r.get("kind") == "column"
+    }
+
+    # Demanda real desde sect_def del NPZ (si existe).
+    demand_by_fid: dict = {}
+    try:
+        if os.path.exists(hist_path):
+            with _np.load(hist_path, allow_pickle=False) as data:
+                if "sect_def" in data.files and "sect_tags" in data.files:
+                    sect_def  = _np.asarray(data["sect_def"], dtype=_np.float32)
+                    sect_tags = [int(t) for t in data["sect_tags"].tolist()]
+                    element_lines = result.get("element_lines") or []
+                    joints_ref = ((result.get("history") or {}).get("joints_ref")
+                                   or result.get("joints_ref") or {})
+                    if not joints_ref:
+                        # Fallback: pedir al pushover history la geometría.
+                        from app.engine.building.nonlinear.nl_frame_ops_builder import (
+                            NLFrameOPSBuilder,
+                        )
+                        # Si no tenemos joints_ref persistido, usamos distancia
+                        # L_col = altura del piso del canonical.
+                        canonical_path = project.canonical_model_path
+                        if canonical_path and os.path.exists(canonical_path):
+                            with open(canonical_path, encoding="utf-8") as fc:
+                                canonical = json.load(fc)
+                            joints_ref = {
+                                str(nid): [float(j.get("x", 0)), float(j.get("y", 0)),
+                                            float(j.get("z", 0))]
+                                for nid, j in (canonical.get("joints") or {}).items()
+                            }
+                    demand_by_fid = compute_demand_dcr_per_column(
+                        sect_def=sect_def, sect_tags=sect_tags,
+                        element_lines=element_lines, joints_ref=joints_ref,
+                        thresholds_by_fid=thresholds_by_fid,
+                    )
+    except Exception as e_dem:
+        print(f"[WARN] no se pudo calcular demanda: {e_dem}")
+
+    hinges = ((result.get("damage") or {}).get("hinges")) or []
+    classification = classify_frame_failure_modes(
+        element_thresholds_rows=rows, hinges=hinges,
+        demand_by_fid=demand_by_fid,
+    )
+    result["failure_modes"] = classification
+    result["failure_modes_recomputed_at"] = datetime.now(timezone.utc).isoformat()
+
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    return {
+        "status":          classification.get("status", "unknown"),
+        "counts":          classification.get("counts", {}),
+        "n_total":         classification.get("n_total", 0),
+        "failure_modes":   classification,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ola 7 — Diagnóstico post-NLTH del elemento patológico + recomendaciones
+# ─────────────────────────────────────────────────────────────────────────────
+def _resolve_demand_for_fid(
+    result: dict,
+    fid: str,
+) -> tuple[float, float | None]:
+    """Busca demanda θ_p_max y V_max para un fid en nlth_results.json.
+
+    Orden de preferencia:
+      1. damage.hinges (del event detector) — contiene theta_p_max por rótula.
+      2. health.pathological_ranking — contiene theta_p_max y strain axial.
+      3. fallback: 0.
+    """
+    theta_demand = 0.0
+    V_demand: float | None = None
+
+    damage = (result.get("damage") or {})
+    for h in damage.get("hinges", []) or []:
+        if str(h.get("fid", "")) == str(fid):
+            tp = float(h.get("theta_p_max", 0.0) or 0.0)
+            if tp > theta_demand:
+                theta_demand = tp
+            v = h.get("V_max_kN") or h.get("V_demand_kN")
+            if v is not None:
+                try:
+                    V_demand = float(v)
+                except (TypeError, ValueError):
+                    pass
+
+    if theta_demand <= 0.0:
+        health = result.get("health") or {}
+        pe = health.get("pathological_element") or {}
+        if str(pe.get("fid", "")) == str(fid):
+            theta_demand = float(pe.get("theta_p_max", 0.0) or 0.0)
+        else:
+            for row in health.get("pathological_ranking", []) or []:
+                if str(row.get("fid", "")) == str(fid):
+                    theta_demand = float(row.get("theta_p_max", 0.0) or 0.0)
+                    break
+
+    return theta_demand, V_demand
+
+
+def _build_element_data(project: StructuralProject, fid: str):
+    """Reconstruye ElementData para un fid desde el spec actual.
+
+    Devuelve (el, spec_confinement) listos para diagnose_element.
+    """
+    from engine.building.nonlinear import elements_from_spec, load_axial_from_gravity, load_observations_csv
+    spec_path = _ensure_nonlinear_spec(project)
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    wd = _project_work_dir(project)
+    axial = load_axial_from_gravity(wd / "nonlinear" / "axial_from_gravity.json")
+    obs   = load_observations_csv(wd / "nonlinear" / "observations.csv")
+    elements = elements_from_spec(spec, axial_json=axial, observations=obs)
+    el = elements.get(str(fid))
+    if el is None:
+        raise HTTPException(
+            404, detail=f"Elemento fid={fid} no encontrado en nonlinear_model.json. "
+                         "Verifica que el modelo esté construido."
+        )
+    kind_key = "columns" if el.kind == "column" else "beams"
+    spec_el = spec.get("elements", {}).get(kind_key, {}).get(str(fid), {})
+    conf = spec_el.get("confinement", {}) or {}
+    spec_conf = conf.get("end", conf.get("mid"))
+    return el, spec_conf
+
+
+@router.get("/{project_id}/nlth/element-diagnosis/{fid}")
+def get_element_diagnosis(
+    project_id: str,
+    fid:        str,
+    user:       CurrentUser,
+    db:         DB,
+    theta_demand_override: float | None = None,
+    V_demand_kN_override:  float | None = None,
+    method:     str = "haselton",
+):
+    """Diagnóstico completo de un elemento + recomendaciones de refuerzo.
+
+    Toma demanda del último `nlth_results.json` (damage.hinges o pathological
+    element). El usuario puede override con query params para explorar
+    escenarios hipotéticos.
+
+    Returns:
+        ElementDiagnosis.to_dict() — ver reinforcement_recommender.py.
+    """
+    from engine.building.nonlinear import diagnose_element
+
+    project = _get_project(db, project_id, user)
+    _work_dir, result_path, _hist_path = _nlth_paths(project)
+
+    theta_demand = float(theta_demand_override or 0.0)
+    V_demand = V_demand_kN_override
+
+    if theta_demand <= 0.0 and os.path.exists(result_path):
+        with open(result_path, encoding="utf-8") as f:
+            result = json.load(f)
+        theta_demand, v_from_result = _resolve_demand_for_fid(result, fid)
+        if V_demand is None:
+            V_demand = v_from_result
+
+    el, spec_conf = _build_element_data(project, fid)
+
+    try:
+        diag = diagnose_element(
+            el=el,
+            theta_demand=theta_demand,
+            V_demand_kN=V_demand,
+            method=method,  # type: ignore[arg-type]
+            spec_conf=spec_conf,
+        )
+    except Exception as exc:
+        raise HTTPException(500, detail=f"Error al diagnosticar: {type(exc).__name__}: {exc}")
+
+    return diag.to_dict()
+
+
+class ApplyReinforcementFixRequest(BaseModel):
+    fid:        str
+    action_id:  str           # ActionId de ReinforcementOption
+    changes:    dict          # payload "changes" del ReinforcementOption aplicado
+    notes:      str | None = None
+
+
+@router.post("/{project_id}/nlth/apply-reinforcement-fix")
+def apply_reinforcement_fix(
+    project_id: str,
+    payload:    ApplyReinforcementFixRequest,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """Persiste un override de refuerzo para un elemento en `reinforcement.json`.
+
+    Mergea `payload.changes` dentro del subdiccionario `reinforcement` del fid.
+    Al escribir el archivo se invalida `nonlinear_model.json` — el próximo
+    pushover/NLTH lo regenera con los nuevos valores.
+    """
+    from app.routers.structural_design import _load_reinforcement, _save_reinforcement
+    project = _get_project(db, project_id, user)
+
+    saved = _load_reinforcement(project)
+    entry = saved.get(payload.fid, {}) or {}
+    existing_reinf = entry.get("reinforcement") or {}
+
+    # Merge superficial por subsección (longitudinal / transverse / shear / detailing)
+    merged = dict(existing_reinf)
+    for section_key, section_vals in payload.changes.items():
+        if isinstance(section_vals, dict):
+            cur = dict(merged.get(section_key) or {})
+            cur.update(section_vals)
+            merged[section_key] = cur
+        else:
+            merged[section_key] = section_vals
+
+    saved[payload.fid] = {
+        "reinforcement": merged,
+        "notes":         payload.notes or f"Fix {payload.action_id} aplicado por Ola 7",
+        "saved_at":      datetime.now(timezone.utc).isoformat(),
+        "source":        "ola7_diagnosis",
+        "action_id":     payload.action_id,
+        "pattern_label": None,
+        "bulk_batch_id": None,
+    }
+    _save_reinforcement(project, saved)
+
+    return {
+        "saved":      True,
+        "fid":        payload.fid,
+        "action_id":  payload.action_id,
+        "message":    f"Fix aplicado a {payload.fid}. Relanza el NLTH para verificar.",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDA — Incremental Dynamic Analysis sobre biblioteca FEMA P-695
+# ─────────────────────────────────────────────────────────────────────────────
+class IDALaunchRequest(BaseModel):
+    """Lanzamiento de IDA: N pares × M niveles de Sa."""
+    pair_ids:       list[int]
+    sa_min:         float            # g
+    sa_max:         float            # g
+    n_levels:       int              # niveles de Sa
+    T1_s:           float            # período fundamental para escalado
+    system:         str  = "frames"  # frames | walls
+    damping:        float = 0.05
+    dt_analysis:    float = 0.005
+    spacing:        str   = "linear" # linear | log
+    collapse_mode:  str   = "ductile"
+    # Fuente de registros: "fema" (22 pares FEMA P-695) o clave de campaña
+    # local p.ej. "colombia_2026_08_10" (Sismo San José del Palmar).
+    catalog_source: str   = "fema"
+
+
+@router.post("/{project_id}/ida/launch", status_code=202)
+def launch_ida(
+    project_id: str,
+    payload:    IDALaunchRequest,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """Lanza un IDA: encola N_pares × N_niveles NLTHA livianos en paralelo.
+
+    El orquestador vive en Celery como `run_ida`; usa `chord` para consolidar
+    automáticamente al terminar todos los hijos en un `ida_results.json` con
+    curvas IM-EDP por par + percentiles 16/50/84 + Sa mediana de colapso.
+    """
+    from app.tasks.structural_ida_task import run_ida_task
+    import uuid
+
+    project = _get_project(db, project_id, user)
+
+    if not payload.pair_ids:
+        raise HTTPException(400, "Selecciona al menos un par FEMA.")
+    if payload.n_levels < 2:
+        raise HTTPException(400, "n_levels debe ser ≥ 2.")
+    if payload.T1_s <= 0:
+        raise HTTPException(400, "T1_s debe ser > 0 (corre modal primero).")
+    if payload.sa_max <= payload.sa_min:
+        raise HTTPException(400, "sa_max debe ser > sa_min.")
+
+    # Crear job IDA en la DB
+    params = payload.model_dump()
+    job = StructuralJob(
+        id             = str(uuid.uuid4()),
+        project_id     = project.id,
+        owner_id       = user.id,
+        analysis_type  = StructuralAnalysisType.ida,
+        status         = StructuralJobStatus.pending,
+        progress_json  = {"stage": "pending", "params": params},
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    # Lanzar orquestador (params van vía argumentos al task, no al modelo DB)
+    task = run_ida_task.delay(
+        job_id=job.id,
+        project_id=project.id,
+        parameters_dict=params,
+    )
+    job.celery_task_id = task.id
+    db.commit()
+
+    return {
+        "job_id":      job.id,
+        "celery_id":   task.id,
+        "pair_ids":    payload.pair_ids,
+        "n_levels":    payload.n_levels,
+        "n_total":     len(payload.pair_ids) * payload.n_levels,
+        "status":      "dispatched",
+        "message":     f"IDA lanzado: {len(payload.pair_ids)} pares × {payload.n_levels} niveles.",
+    }
+
+
+@router.get("/{project_id}/ida/result")
+def get_ida_result(project_id: str, user: CurrentUser, db: DB):
+    """Devuelve el último `ida_results.json` consolidado (el más reciente por
+    `finished_at`). Si ningún IDA ha terminado, 404.
+    """
+    project = _get_project(db, project_id, user)
+
+    jobs = (
+        db.query(StructuralJob)
+        .filter(StructuralJob.project_id == project.id)
+        .filter(StructuralJob.analysis_type == StructuralAnalysisType.ida)
+        .filter(StructuralJob.status == StructuralJobStatus.success)
+        .order_by(StructuralJob.finished_at.desc())
+        .limit(1)
+        .all()
+    )
+    if not jobs or not jobs[0].result_path:
+        raise HTTPException(404, "Ningún IDA completado todavía.")
+
+    path = jobs[0].result_path
+    if not os.path.exists(path):
+        raise HTTPException(404, f"ida_results.json no encontrado en {path}")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    data["job_id"] = jobs[0].id
+    return data
+
+
+@router.get("/{project_id}/ida/progress/{job_id}")
+def get_ida_progress(project_id: str, job_id: str, user: CurrentUser, db: DB):
+    """Devuelve progreso del IDA (contado de results persistidos / total)."""
+    project = _get_project(db, project_id, user)
+    job = db.get(StructuralJob, job_id)
+    if not job or job.project_id != project.id:
+        raise HTTPException(404, "Job IDA no encontrado.")
+    if job.analysis_type != StructuralAnalysisType.ida:
+        raise HTTPException(400, f"Job {job_id} no es un IDA.")
+
+    if not project.canonical_model_path:
+        raise HTTPException(404, "Modelo canónico no disponible")
+    work_dir = os.path.dirname(os.path.dirname(project.canonical_model_path))
+    results_dir = os.path.join(work_dir, "ida", job.id, "results")
+
+    n_done = 0
+    if os.path.isdir(results_dir):
+        n_done = sum(1 for f in os.listdir(results_dir) if f.startswith("pair_") and f.endswith(".json"))
+
+    meta_path = os.path.join(work_dir, "ida", job.id, "meta.json")
+    n_total = 0
+    meta = None
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            n_total = int(meta.get("total_runs", 0))
+        except Exception:
+            pass
+
+    pct = (n_done / n_total * 100.0) if n_total > 0 else 0.0
+
+    return {
+        "job_id":    job.id,
+        "status":    job.status.value if hasattr(job.status, "value") else str(job.status),
+        "n_done":    n_done,
+        "n_total":   n_total,
+        "pct":       round(pct, 1),
+        "progress":  job.progress_json,
+        "meta":      meta,
+    }
+
+
+@router.get("/{project_id}/ida/jobs")
+def list_ida_jobs(project_id: str, user: CurrentUser, db: DB):
+    """Lista los jobs IDA del proyecto (para dropdown en UI)."""
+    project = _get_project(db, project_id, user)
+    jobs = (
+        db.query(StructuralJob)
+        .filter(StructuralJob.project_id == project.id)
+        .filter(StructuralJob.analysis_type == StructuralAnalysisType.ida)
+        .order_by(StructuralJob.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "job_id":        j.id,
+            "status":        j.status.value if hasattr(j.status, "value") else str(j.status),
+            "created_at":    j.created_at.isoformat() if j.created_at else None,
+            "finished_at":   j.finished_at.isoformat() if j.finished_at else None,
+            "params":        (j.progress_json or {}).get("params") if isinstance(j.progress_json, dict) else None,
+            "result_summary": j.result_summary,
+        }
+        for j in jobs
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NLRHA — Nonlinear Response History Analysis (ASCE 7-22 Cap 16 / NSR-10 A.5.4.6)
+#
+# Diferencia operativa con IDA:
+#   IDA   = barrido de Sa (Sa_min → Sa_max, varios niveles) para investigación
+#           (Sa mediana de colapso, fragilidad, FEMA P-695).
+#   NLRHA = UN solo nivel Sa_target = Sa_NSR-10(T1, ciudad, suelo) · I · MCE_mult,
+#           para verificación del edificio ante el sismo de código.
+#
+# Para no duplicar pipeline, reutiliza `run_ida_task` con `n_levels=1`
+# (ya soportado en `_sa_grid`). El job queda como `analysis_type=ida` pero
+# `progress_json.mode="nlrha"` lo distingue en los listados.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# NSR-10 A.2.5.2 — coeficiente de importancia por grupo de uso
+_NSR10_IMPORTANCE: dict[str, float] = {"I": 1.0, "II": 1.0, "III": 1.25, "IV": 1.5}
+
+# Límites de deriva (NSR-10 A.6.4.2 edificaciones de concreto / ASCE 7-22 §16.4)
+_NSR10_DRIFT_LIMIT_MEAN_PCT = 1.0   # deriva promedio
+_NSR10_DRIFT_LIMIT_MAX_PCT  = 1.5   # overshoot permitido para P84
+
+
+class NLRHALaunchRequest(BaseModel):
+    """Lanzamiento NLRHA: N pares escalados al Sa de código."""
+    pair_ids:        list[int]
+    Aa:              float = Field(..., gt=0,  le=0.5,  description="A.2.3 coef. aceleración pico efectiva")
+    Av:              float = Field(..., gt=0,  le=0.5,  description="A.2.3 coef. velocidad")
+    soil_type:       str   = Field(..., pattern=r"^[A-E]$", description="Perfil A-E (F requiere estudio especial)")
+    use_group:       str   = Field("II", pattern=r"^(I|II|III|IV)$")
+    T1_s:            float = Field(..., gt=0,  le=10.0)
+    mce_multiplier:  float = Field(1.0, ge=1.0, le=1.5, description="1.0 SDE · 1.5 MCE_R")
+    system:          str   = "frames"
+    damping:         float = 0.05
+    dt_analysis:     float = 0.005
+    # Mismo contrato que IDA
+    catalog_source:  str   = "fema"
+
+
+def _nsr10_sa_at_T(Aa: float, Av: float, soil_type: str, T_s: float) -> dict:
+    """Sa(T) de código NSR-10 + parámetros SDs/SD1/T0/Ts/TL/Fa/Fv."""
+    from engine.seismic.spectrum import get_site_factors, spectral_parameters, _sa_at_T
+    Fa, Fv = get_site_factors(Aa, Av, soil_type)
+    p = spectral_parameters(Aa, Av, Fa, Fv)
+    Sa = _sa_at_T(T_s, p["SDs"], p["SD1"], p["T0"], p["Ts"], p["TL"])
+    return {"Sa_g": float(Sa), "Fa": Fa, "Fv": Fv, **p}
+
+
+def _verify_nsr10_drift_limit(ida_result: dict) -> dict:
+    """Evalúa cumplimiento de Δ ≤ 1 % NSR-10 A.6.4.2 sobre el perfil P50/P84."""
+    stats_per_level = ida_result.get("stats_per_level", [])
+    if not stats_per_level:
+        return {"overall": "no_data", "stories": []}
+    level = stats_per_level[0]  # NLRHA: único nivel
+    prof = level.get("drift_profile") or {}
+    p50 = prof.get("p50") or []
+    p84 = prof.get("p84") or []
+    stories: list[dict] = []
+    all_ok = True
+    for i in range(len(p50)):
+        mean = float(p50[i])
+        pmax = float(p84[i]) if i < len(p84) else mean
+        ok = (mean <= _NSR10_DRIFT_LIMIT_MEAN_PCT) and (pmax <= _NSR10_DRIFT_LIMIT_MAX_PCT)
+        if not ok:
+            all_ok = False
+        stories.append({
+            "story":           i + 1,
+            "drift_p50_pct":   round(mean, 3),
+            "drift_p84_pct":   round(pmax, 3),
+            "ratio_vs_limit":  round(mean / _NSR10_DRIFT_LIMIT_MEAN_PCT, 3),
+            "ok":              bool(ok),
+        })
+    return {
+        "overall":         "pass" if all_ok else "fail",
+        "limit_mean_pct":  _NSR10_DRIFT_LIMIT_MEAN_PCT,
+        "limit_max_pct":   _NSR10_DRIFT_LIMIT_MAX_PCT,
+        "stories":         stories,
+        "n_pairs":         level.get("n_total"),
+        "n_collapsed":     level.get("n_collapsed"),
+    }
+
+
+@router.post("/{project_id}/nlrha/launch", status_code=202)
+def launch_nlrha(
+    project_id: str,
+    payload:    NLRHALaunchRequest,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """Verificación NSR-10 / ASCE 7-22 Cap 16 mediante NLRHA de N pares a Sa de código."""
+    from app.tasks.structural_ida_task import run_ida_task
+    import uuid
+
+    project = _get_project(db, project_id, user)
+
+    if not payload.pair_ids:
+        raise HTTPException(400, "Selecciona al menos un par.")
+    if len(payload.pair_ids) < 3:
+        raise HTTPException(
+            400,
+            f"NSR-10 A.5.4.6 requiere ≥ 3 pares (seleccionaste {len(payload.pair_ids)}).",
+        )
+
+    try:
+        sa_info = _nsr10_sa_at_T(payload.Aa, payload.Av, payload.soil_type, payload.T1_s)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    I_factor  = _NSR10_IMPORTANCE[payload.use_group]
+    sa_target = round(sa_info["Sa_g"] * I_factor * payload.mce_multiplier, 4)
+    if sa_target <= 0:
+        raise HTTPException(400, f"Sa_target={sa_target} ≤ 0. Revise Aa/Av/soil/T1.")
+
+    params = {
+        "pair_ids":    payload.pair_ids,
+        "sa_min":      sa_target,
+        "sa_max":      sa_target,
+        "n_levels":    1,
+        "T1_s":        payload.T1_s,
+        "system":      payload.system,
+        "damping":     payload.damping,
+        "dt_analysis": payload.dt_analysis,
+        "spacing":     "linear",
+        "collapse_mode": "ductile",
+        "catalog_source": payload.catalog_source,
+        # Metadatos NLRHA (persistidos en progress_json.params)
+        "mode":                "nlrha",
+        "nsr10_Aa":            payload.Aa,
+        "nsr10_Av":            payload.Av,
+        "soil_type":           payload.soil_type,
+        "use_group":           payload.use_group,
+        "importance_factor":   I_factor,
+        "mce_multiplier":      payload.mce_multiplier,
+        "sa_nsr10_T1_g":       round(sa_info["Sa_g"], 4),
+        "sa_target_g":         sa_target,
+        "spectral_params":     {k: sa_info[k] for k in ("SDs", "SD1", "T0", "Ts", "TL", "Fa", "Fv")},
+    }
+
+    job = StructuralJob(
+        id             = str(uuid.uuid4()),
+        project_id     = project.id,
+        owner_id       = user.id,
+        analysis_type  = StructuralAnalysisType.ida,
+        status         = StructuralJobStatus.pending,
+        progress_json  = {"stage": "pending", "params": params, "mode": "nlrha"},
+    )
+    db.add(job); db.commit(); db.refresh(job)
+
+    task = run_ida_task.delay(
+        job_id=job.id, project_id=project.id, parameters_dict=params,
+    )
+    job.celery_task_id = task.id
+    db.commit()
+
+    return {
+        "job_id":          job.id,
+        "celery_id":       task.id,
+        "pair_ids":        payload.pair_ids,
+        "sa_nsr10_T1_g":   round(sa_info["Sa_g"], 4),
+        "I_factor":        I_factor,
+        "mce_multiplier":  payload.mce_multiplier,
+        "sa_target_g":     sa_target,
+        "spectral_params": {k: sa_info[k] for k in ("SDs", "SD1", "T0", "Ts", "TL", "Fa", "Fv")},
+        "status":          "dispatched",
+        "message":         (
+            f"NLRHA lanzado: {len(payload.pair_ids)} pares escalados a "
+            f"Sa={sa_target:.3f}g (Sa_NSR-10={sa_info['Sa_g']:.3f}g × I={I_factor} × {payload.mce_multiplier}×)."
+        ),
+    }
+
+
+@router.get("/{project_id}/nlrha/result")
+def get_nlrha_result(project_id: str, user: CurrentUser, db: DB):
+    """Último NLRHA exitoso + evaluación NSR-10 A.6.4.2 por piso."""
+    project = _get_project(db, project_id, user)
+
+    jobs = (
+        db.query(StructuralJob)
+        .filter(StructuralJob.project_id == project.id)
+        .filter(StructuralJob.analysis_type == StructuralAnalysisType.ida)
+        .filter(StructuralJob.status == StructuralJobStatus.success)
+        .order_by(StructuralJob.finished_at.desc())
+        .all()
+    )
+    target = None
+    for j in jobs:
+        progress = j.progress_json or {}
+        if isinstance(progress, dict) and progress.get("mode") == "nlrha":
+            target = j
+            break
+    if not target or not target.result_path:
+        raise HTTPException(404, "Ningún NLRHA completado todavía.")
+
+    if not os.path.exists(target.result_path):
+        raise HTTPException(404, f"Resultado no encontrado en {target.result_path}")
+    with open(target.result_path, encoding="utf-8") as f:
+        data = json.load(f)
+    data["job_id"] = target.id
+    progress = target.progress_json or {}
+    params = progress.get("params") if isinstance(progress, dict) else None
+    if params:
+        data["nlrha_meta"] = {k: params.get(k) for k in (
+            "mode", "nsr10_Aa", "nsr10_Av", "soil_type", "use_group",
+            "importance_factor", "mce_multiplier",
+            "sa_nsr10_T1_g", "sa_target_g", "spectral_params",
+        ) if k in params}
+    data["nsr10_verification"] = _verify_nsr10_drift_limit(data)
+    return data
+
+
+@router.get("/{project_id}/nlrha/jobs")
+def list_nlrha_jobs(project_id: str, user: CurrentUser, db: DB):
+    """Lista jobs NLRHA (sólo los que llevan mode=nlrha)."""
+    project = _get_project(db, project_id, user)
+    jobs = (
+        db.query(StructuralJob)
+        .filter(StructuralJob.project_id == project.id)
+        .filter(StructuralJob.analysis_type == StructuralAnalysisType.ida)
+        .order_by(StructuralJob.created_at.desc())
+        .all()
+    )
+    out: list[dict] = []
+    for j in jobs:
+        progress = j.progress_json or {}
+        if not isinstance(progress, dict) or progress.get("mode") != "nlrha":
+            continue
+        out.append({
+            "job_id":        j.id,
+            "status":        j.status.value if hasattr(j.status, "value") else str(j.status),
+            "created_at":    j.created_at.isoformat() if j.created_at else None,
+            "finished_at":   j.finished_at.isoformat() if j.finished_at else None,
+            "params":        progress.get("params"),
+            "result_summary": j.result_summary,
+        })
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ola 8 — Performance-based design verifier
+# ─────────────────────────────────────────────────────────────────────────────
+class PerformanceVerifyRequest(BaseModel):
+    """Parámetros para el verificador performance-based."""
+    performance_level: str = "LS"                    # IO | LS | CP
+    theta_target_column: float | None = None          # override en rad
+    theta_target_beam:   float | None = None
+    method:              str = "haselton"             # haselton | ec8_3 | mecanico
+    max_iterations:      int = 6
+    skip_coupling_beams: bool = True
+    save_fixes:          bool = False                # True → persiste al reinforcement.json
+
+
+@router.post("/{project_id}/verify-performance-capacity")
+def verify_performance_capacity_endpoint(
+    project_id: str,
+    payload:    PerformanceVerifyRequest,
+    user:       CurrentUser,
+    db:         DB,
+):
+    """Verifica y (opcionalmente) ajusta el refuerzo para cumplir θ_target por
+    nivel de desempeño ASCE 41-17.
+
+    Pipeline (sin tocar OpenSees):
+        1. Lee nonlinear_model.json actual.
+        2. Para cada elemento calcula θ_CP (Haselton) vs θ_target.
+        3. Si θ_CP < θ_target, aplica ajustes incrementales (s↓, n_legs↑, etc.).
+        4. Si `save_fixes=true`, persiste los overrides en reinforcement.json —
+           el próximo NLTH/Pushover leerá los nuevos valores.
+    """
+    from engine.building.nonlinear import (
+        verify_performance_capacity, apply_verification_fixes,
+        load_axial_from_gravity, load_observations_csv,
+    )
+    from app.routers.structural_design import _load_reinforcement, _save_reinforcement
+
+    project = _get_project(db, project_id, user)
+    work_dir = _project_work_dir(project)
+    spec_path = _ensure_nonlinear_spec(project)
+
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    axial = load_axial_from_gravity(work_dir / "nonlinear" / "axial_from_gravity.json")
+    obs = load_observations_csv(work_dir / "nonlinear" / "observations.csv")
+
+    theta_overrides = {}
+    if payload.theta_target_column is not None:
+        theta_overrides["column"] = payload.theta_target_column
+    if payload.theta_target_beam is not None:
+        theta_overrides["beam"] = payload.theta_target_beam
+
+    try:
+        result = verify_performance_capacity(
+            spec=spec,
+            performance_level=payload.performance_level,  # type: ignore[arg-type]
+            theta_overrides=theta_overrides or None,
+            method=payload.method,                        # type: ignore[arg-type]
+            axial_json=axial,
+            observations=obs,
+            max_iterations=payload.max_iterations,
+            skip_coupling_beams=payload.skip_coupling_beams,
+        )
+    except Exception as exc:
+        raise HTTPException(500, detail=f"Error en el verificador: {type(exc).__name__}: {exc}")
+
+    # Persistir reporte para que la UI pueda releerlo sin recalcular
+    out_path = work_dir / "nonlinear" / "performance_verification.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result.to_dict(), indent=2, ensure_ascii=False),
+                        encoding="utf-8")
+
+    saved_fixes_count = 0
+    if payload.save_fixes:
+        current_reinf = _load_reinforcement(project)
+        updated_reinf = apply_verification_fixes(result, current_reinf, only_adjusted=True)
+        saved_fixes_count = len(updated_reinf) - len(current_reinf) + sum(
+            1 for fid, v in updated_reinf.items()
+            if current_reinf.get(fid) != v
+        )
+        _save_reinforcement(project, updated_reinf)
+
+    payload_dict = result.to_dict()
+    payload_dict["saved_fixes"]       = payload.save_fixes
+    payload_dict["saved_fixes_count"] = saved_fixes_count
+    return payload_dict
+
+
+@router.get("/{project_id}/verify-performance-capacity")
+def get_performance_verification(project_id: str, user: CurrentUser, db: DB):
+    """Devuelve el último reporte de verificación performance-based persistido."""
+    project = _get_project(db, project_id, user)
+    work_dir = _project_work_dir(project)
+    out_path = work_dir / "nonlinear" / "performance_verification.json"
+    if not out_path.exists():
+        raise HTTPException(
+            404,
+            detail="Verificación performance-based aún no ejecutada — "
+                   "lanza POST /verify-performance-capacity primero.",
+        )
+    return json.loads(out_path.read_text(encoding="utf-8"))
+
+
 @router.delete("/jobs/{job_id}/cancel", status_code=200)
 def cancel_job(job_id: str, user: CurrentUser, db: DB):
-    """Cancela un job activo (pending o running)."""
+    """
+    Cancela un job activo (pending o running). Envía SIGKILL al fork de Celery
+    para matar instantáneamente el proceso OpenSees — SIGTERM no funciona bien
+    con OpenSees porque el C++ ignora señales durante el loop de análisis
+    (verificado 2026-11-04 con la task colgada de Prueba 4).
+    """
     job = _get_job(db, job_id, user)
     if job.status not in (StructuralJobStatus.pending, StructuralJobStatus.running):
         raise HTTPException(
@@ -1937,7 +3218,7 @@ def cancel_job(job_id: str, user: CurrentUser, db: DB):
     if job.celery_task_id:
         try:
             from app.tasks.celery_app import celery_app
-            celery_app.control.revoke(job.celery_task_id, terminate=True, signal="SIGTERM")
+            celery_app.control.revoke(job.celery_task_id, terminate=True, signal="SIGKILL")
         except Exception:
             pass
     job.status = StructuralJobStatus.cancelled

@@ -115,10 +115,23 @@ def compute_hinge_damage_from_history(
         return {"status": "no_history", "message": f"NPZ no encontrado: {history_path}"}
 
     data = np.load(history_path, allow_pickle=False)
+    # Formato pushover: col_sect_def + bm_sect_def separados por tipo.
     col_def = data["col_sect_def"] if "col_sect_def" in data.files else np.empty((0,))
     bm_def  = data["bm_sect_def"]  if "bm_sect_def"  in data.files else np.empty((0,))
     col_tags = data["col_tags"].tolist() if "col_tags" in data.files else []
     bm_tags  = data["bm_tags"].tolist()  if "bm_tags"  in data.files else []
+
+    # Formato NLTH: sect_def unificado (col+beam) + sect_tags. Si el NPZ viene
+    # del cronológico, los arrays separados estarán vacíos. Reusamos el mismo
+    # tensor para ambos tipos y filtramos por ele_tag (único).
+    use_unified = (col_def.size == 0 and bm_def.size == 0) and ("sect_def" in data.files)
+    if use_unified:
+        unified_def = data["sect_def"]
+        col_def = unified_def
+        bm_def  = unified_def
+        all_tags = data["sect_tags"].tolist() if "sect_tags" in data.files else []
+        col_tags = all_tags
+        bm_tags  = all_tags
 
     n_steps_col = col_def.shape[0] if col_def.size else 0
     n_steps_bm  = bm_def.shape[0]  if bm_def.size  else 0
@@ -242,19 +255,30 @@ def compute_hinge_damage_from_history(
     n_critical = sum(1 for h in hinges if h["dcr"] >= _DCR_CRITICAL)
     max_dcr    = max((h["dcr"] for h in hinges), default=0.0)
     max_level  = _top_level([h["damage_level"] for h in hinges])
+    max_theta_p = max((h["theta_p_max"] for h in hinges), default=0.0)
 
     # Orden descendente por DCR (para ranking frontend)
     hinges.sort(key=lambda r: -r["dcr"])
 
+    # Campos legacy consumidos por NLTHPanel.tsx: `counts` (dict level→n) y
+    # `max_theta_p`. Convivir con el formato nuevo mantiene retro-compat con
+    # paneles que no se han migrado al esquema (n_total/by_element).
+    counts: dict[str, int] = {"none": 0, "near_io": 0, "io": 0, "ls": 0, "cp": 0, "collapse": 0}
+    for h in hinges:
+        lvl = h.get("damage_level", "none")
+        counts[lvl] = counts.get(lvl, 0) + 1
+
     return {
-        "status":     "success",
-        "direction":  direction,
-        "n_total":    n_total,
-        "n_critical": n_critical,
-        "max_dcr":    round(max_dcr, 3),
-        "max_level":  max_level,
-        "hinges":     hinges,
-        "by_element": by_element,
+        "status":      "success",
+        "direction":   direction,
+        "n_total":     n_total,
+        "n_critical":  n_critical,
+        "max_dcr":     round(max_dcr, 3),
+        "max_level":   max_level,
+        "max_theta_p": round(max_theta_p, 6),
+        "counts":      counts,
+        "hinges":      hinges,
+        "by_element":  by_element,
     }
 
 
@@ -285,6 +309,15 @@ def compute_theta_p_submatrix(
     bm_def  = data["bm_sect_def"]  if "bm_sect_def"  in data.files else np.empty((0,))
     col_tags = data["col_tags"].tolist() if "col_tags" in data.files else []
     bm_tags  = data["bm_tags"].tolist()  if "bm_tags"  in data.files else []
+
+    # Fallback para NPZ del NLTH (sect_def + sect_tags unificados).
+    if col_def.size == 0 and bm_def.size == 0 and "sect_def" in data.files:
+        unified_def = data["sect_def"]
+        col_def = unified_def
+        bm_def  = unified_def
+        all_tags = data["sect_tags"].tolist() if "sect_tags" in data.files else []
+        col_tags = all_tags
+        bm_tags  = all_tags
 
     idx_arr = np.asarray(list(frame_indices), dtype=int)
     if idx_arr.size == 0:

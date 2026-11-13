@@ -17,7 +17,8 @@ import { structuralAnalysisApi, elementThresholdsApi } from "@/lib/structural-ap
 import type { ElementDemandResult } from "@/lib/structural-api";
 import type {
   NLTHResult, NLTHUploadResult, StructuralJob,
-  NLTHDamageHinges, NLTHDamagePiers,
+  NLTHDamageHinges, NLTHDamagePiers, NLTHThresholdsMeta, ThresholdKey,
+  NLTHJobMeta,
 } from "@/lib/structural-types";
 import { useBuildingWeightKN } from "./use-building-weight";
 import ElementThresholdsPanel from "./ElementThresholdsPanel";
@@ -26,6 +27,12 @@ import LocalEventsPanel, {
 } from "./LocalEventsPanel";
 import RepairPlanPanel from "./RepairPlanPanel";
 import NLTHFinalState3D from "./NLTHFinalState3D";
+import { DamageThresholdsPanel } from "./DamageThresholdsPanel";
+import { AnalysisHealthBanner } from "./AnalysisHealthBanner";
+import { RecordValidationCard } from "./RecordValidationCard";
+import { FEMALibrarySelector } from "./FEMALibrarySelector";
+import { usePlotly } from "@/lib/use-plotly";
+import { plotlyLayoutPremium, plotlyConfigPremium } from "@/lib/plotly-theme";
 import type { LocalEventsPayload } from "@/lib/structural-types";
 
 interface Props {
@@ -53,10 +60,60 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
 
   const [job, setJob]                 = useState<StructuralJob | null>(null);
   const [result, setResult]           = useState<NLTHResult | null>(null);
+  // Historial de análisis NLTH del proyecto. Cada corrida guarda su carpeta
+  // `nlth/<job_id>/` → podemos navegar entre análisis sin re-correr.
+  const [jobs, setJobs]               = useState<NLTHJobMeta[]>([]);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [loadingJob, setLoadingJob]   = useState<string | null>(null);
+  // Modo preview: NLTHResult cargado desde un .json externo (fuera de DB).
+  // Útil para revisar análisis de otros proyectos, backups, o archivados
+  // offline sin tener que subirlos al servidor.
+  const [previewFilename, setPreviewFilename] = useState<string | null>(null);
+  const importFileInputRef = useRef<HTMLInputElement>(null);
   const [demand, setDemand]           = useState<ElementDemandResult | null>(null);
   const [launching, setLaunching]     = useState(false);
   const [error, setError]             = useState<string | null>(null);
+  const [thresholdsMeta, setThresholdsMeta] = useState<NLTHThresholdsMeta | null>(null);
+  const [recomputing, setRecomputing] = useState(false);
+  // Timestamp del lanzamiento (ms epoch) — para computar wall-time y ETA en vivo.
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [nowTick, setNowTick]     = useState<number>(() => Date.now());
+  // Stall detector (Ola 3): último pct observado + timestamp del último cambio.
+  // Si el análisis no avanza >30s se pinta alerta roja y aparece botón cancelar.
+  const [lastSeenPct, setLastSeenPct]     = useState<number>(0);
+  const [lastPctChangeAt, setLastPctChangeAt] = useState<number>(() => Date.now());
+  const [canceling, setCanceling] = useState(false);
   const W_kN = useBuildingWeightKN(projectId);
+
+  // Fuente del registro: carga manual vs biblioteca FEMA (persistido local).
+  const [source, setSource] = useState<"upload" | "fema">(() => {
+    if (typeof window === "undefined") return "upload";
+    return (localStorage.getItem(`nlth-source:${projectId}`) as "upload" | "fema") ?? "upload";
+  });
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem(`nlth-source:${projectId}`, source);
+    }
+  }, [source, projectId]);
+
+  // T1 del modal (para escalado FEMA) + flag si hay espectral para modo nsr10
+  const [T1Modal,  setT1Modal]  = useState<number | null>(null);
+  const [T1ModalY, setT1ModalY] = useState<number | null>(null);
+  const [nsr10Available, setNsr10Available] = useState<boolean>(false);
+  useEffect(() => {
+    let cancelled = false;
+    structuralAnalysisApi.getModalResult(projectId)
+      .then((r) => {
+        if (cancelled) return;
+        setT1Modal(typeof r?.T1_x === "number" ? r.T1_x : (typeof r?.T1 === "number" ? r.T1 : null));
+        setT1ModalY(typeof r?.T1_y === "number" ? r.T1_y : null);
+      })
+      .catch(() => { /* silencioso — modal puede no existir aún */ });
+    structuralAnalysisApi.getSpectralResult(projectId)
+      .then((r) => { if (!cancelled) setNsr10Available(!!r?.spectrum); })
+      .catch(() => { /* silencioso */ });
+    return () => { cancelled = true; };
+  }, [projectId]);
 
   // Refs de los plots
   const previewXRef   = useRef<HTMLDivElement>(null);
@@ -65,6 +122,7 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
   const vbRef         = useRef<HTMLDivElement>(null);
   const driftRef      = useRef<HTMLDivElement>(null);
   const accelRef      = useRef<HTMLDivElement>(null);
+  const amplifRef     = useRef<HTMLDivElement>(null);
   const hysteresisRef = useRef<HTMLDivElement>(null);
   const orbitRef      = useRef<HTMLDivElement>(null);
 
@@ -85,8 +143,225 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
         if (r.Y) setUploadY(r.Y);
       })
       .catch(() => {});
+    structuralAnalysisApi.listNLTHJobs(projectId)
+      .then((js) => {
+        if (cancelled) return;
+        setJobs(js);
+        if (js.length > 0) setActiveJobId(js[0].job_id);  // más reciente
+      })
+      .catch(() => {});
     return () => { cancelled = true; };
   }, [projectId]);
+
+  // Carga un job histórico y lo pone como vista activa (no toca el shim del
+  // "último"; el usuario puede navegar libremente entre análisis).
+  const openHistoricalJob = useCallback(async (jobId: string) => {
+    setLoadingJob(jobId);
+    setError(null);
+    try {
+      const r = await structuralAnalysisApi.getNLTHResultByJob(projectId, jobId);
+      setResult(r);
+      setActiveJobId(jobId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingJob(null);
+    }
+  }, [projectId]);
+
+  // Fija este job como "el último" en results/ → afecta verificador, export y
+  // diagnóstico por elemento (que leen la copia tradicional).
+  const activateHistoricalJob = useCallback(async (jobId: string) => {
+    try {
+      await structuralAnalysisApi.activateNLTHJob(projectId, jobId);
+      // Refrescar el result (es idéntico al que ya se muestra, pero asegura
+      // que verificador/export operen con este job).
+      const r = await structuralAnalysisApi.getNLTHResult(projectId);
+      setResult(r);
+      setActiveJobId(jobId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [projectId]);
+
+  // ── Export / Import JSON portable (Fase 2) ───────────────────────────────
+
+  /** Descarga un JSON autocontenido del análisis seleccionado. Envuelve el
+   *  NLTHResult en un sobre con metadata y schema_version para trazabilidad
+   *  y para que el importador lo reconozca. */
+  const downloadBlob = useCallback((data: unknown, filename: string) => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: "application/json;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const a   = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 500);
+  }, []);
+
+  const buildExportBundle = useCallback(
+    (res: NLTHResult, source: "historical_job" | "live", jobMeta?: NLTHJobMeta) => ({
+      export_meta: {
+        schema_version: "1.0",
+        exporter:       "PerformanceLabs NLTH",
+        exported_at:    new Date().toISOString(),
+        project_id:     projectId,
+        job_id:         jobMeta?.job_id ?? null,
+        source,
+        record_x:       jobMeta?.record_x_file ?? (res as NLTHResult & { record_x_file?: string }).record_x_file ?? null,
+        record_y:       jobMeta?.record_y_file ?? (res as NLTHResult & { record_y_file?: string }).record_y_file ?? null,
+        scale:          jobMeta?.scale ?? null,
+      },
+      result: res,
+    }),
+    [projectId],
+  );
+
+  const exportHistoricalJob = useCallback(
+    async (jobMeta: NLTHJobMeta) => {
+      try {
+        const r = await structuralAnalysisApi.getNLTHResultByJob(projectId, jobMeta.job_id);
+        const bundle = buildExportBundle(r, "historical_job", jobMeta);
+        const safe = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 80);
+        const ts   = jobMeta.computed_at
+          ? jobMeta.computed_at.slice(0, 19).replace(/[:T]/g, "-")
+          : "unknown-date";
+        const fname = `nlth_${safe(jobMeta.record_x_file || "analysis")}_${ts}.json`;
+        downloadBlob(bundle, fname);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [projectId, buildExportBundle, downloadBlob],
+  );
+
+  /** Carga un NLTHResult desde un .json en disco y lo pinta en modo preview.
+   *  Acepta dos formatos: (a) bundle con `export_meta` + `result`, o (b) un
+   *  NLTHResult directo (por si alguien exportó manualmente). */
+  const importJSONFromFile = useCallback((file: File) => {
+    const reader = new FileReader();
+    reader.onerror = () => setError("No se pudo leer el archivo.");
+    reader.onload = (ev) => {
+      try {
+        const raw = String(ev.target?.result ?? "");
+        const parsed = JSON.parse(raw);
+        // Detectar formato
+        let res: NLTHResult;
+        if (parsed && typeof parsed === "object" && parsed.result && parsed.export_meta) {
+          res = parsed.result as NLTHResult;
+        } else if (parsed && typeof parsed === "object" && parsed.envelope) {
+          // NLTHResult crudo
+          res = parsed as NLTHResult;
+        } else {
+          throw new Error(
+            "El archivo no parece un resultado NLTH. Espero un objeto con " +
+            "`envelope` o un bundle `{export_meta, result}`.",
+          );
+        }
+        setResult(res);
+        setPreviewFilename(file.name);
+        setActiveJobId(null);
+        setError(null);
+        // Scroll al tope de los resultados para que se vea el banner
+        setTimeout(() => window.scrollTo({ top: 300, behavior: "smooth" }), 100);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "JSON inválido.");
+      }
+    };
+    reader.readAsText(file, "utf-8");
+  }, []);
+
+  const exitPreviewMode = useCallback(async () => {
+    setPreviewFilename(null);
+    // Volver al último job del proyecto
+    try {
+      const freshJobs = await structuralAnalysisApi.listNLTHJobs(projectId);
+      setJobs(freshJobs);
+      if (freshJobs.length > 0) {
+        await openHistoricalJob(freshJobs[0].job_id);
+      } else {
+        setResult(null);
+        setActiveJobId(null);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [projectId, openHistoricalJob]);
+
+  // Borra un job del historial. Si borras el activo, limpiamos el panel.
+  const deleteHistoricalJob = useCallback(async (jobId: string) => {
+    if (!window.confirm("¿Borrar este análisis NLTH del historial?")) return;
+    try {
+      await structuralAnalysisApi.deleteNLTHJob(projectId, jobId);
+      const freshJobs = await structuralAnalysisApi.listNLTHJobs(projectId);
+      setJobs(freshJobs);
+      if (activeJobId === jobId) {
+        if (freshJobs.length > 0) {
+          await openHistoricalJob(freshJobs[0].job_id);
+        } else {
+          setResult(null);
+          setActiveJobId(null);
+        }
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [projectId, activeJobId, openHistoricalJob]);
+
+  // Carga meta de umbrales de daño cuando hay resultado (sólo frames; muros no
+  // usan sect_def). Si no hay result o es muro, el endpoint responde 404 y
+  // dejamos meta=null para que el panel no se renderice.
+  useEffect(() => {
+    if (!result || result.meta?.eletype !== "frame") {
+      setThresholdsMeta(null);
+      return;
+    }
+    let cancelled = false;
+    structuralAnalysisApi.getNLTHThresholdsMeta(projectId)
+      .then((m) => { if (!cancelled) setThresholdsMeta(m); })
+      .catch(() => { if (!cancelled) setThresholdsMeta(null); });
+    return () => { cancelled = true; };
+  }, [projectId, result]);
+
+  // Auto-dispara la clasificación de modo de falla cuando hay result de frames
+  // y no se ha calculado aún. El endpoint es puro post-process (segundos).
+  useEffect(() => {
+    if (!result || result.meta?.eletype !== "frame") return;
+    if (result.failure_modes) return;   // ya está calculado
+    let cancelled = false;
+    structuralAnalysisApi.recomputeNLTHFailureModes(projectId)
+      .then(async () => {
+        if (cancelled) return;
+        const fresh = await structuralAnalysisApi.getNLTHResult(projectId);
+        if (!cancelled) setResult(fresh);
+      })
+      .catch(() => { /* silencioso: si falta element_thresholds, no se dibuja */ });
+    return () => { cancelled = true; };
+  }, [projectId, result]);
+
+  const recomputeEvents = useCallback(async (
+    overrides: Partial<Record<ThresholdKey, number>>,
+  ) => {
+    if (recomputing) return;
+    setRecomputing(true);
+    try {
+      const r = await structuralAnalysisApi.recomputeNLTHEvents(projectId, overrides);
+      const fresh = await structuralAnalysisApi.getNLTHResult(projectId);
+      setResult(fresh);
+      setThresholdsMeta((prev) => prev ? {
+        ...prev,
+        user_override: r.events.thresholds_user_override ?? {},
+      } : prev);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Error recalculando estados de daño.");
+    } finally {
+      setRecomputing(false);
+    }
+  }, [projectId, recomputing]);
 
   // Polling del job
   useEffect(() => {
@@ -101,6 +376,13 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
           setResult(r);
           elementThresholdsApi.getElementDemand(projectId)
             .then(setDemand).catch(() => {});
+          // Refrescar historial — el job recién completado debe aparecer.
+          structuralAnalysisApi.listNLTHJobs(projectId)
+            .then((js) => {
+              setJobs(js);
+              if (js.length > 0) setActiveJobId(js[0].job_id);
+            })
+            .catch(() => {});
         }
         if (fresh.status === "failed" || fresh.status === "cancelled") {
           clearInterval(id);
@@ -136,6 +418,7 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
       return;
     }
     setLaunching(true); setError(null); setResult(null);
+    setStartedAt(Date.now());
     try {
       const extra: Record<string, unknown> = {
         system,
@@ -158,23 +441,155 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
   }, [projectId, uploadX, uploadY, system, dtrec, dtAnalysis, damping, scale, units, duration]);
 
   // Preview X
-  usePreviewPlot(previewXRef, uploadX?.preview, "#2563eb");
-  usePreviewPlot(previewYRef, uploadY?.preview, "#16a34a");
+  // Gatekeepear los plots hasta que Plotly esté disponible (cargado vía CDN
+  // en app/(app)/layout.tsx). Si pasamos null a los hooks mientras carga, el
+  // useEffect interno hace early return; cuando plotlyReady cambia a true,
+  // React re-renderiza, los hooks reciben el `result` real y disparan newPlot
+  // con Plotly ya definido. Fix del bug de 2026-11-04: al persistir la última
+  // sección activa, se podía aterrizar en NLTH sin que Plotly hubiera cargado.
+  const plotlyReady = usePlotly();
+  const rr = plotlyReady ? result : null;
+  usePreviewPlot(previewXRef, plotlyReady ? uploadX?.preview : undefined, "#2563eb");
+  usePreviewPlot(previewYRef, plotlyReady ? uploadY?.preview : undefined, "#16a34a");
   // Resultados
-  useRoofPlot(roofRef, result, result?.events ?? null);
-  useVbPlot(vbRef, result, W_kN, result?.events ?? null);
-  useDriftPlot(driftRef, result);
-  useAccelPlot(accelRef, result);
-  useHysteresisPlot(hysteresisRef, result);
-  useOrbitPlot(orbitRef, result);
+  useRoofPlot(roofRef, rr, rr?.events ?? null);
+  useVbPlot(vbRef, rr, W_kN, rr?.events ?? null);
+  useDriftPlot(driftRef, rr);
+  useAccelPlot(accelRef, rr);
+  useAmplificationPlot(amplifRef, rr);
+  useHysteresisPlot(hysteresisRef, rr);
+  useOrbitPlot(orbitRef, rr);
 
   const running  = job && (job.status === "pending" || job.status === "running");
   const progress = (job?.progress ?? {}) as { stage?: string; pct?: number; t?: number };
+
+  // Trackear cambios de pct para el stall detector
+  useEffect(() => {
+    if (!running) return;
+    const pct = typeof progress.pct === "number" ? progress.pct : 0;
+    if (Math.abs(pct - lastSeenPct) > 0.01) {
+      setLastSeenPct(pct);
+      setLastPctChangeAt(Date.now());
+    }
+  }, [progress.pct, running, lastSeenPct]);
+  // Al cambiar de job, resetear
+  useEffect(() => {
+    setLastSeenPct(0);
+    setLastPctChangeAt(Date.now());
+  }, [job?.id]);
+
+  const stalledSec = running ? (nowTick - lastPctChangeAt) / 1000 : 0;
+  const isStalled  = running && stalledSec > 30 && (progress.pct ?? 0) < 99.5;
+
+  const handleCancel = useCallback(async () => {
+    if (!job || canceling) return;
+    if (!window.confirm("¿Cancelar el análisis? El proceso OpenSees recibirá SIGKILL y no podrá recuperarse.")) return;
+    setCanceling(true);
+    try {
+      await structuralAnalysisApi.cancel(job.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Error cancelando el job.");
+    } finally {
+      setCanceling(false);
+    }
+  }, [job, canceling]);
+
   const sameDt = uploadX?.dt_detected && uploadY?.dt_detected &&
                  Math.abs(uploadX.dt_detected - uploadY.dt_detected) > 1e-6;
 
+  // Reloj: refresca cada segundo mientras hay job corriendo (para ETA en vivo).
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [running]);
+
+  // Métricas en vivo de progreso.
+  const liveMetrics = (() => {
+    if (!running || !startedAt) return null;
+    const elapsedMs = nowTick - startedAt;
+    const elapsedS  = Math.max(0, elapsedMs / 1000);
+    const pct       = typeof progress.pct === "number" ? progress.pct : 0;
+    const tSim      = typeof progress.t   === "number" ? progress.t   : 0;
+    // ETA solo tiene sentido con pct > ~2 para no explotar al inicio.
+    const etaS = pct > 2
+      ? Math.max(0, (elapsedS * (100 - pct)) / pct)
+      : null;
+    const ratio = tSim > 0.1 ? elapsedS / tSim : null;
+    return { elapsedS, etaS, ratio, pct, tSim };
+  })();
+
+  const fmtDuration = (s: number | null | undefined): string => {
+    if (s == null || !Number.isFinite(s)) return "—";
+    if (s < 60)    return `${s.toFixed(0)} s`;
+    if (s < 3600)  return `${Math.floor(s / 60)}m ${Math.floor(s % 60).toString().padStart(2, "0")}s`;
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return `${h}h ${m.toString().padStart(2, "0")}m`;
+  };
+
   return (
     <div className="flex flex-col gap-5">
+      {/* ── Banner de modo preview (JSON externo cargado) ─────────────────── */}
+      {previewFilename && (
+        <div className="rounded-xl border border-amber-500/40 bg-amber-500/8 p-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <span className="text-[10px] uppercase tracking-wider font-bold px-2 py-0.5 rounded bg-amber-500 text-white">
+              Vista previa
+            </span>
+            <span className="text-xs text-[var(--text)] truncate">
+              Análisis cargado desde <code className="font-mono text-[var(--text-muted)]">{previewFilename}</code> — no está guardado en este proyecto.
+            </span>
+          </div>
+          <div className="flex gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={async () => {
+                if (!result) return;
+                try {
+                  const r = await structuralAnalysisApi.importNLTHBundle(projectId, {
+                    export_meta: { exporter: "NLTHPanel preview", exported_at: new Date().toISOString() },
+                    result,
+                  });
+                  // Refrescar historial + fijar el job importado
+                  const list = await structuralAnalysisApi.listNLTHJobs(projectId);
+                  setJobs(list);
+                  setActiveJobId(r.job_id);
+                  setPreviewFilename(null);
+                  alert(r.message);
+                } catch (e) {
+                  alert(`Error importando: ${e instanceof Error ? e.message : String(e)}`);
+                }
+              }}
+              className="text-xs px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white"
+              title="Persiste el bundle JSON como un job real del proyecto"
+            >
+              Guardar como nuevo análisis
+            </button>
+            <button
+              type="button"
+              onClick={exitPreviewMode}
+              className="text-xs px-3 py-1 rounded bg-[var(--panel-muted)] hover:bg-[var(--surface-2)] text-[var(--text)]"
+            >
+              Volver al proyecto
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Input oculto para importar JSON externos. */}
+      <input
+        ref={importFileInputRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) importJSONFromFile(f);
+          e.target.value = "";
+        }}
+      />
+
       {/* ── Launcher ──────────────────────────────────────────────────────── */}
       <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 flex flex-col gap-4">
         <div className="flex items-start justify-between gap-3 flex-wrap">
@@ -191,13 +606,56 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
           <SystemBadge detected={detected} />
         </div>
 
-        {/* Uploads + previews */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <RecordUpload dir="X" upload={uploadX} uploading={uploading === "X"}
-            onFile={(f) => f && upload("X", f)} previewRef={previewXRef} />
-          <RecordUpload dir="Y" upload={uploadY} uploading={uploading === "Y"}
-            onFile={(f) => f && upload("Y", f)} previewRef={previewYRef} />
+        {/* Fuente del registro: subir archivo vs biblioteca FEMA P-695 */}
+        <div className="flex gap-1 flex-wrap items-center">
+          <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mr-2">
+            Fuente del registro
+          </span>
+          <button
+            onClick={() => setSource("upload")}
+            className={`px-3 py-1.5 rounded-md text-xs font-medium border transition-colors ${
+              source === "upload"
+                ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                : "bg-[var(--surface-2)] text-[var(--text-muted)] border-[var(--border)] hover:bg-[var(--surface)]"
+            }`}
+          >
+            Cargar archivos propios
+          </button>
+          <button
+            onClick={() => setSource("fema")}
+            className={`px-3 py-1.5 rounded-md text-xs font-medium border transition-colors ${
+              source === "fema"
+                ? "bg-[var(--accent)] text-white border-[var(--accent)]"
+                : "bg-[var(--surface-2)] text-[var(--text-muted)] border-[var(--border)] hover:bg-[var(--surface)]"
+            }`}
+          >
+            Biblioteca FEMA P-695 (22 pares)
+          </button>
         </div>
+
+        {source === "upload" ? (
+          /* Uploads + previews */
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <RecordUpload dir="X" upload={uploadX} uploading={uploading === "X"}
+              onFile={(f) => f && upload("X", f)} previewRef={previewXRef} />
+            <RecordUpload dir="Y" upload={uploadY} uploading={uploading === "Y"}
+              onFile={(f) => f && upload("Y", f)} previewRef={previewYRef} />
+          </div>
+        ) : (
+          <FEMALibrarySelector
+            projectId={projectId}
+            T1_x={T1Modal}
+            T1_y={T1ModalY}
+            nsr10Available={!!nsr10Available}
+            onPairApplied={(ux, uy, info) => {
+              setUploadX(ux); setUploadY(uy);
+              // Si el backend calculó un factor de escala, lo reflejamos en el panel.
+              if (typeof info.scale === "number") setScale(info.scale);
+              if (ux.dt_detected) setDtrec(ux.dt_detected);
+              setUnits("g");
+            }}
+          />
+        )}
 
         {sameDt && (
           <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
@@ -205,6 +663,12 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
             El análisis usa un único dt — verifica que los registros sean compatibles.
           </div>
         )}
+
+        {/* Validación visual de la configuración del registro (Ola 3) */}
+        <RecordValidationCard
+          uploadX={uploadX} uploadY={uploadY}
+          dtrec={dtrec} units={units} scale={scale}
+        />
 
         {/* Parámetros */}
         <div className="grid grid-cols-2 md:grid-cols-6 gap-3 pt-1">
@@ -249,26 +713,124 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
 
         {/* Job progress */}
         {running && (
-          <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 flex items-center gap-3">
-            <span className="text-xs text-[var(--text-muted)] uppercase tracking-wider">
-              {progress.stage ?? job?.status}
-            </span>
-            <div className="flex-1 h-2 bg-[var(--border)] rounded-full overflow-hidden">
-              <div className="h-full bg-[var(--accent)] transition-all"
-                   style={{ width: `${Math.max(2, progress.pct ?? 2)}%` }} />
+          <div className={`rounded-lg border px-3 py-2 flex flex-col gap-2 ${
+            isStalled ? "border-rose-500/50 bg-rose-500/5" : "border-[var(--border)] bg-[var(--surface-2)]"
+          }`}>
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-[var(--text-muted)] uppercase tracking-wider">
+                {progress.stage ?? job?.status}
+              </span>
+              <div className="flex-1 h-2 bg-[var(--border)] rounded-full overflow-hidden">
+                <div className={`h-full transition-all ${isStalled ? "bg-rose-500" : "bg-[var(--accent)]"}`}
+                     style={{ width: `${Math.max(2, progress.pct ?? 2)}%` }} />
+              </div>
+              <span className="text-xs font-mono text-[var(--text)]">
+                {progress.pct !== undefined ? `${progress.pct.toFixed(0)}%` : "…"}
+              </span>
+              <button
+                onClick={handleCancel}
+                disabled={canceling}
+                className="px-2.5 py-1 rounded text-[11px] font-semibold border border-rose-500/50 text-rose-700 dark:text-rose-300 hover:bg-rose-500/10 disabled:opacity-40 transition-colors"
+                title="Enviar SIGKILL al proceso OpenSees"
+              >
+                {canceling ? "Cancelando…" : "Cancelar"}
+              </button>
             </div>
-            <span className="text-xs font-mono text-[var(--text)]">
-              {progress.pct !== undefined ? `${progress.pct.toFixed(0)}%` : "…"}
-              {progress.t !== undefined ? `  t=${progress.t.toFixed(1)}s` : ""}
-            </span>
+            {isStalled && (
+              <div className="text-xs text-rose-800 dark:text-rose-300 font-medium">
+                ⚠ El progreso no avanza hace {stalledSec.toFixed(0)}s —
+                {" "}es posible que un elemento sea patológico. Puedes esperar o cancelar.
+              </div>
+            )}
+            {liveMetrics && (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                <ProgressStat
+                  label="Transcurrido"
+                  value={fmtDuration(liveMetrics.elapsedS)}
+                  hint="tiempo real desde que se lanzó"
+                />
+                <ProgressStat
+                  label="ETA"
+                  value={fmtDuration(liveMetrics.etaS)}
+                  hint="estimado restante basado en el progreso actual"
+                  highlight
+                />
+                <ProgressStat
+                  label="Simulado"
+                  value={liveMetrics.tSim > 0 ? `${liveMetrics.tSim.toFixed(1)} s` : "—"}
+                  hint="segundos del registro ya procesados"
+                />
+                <ProgressStat
+                  label="Ratio"
+                  value={liveMetrics.ratio ? `${liveMetrics.ratio.toFixed(1)}×` : "—"}
+                  hint="segundos de reloj por 1 s simulado"
+                />
+              </div>
+            )}
           </div>
         )}
       </div>
 
+      {/* ── Historial de análisis NLTH del proyecto ─────────────────────── */}
+      <NLTHHistoryList
+        jobs={jobs}
+        activeJobId={activeJobId}
+        loadingJobId={loadingJob}
+        onOpen={openHistoricalJob}
+        onActivate={activateHistoricalJob}
+        onDelete={deleteHistoricalJob}
+        onExport={exportHistoricalJob}
+        onImportClick={() => importFileInputRef.current?.click()}
+      />
+
       {/* ── Resultados ───────────────────────────────────────────────────── */}
       {result && (
         <div className="flex flex-col gap-5">
+          {/* Barra de acciones sobre el análisis actualmente visible.
+              Permite guardar el análisis aún cuando no está en el historial
+              (p.ej. en modo preview tras importar un JSON). */}
+          <div className="flex items-center justify-between gap-3 flex-wrap bg-[var(--panel-muted)]/30 rounded-lg px-3 py-2">
+            <div className="text-[11px] text-[var(--text-muted)]">
+              {previewFilename ? (
+                <>Mostrando archivo externo <code className="font-mono text-[var(--text)]">{previewFilename}</code></>
+              ) : activeJobId ? (
+                <>Mostrando análisis <code className="font-mono text-[var(--text)]">{activeJobId.slice(0, 8)}</code> del historial</>
+              ) : (
+                <>Mostrando el último análisis disponible</>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const bundle = buildExportBundle(
+                  result,
+                  previewFilename ? "historical_job" : "live",
+                  activeJobId
+                    ? jobs.find((j) => j.job_id === activeJobId) ?? undefined
+                    : undefined,
+                );
+                const activeMeta = activeJobId
+                  ? jobs.find((j) => j.job_id === activeJobId)
+                  : null;
+                const safe = (s: string) => s.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 80);
+                const recordLabel = activeMeta?.record_x_file
+                  ?? (result as NLTHResult & { record_x_file?: string }).record_x_file
+                  ?? "analysis";
+                const ts = (activeMeta?.computed_at ?? new Date().toISOString())
+                  .slice(0, 19).replace(/[:T]/g, "-");
+                downloadBlob(bundle, `nlth_${safe(recordLabel)}_${ts}.json`);
+              }}
+              className="text-xs px-3 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/30 text-emerald-600 dark:text-emerald-400 font-medium shrink-0"
+              title="Descarga este análisis como JSON portable para respaldo o importación posterior."
+            >
+              ↓ Descargar este análisis (JSON)
+            </button>
+          </div>
+
           <VerdictHero result={result} wKN={W_kN} />
+
+          {/* Diagnóstico de salud del solver (Ola 2) + diagnóstico elemento (Ola 7) */}
+          <AnalysisHealthBanner health={result.health} projectId={projectId} />
 
           {/* Runtime: wall time + ratio vs simulado */}
           <RuntimeCard result={result} />
@@ -282,7 +844,13 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
             <PlotCard title="Desplazamiento de techo" refEl={roofRef} />
             <PlotCard title="Cortante basal Vb(t)"    refEl={vbRef} />
             <PlotCard title="Deriva por piso vs límite NSR-10"  refEl={driftRef} />
-            <PlotCard title="Aceleración máxima por piso"       refEl={accelRef} />
+            <PlotCard
+              title={(result.envelope.max_abs_accel_by_story_x_mps2 ?? result.envelope.max_abs_accel_by_story_y_mps2)
+                      ? "Aceleración absoluta máxima por piso (g)"
+                      : "Aceleración relativa máxima por piso (g) — relanzar NLTHA para obtener la absoluta"}
+              refEl={accelRef}
+            />
+            <PlotCard title="Amplificación PFA / PGA por piso"         refEl={amplifRef} />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-[1fr_minmax(0,420px)] gap-4">
@@ -292,12 +860,19 @@ export default function NLTHPanel({ projectId, system: detected }: Props) {
 
           <DamageSummary damage={result.damage} />
 
-          {/* Eventos locales: aplastamiento, pandeo, fluencia, fractura (Bloque B) */}
+          {/* Umbrales de daño editables + eventos locales */}
           {result.system === "frames" && (
-            <LocalEventsPanel
-              events={result.events ?? null}
-              context="nlth"
-            />
+            <div className="flex flex-col gap-3">
+              <DamageThresholdsPanel
+                meta={thresholdsMeta}
+                busy={recomputing}
+                onApply={recomputeEvents}
+              />
+              <LocalEventsPanel
+                events={result.events ?? null}
+                context="nlth"
+              />
+            </div>
           )}
 
           {/* Plan de reparación por elemento (Bloque C) */}
@@ -604,10 +1179,10 @@ function useRoofPlot(
 
     Plotly.newPlot(ref.current, [
       { x: t, y: dx, type: "scatter", mode: "lines", name: "X",
-        line: { color: "#2563eb", width: 1.4 },
+        line: { color: "#2563eb", width: 2, shape: "spline", smoothing: 0.3 },
         hovertemplate: "X: %{y:.4f} m<extra></extra>" },
       { x: t, y: dy, type: "scatter", mode: "lines", name: "Y",
-        line: { color: "#16a34a", width: 1.4 },
+        line: { color: "#16a34a", width: 2, shape: "spline", smoothing: 0.3 },
         hovertemplate: "Y: %{y:.4f} m<extra></extra>" },
       { x: [t[ix]], y: [dxPeak], type: "scatter", mode: "markers",
         showlegend: false,
@@ -717,10 +1292,10 @@ function useVbPlot(
 
     Plotly.newPlot(ref.current, [
       { x: t, y: vx, type: "scatter", mode: "lines", name: "Vb X",
-        line: { color: "#2563eb", width: 1.4 },
+        line: { color: "#2563eb", width: 2, shape: "spline", smoothing: 0.3 },
         hovertemplate: "Vb X: %{y:.0f} kN<extra></extra>" },
       { x: t, y: vy, type: "scatter", mode: "lines", name: "Vb Y",
-        line: { color: "#16a34a", width: 1.4 },
+        line: { color: "#16a34a", width: 2, shape: "spline", smoothing: 0.3 },
         hovertemplate: "Vb Y: %{y:.0f} kN<extra></extra>" },
       { x: [t[ix]], y: [vxPeak], type: "scatter", mode: "markers",
         showlegend: false,
@@ -807,27 +1382,122 @@ function useAccelPlot(ref: React.RefObject<HTMLDivElement | null>, result: NLTHR
       newPlot: (...a: unknown[]) => void; purge: (el: Element) => void;
     } }).Plotly;
     if (!Plotly) return;
-    // Convertir a g para mostrar en una escala estandarizada
     const G = 9.80665;
-    const ax = (result.envelope.max_accel_by_story_x_mps2 ?? []).map((v) => v / G);
-    const ay = (result.envelope.max_accel_by_story_y_mps2 ?? []).map((v) => v / G);
+    const env = result.envelope;
+    // Prefiere la aceleración absoluta (= ü_rel + ü_g). Si viene de un run
+    // viejo sin ese campo, usa el alias legacy max_accel_* (que ya reportamos
+    // de forma incorrecta como "absoluta" pero era en realidad relativa).
+    const absX = env.max_abs_accel_by_story_x_mps2 ?? env.max_accel_by_story_x_mps2 ?? [];
+    const absY = env.max_abs_accel_by_story_y_mps2 ?? env.max_accel_by_story_y_mps2 ?? [];
+    const ax = absX.map((v) => v / G);
+    const ay = absY.map((v) => v / G);
+    const pgaXg = env.pga_x_g ?? ((env.pga_x_mps2 ?? 0) / G);
+    const pgaYg = env.pga_y_g ?? ((env.pga_y_mps2 ?? 0) / G);
+    const pgaMax = Math.max(pgaXg, pgaYg);
+
     const dzApprox = result.meta.total_height_m / Math.max(ax.length, 1);
     const stories = ax.map((_, i) =>
       `N${i + 1} (${((i + 1) * dzApprox).toFixed(1)} m)`
     );
 
+    const shapes: Record<string, unknown>[] = [];
+    const annotations: Record<string, unknown>[] = [];
+    if (pgaMax > 0) {
+      shapes.push({
+        type: "line", xref: "x", yref: "paper",
+        x0: pgaMax, x1: pgaMax, y0: 0, y1: 1,
+        line: { color: "#dc2626", width: 1.5, dash: "dash" },
+      });
+      annotations.push({
+        x: pgaMax, y: 1.03, xref: "x", yref: "paper",
+        text: `PGA = ${pgaMax.toFixed(3)} g`,
+        showarrow: false, xanchor: "right", yanchor: "bottom",
+        font: { color: "#dc2626", size: 10, family: "monospace" },
+        bgcolor: "#fef2f2", bordercolor: "#dc2626", borderwidth: 1, borderpad: 3,
+      });
+    }
+
     Plotly.newPlot(ref.current, [
       { x: ax, y: stories, type: "bar", orientation: "h", name: "X",
         marker: { color: "#2563eb", line: { color: "#1e40af", width: 0.5 } },
-        hovertemplate: "%{y} · X: %{x:.3f} g<extra></extra>" },
+        hovertemplate: `%{y} · X: %{x:.3f} g (PGAx = ${pgaXg.toFixed(3)} g)<extra></extra>` },
       { x: ay, y: stories, type: "bar", orientation: "h", name: "Y",
         marker: { color: "#16a34a", line: { color: "#15803d", width: 0.5 } },
-        hovertemplate: "%{y} · Y: %{x:.3f} g<extra></extra>" },
+        hovertemplate: `%{y} · Y: %{x:.3f} g (PGAy = ${pgaYg.toFixed(3)} g)<extra></extra>` },
     ], {
       ..._layout("Aceleración absoluta de piso (g)", ""),
       barmode: "group",
-      // Convención física: Piso 1 abajo, cubierta arriba (default de categorías).
       yaxis: { categoryorder: "array", categoryarray: stories },
+      shapes, annotations,
+    }, _opts());
+    return () => { if (ref.current) Plotly.purge(ref.current); };
+  }, [result, ref]);
+}
+
+function useAmplificationPlot(ref: React.RefObject<HTMLDivElement | null>, result: NLTHResult | null) {
+  useEffect(() => {
+    if (!result || !ref.current) return;
+    const Plotly = (window as unknown as { Plotly?: {
+      newPlot: (...a: unknown[]) => void; purge: (el: Element) => void;
+    } }).Plotly;
+    if (!Plotly) return;
+
+    const G   = 9.80665;
+    const env = result.envelope;
+    // Si el backend no devolvió amplificaciones (run viejo), las calculamos
+    // on-the-fly con la absoluta y el PGA, cuando ambos estén disponibles.
+    const pgaX = env.pga_x_mps2 ?? 0;
+    const pgaY = env.pga_y_mps2 ?? 0;
+    const absX = env.max_abs_accel_by_story_x_mps2 ?? env.max_accel_by_story_x_mps2 ?? [];
+    const absY = env.max_abs_accel_by_story_y_mps2 ?? env.max_accel_by_story_y_mps2 ?? [];
+    const ampX = env.accel_amplification_by_story_x ?? (pgaX > 0 ? absX.map((v) => v / pgaX) : []);
+    const ampY = env.accel_amplification_by_story_y ?? (pgaY > 0 ? absY.map((v) => v / pgaY) : []);
+
+    if (ampX.length === 0 && ampY.length === 0) {
+      Plotly.newPlot(ref.current, [], {
+        ..._layout("PFA / PGA (adim.)", ""),
+        annotations: [{
+          x: 0.5, y: 0.5, xref: "paper", yref: "paper",
+          text: "Sin PGA disponible — relanza el NLTHA con el motor nuevo",
+          showarrow: false,
+          font: { color: "#6b7280", size: 11 },
+        }],
+      }, _opts());
+      return () => { if (ref.current) Plotly.purge(ref.current); };
+    }
+
+    const n = Math.max(ampX.length, ampY.length);
+    const dzApprox = result.meta.total_height_m / Math.max(n, 1);
+    const stories = Array.from({ length: n }, (_, i) =>
+      `N${i + 1} (${((i + 1) * dzApprox).toFixed(1)} m)`
+    );
+
+    const pgaXg = pgaX / G;
+    const pgaYg = pgaY / G;
+
+    Plotly.newPlot(ref.current, [
+      { x: ampX, y: stories, type: "bar", orientation: "h", name: "X",
+        marker: { color: "#2563eb", line: { color: "#1e40af", width: 0.5 } },
+        hovertemplate: `%{y} · PFAx/PGAx: %{x:.2f} (PGAx = ${pgaXg.toFixed(3)} g)<extra></extra>` },
+      { x: ampY, y: stories, type: "bar", orientation: "h", name: "Y",
+        marker: { color: "#16a34a", line: { color: "#15803d", width: 0.5 } },
+        hovertemplate: `%{y} · PFAy/PGAy: %{x:.2f} (PGAy = ${pgaYg.toFixed(3)} g)<extra></extra>` },
+    ], {
+      ..._layout("PFA / PGA (adim.)", ""),
+      barmode: "group",
+      yaxis: { categoryorder: "array", categoryarray: stories },
+      shapes: [{
+        type: "line", xref: "x", yref: "paper",
+        x0: 1, x1: 1, y0: 0, y1: 1,
+        line: { color: "#64748b", width: 1.5, dash: "dash" },
+      }],
+      annotations: [{
+        x: 1, y: 1.03, xref: "x", yref: "paper",
+        text: "PFA = PGA (sin amplificación)",
+        showarrow: false, xanchor: "left", yanchor: "bottom",
+        font: { color: "#475569", size: 10, family: "monospace" },
+        bgcolor: "#f1f5f9", bordercolor: "#64748b", borderwidth: 1, borderpad: 3,
+      }],
     }, _opts());
     return () => { if (ref.current) Plotly.purge(ref.current); };
   }, [result, ref]);
@@ -1032,18 +1702,24 @@ function useOrbitPlot(
   }, [result, ref]);
 }
 
+// Layout premium reusado por todos los gráficos del panel NLTH (Ola 4 2026-11-04).
+// Delegamos a plotlyLayoutPremium para el look&feel central (títulos en negrilla,
+// grilla sutil, hover elegante, zero line marcada). Añadimos una leyenda top-right
+// semi-transparente — útil cuando los charts tienen varias trazas por piso.
 function _layout(xLabel: string, yLabel: string) {
   return {
-    paper_bgcolor: "transparent", plot_bgcolor: "transparent",
-    font: { size: 11 }, margin: { t: 10, r: 10, b: 44, l: 60 },
-    xaxis: { title: { text: xLabel }, gridcolor: "var(--border)" },
-    yaxis: { title: { text: yLabel }, gridcolor: "var(--border)" },
-    legend: { x: 1, y: 1, xanchor: "right", bgcolor: "rgba(255,255,255,0.4)" },
+    ...plotlyLayoutPremium({ xTitle: xLabel, yTitle: yLabel, showLegend: true, legendTop: true }),
+    legend: {
+      x: 1, y: 1.08, xanchor: "right", yanchor: "bottom",
+      orientation: "h" as const,
+      font: { family: "Inter, system-ui, sans-serif", size: 10, color: "var(--text)" },
+      bgcolor: "rgba(0,0,0,0)",
+    },
   };
 }
 
 function _opts() {
-  return { responsive: true, displayModeBar: false };
+  return { ...plotlyConfigPremium, displayModeBar: false };
 }
 
 // ── Sub-componentes ─────────────────────────────────────────────────────────
@@ -1338,6 +2014,32 @@ function RuntimeStat({ label, value, detail }: {
   );
 }
 
+function ProgressStat({ label, value, hint, highlight = false }: {
+  label: string; value: string; hint: string; highlight?: boolean;
+}) {
+  return (
+    <div
+      title={hint}
+      className={`flex items-baseline justify-between gap-1 rounded border px-2 py-1 ${
+        highlight
+          ? "border-amber-300 bg-amber-50"
+          : "border-[var(--border)] bg-[var(--surface)]"
+      }`}
+    >
+      <span className={`text-[9px] uppercase tracking-wider ${
+        highlight ? "text-amber-700" : "text-[var(--text-muted)]"
+      }`}>
+        {label}
+      </span>
+      <span className={`font-mono font-semibold ${
+        highlight ? "text-amber-900" : "text-[var(--text)]"
+      }`}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
 function VerdictHero({ result, wKN }: { result: NLTHResult; wKN: number | null }) {
   const v = computeVerdict(result, wKN);
 
@@ -1489,7 +2191,7 @@ function DamageSummary({ damage }: { damage: NLTHResult["damage"] }) {
 
 function HysteresisCard({ refEl }: { refEl: React.RefObject<HTMLDivElement | null> }) {
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 flex flex-col gap-2">
+    <div className="pl-glass rounded-xl p-4 flex flex-col gap-2">
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div>
           <h4 className="text-sm font-semibold uppercase tracking-wider text-[var(--text-muted)]">
@@ -1503,14 +2205,14 @@ function HysteresisCard({ refEl }: { refEl: React.RefObject<HTMLDivElement | nul
           </p>
         </div>
       </div>
-      <div ref={refEl} style={{ height: 320 }} className="rounded bg-[var(--surface-2)]" />
+      <div ref={refEl} style={{ height: 320 }} className="rounded" />
     </div>
   );
 }
 
 function OrbitCard({ refEl }: { refEl: React.RefObject<HTMLDivElement | null> }) {
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 flex flex-col gap-2">
+    <div className="pl-glass rounded-xl p-4 flex flex-col gap-2">
       <h4 className="text-sm font-semibold uppercase tracking-wider text-[var(--text-muted)]">
         Órbita de techo (X vs Y)
       </h4>
@@ -1520,7 +2222,7 @@ function OrbitCard({ refEl }: { refEl: React.RefObject<HTMLDivElement | null> })
         <span className="text-red-500 font-semibold"> ✕</span> residual ·
         <span className="text-red-500"> círculo</span> = límite NSR-10.
       </p>
-      <div ref={refEl} style={{ height: 320 }} className="rounded bg-[var(--surface-2)]" />
+      <div ref={refEl} style={{ height: 320 }} className="rounded" />
     </div>
   );
 }
@@ -1529,11 +2231,11 @@ function PlotCard({ title, refEl }: {
   title: string; refEl: React.RefObject<HTMLDivElement | null>;
 }) {
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 flex flex-col gap-2">
+    <div className="pl-glass rounded-xl p-4 flex flex-col gap-2">
       <h4 className="text-sm font-semibold uppercase tracking-wider text-[var(--text-muted)]">
         {title}
       </h4>
-      <div ref={refEl} style={{ height: 280 }} className="rounded bg-[var(--surface-2)]" />
+      <div ref={refEl} style={{ height: 280 }} className="rounded" />
     </div>
   );
 }
@@ -1600,5 +2302,194 @@ function SystemBadge({ detected }: { detected: "walls" | "frames" | "mixed" | "u
       <span className="w-1.5 h-1.5 rounded-full" style={{ background: color }} />
       {label}
     </span>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Historial de análisis NLTH — lista de jobs navegables (Fase 1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function NLTHHistoryList({
+  jobs, activeJobId, loadingJobId,
+  onOpen, onActivate, onDelete, onExport, onImportClick,
+}: {
+  jobs:          NLTHJobMeta[];
+  activeJobId:   string | null;
+  loadingJobId:  string | null;
+  onOpen:        (id: string) => void;
+  onActivate:    (id: string) => void;
+  onDelete:      (id: string) => void;
+  onExport:      (job: NLTHJobMeta) => void;
+  onImportClick: () => void;
+}) {
+  return (
+    <section className="pl-glass-soft rounded-xl p-4 space-y-3">
+      <header className="flex items-baseline justify-between gap-3 flex-wrap">
+        <div>
+          <h3 className="text-sm font-semibold text-[var(--text)]">
+            Historial de análisis cronológicos ({jobs.length})
+          </h3>
+          <p className="text-[11px] text-[var(--text-muted)]">
+            Click en una tarjeta para revisar. "Fijar" lo activa para el
+            verificador y exports. "Descargar" guarda un .json portable;
+            "Importar" abre un .json externo en modo vista previa.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onImportClick}
+          className="text-xs px-3 py-1.5 rounded bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-600 dark:text-indigo-300 font-medium shrink-0"
+        >
+          📂 Importar JSON
+        </button>
+      </header>
+
+      {jobs.length === 0 && (
+        <div className="rounded-lg bg-[var(--panel-muted)]/40 p-6 text-center">
+          <div className="text-xs text-[var(--text-muted)]">
+            Aún no hay análisis guardados en este proyecto.
+          </div>
+          <div className="text-[11px] text-[var(--text-muted)] italic mt-1">
+            Lanza un NLTH desde abajo, o importa un .json exportado previamente.
+          </div>
+        </div>
+      )}
+
+      {jobs.length > 0 && (
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-2 max-h-[420px] overflow-y-auto pr-1">
+        {jobs.map((j) => {
+          const isActive  = j.job_id === activeJobId;
+          const isLoading = j.job_id === loadingJobId;
+          const dateStr   = j.computed_at
+            ? new Date(j.computed_at).toLocaleString("es-CO", {
+                dateStyle: "short", timeStyle: "short",
+              })
+            : "—";
+          const driftColor =
+            j.max_drift_pct >= 2.0 ? "text-rose-500"
+            : j.max_drift_pct >= 1.0 ? "text-amber-500"
+            : "text-emerald-500";
+          const residualColor =
+            j.residual_drift_pct >= 0.5 ? "text-rose-500"
+            : j.residual_drift_pct >= 0.2 ? "text-amber-500"
+            : "text-emerald-500";
+          const recordLabel = j.record_x_file === j.record_y_file
+            ? j.record_x_file
+            : `${j.record_x_file} / ${j.record_y_file}`;
+          return (
+            <article
+              key={j.job_id}
+              className={`rounded-lg p-3 border transition cursor-pointer ${
+                isActive
+                  ? "bg-indigo-500/10 border-indigo-500/50 shadow"
+                  : "bg-[var(--panel-muted)]/40 border-transparent hover:border-[var(--panel-muted)]"
+              } ${isLoading ? "opacity-60 pointer-events-none" : ""}`}
+              onClick={() => onOpen(j.job_id)}
+            >
+              <div className="flex items-baseline justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    {isActive && (
+                      <span className="text-[9px] uppercase tracking-wider font-bold text-indigo-500 px-1.5 py-0.5 rounded bg-indigo-500/15">
+                        viendo
+                      </span>
+                    )}
+                    <span className="text-xs font-mono text-[var(--text)] truncate">
+                      {recordLabel}
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-[var(--text-muted)] mt-0.5">
+                    {dateStr} · {j.system === "walls" ? "muros" : "pórticos"} ·
+                    {" "}scale = {j.scale.toFixed(3)} · wall = {j.wall_time_min.toFixed(1)} min
+                  </div>
+                </div>
+                <span
+                  className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded ${
+                    j.status === "success"
+                      ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+                      : j.status === "partial"
+                      ? "bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                      : "bg-rose-500/15 text-rose-600 dark:text-rose-400"
+                  }`}
+                >
+                  {j.status}
+                </span>
+              </div>
+
+              {/* KPIs breves */}
+              <div className="grid grid-cols-4 gap-2 mt-2 text-[10px]">
+                <div>
+                  <div className="text-[9px] uppercase text-[var(--text-muted)]">Deriva máx</div>
+                  <div className={`font-mono font-semibold ${driftColor}`}>
+                    {j.max_drift_pct.toFixed(2)} %
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] uppercase text-[var(--text-muted)]">Residual</div>
+                  <div className={`font-mono font-semibold ${residualColor}`}>
+                    {j.residual_drift_pct.toFixed(2)} %
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] uppercase text-[var(--text-muted)]">PGA</div>
+                  <div className="font-mono text-[var(--text)]">
+                    {Math.max(j.pga_x_g, j.pga_y_g).toFixed(2)} g
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[9px] uppercase text-[var(--text-muted)]">Vb pico</div>
+                  <div className="font-mono text-[var(--text)]">
+                    {j.Vb_peak_kN.toFixed(0)} kN
+                  </div>
+                </div>
+              </div>
+
+              {/* Acciones */}
+              <div className="flex items-center gap-1.5 mt-2 pt-2 border-t border-[var(--panel-muted)]/50">
+                {!isActive && (
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onOpen(j.job_id); }}
+                    className="text-[10px] px-2 py-0.5 rounded bg-[var(--panel-muted)] hover:bg-[var(--surface-2)] text-[var(--text)]"
+                  >
+                    Abrir
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onActivate(j.job_id); }}
+                  className="text-[10px] px-2 py-0.5 rounded bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-600 dark:text-indigo-300"
+                  title="Fija este análisis como 'el último' — el verificador y los exports usarán este."
+                >
+                  Fijar
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onExport(j); }}
+                  className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/10 hover:bg-emerald-500/25 text-emerald-600 dark:text-emerald-400"
+                  title="Descarga un JSON autocontenido de este análisis."
+                >
+                  ↓ Descargar
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onDelete(j.job_id); }}
+                  className="text-[10px] px-2 py-0.5 rounded bg-rose-500/10 hover:bg-rose-500/25 text-rose-600 dark:text-rose-400 ml-auto"
+                >
+                  Borrar
+                </button>
+              </div>
+
+              {j.aborted && j.abort_reason && (
+                <div className="mt-1.5 text-[9px] italic text-amber-600 dark:text-amber-400">
+                  motor abortó: {j.abort_reason}
+                </div>
+              )}
+            </article>
+          );
+        })}
+      </div>
+      )}
+    </section>
   );
 }

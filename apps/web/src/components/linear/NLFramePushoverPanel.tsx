@@ -9,6 +9,9 @@ import type {
   HingeThresholds, NLFramePushoverHistory, LocalEventsPayload, LocalEvent,
 } from "@/lib/structural-types";
 import NLFramePushoverLauncher    from "./NLFramePushoverLauncher";
+import { AnalysisHealthBanner }    from "./AnalysisHealthBanner";
+import { usePlotly }                from "@/lib/use-plotly";
+import { plotlyLayoutPremium, plotlyConfigPremium } from "@/lib/plotly-theme";
 import FrameDeformedShape3D       from "./FrameDeformedShape3D";
 import DriftProfileChart          from "./DriftProfileChart";
 import CriticalElementsPanel      from "./CriticalElementsPanel";
@@ -282,8 +285,9 @@ export default function NLFramePushoverPanel({ projectId, hideLauncher = false }
               const pct = s.total_steps > 0 ? (s.converged_steps / s.total_steps) * 100 : 0;
               const col = s.status === "success" ? "#22c55e"
                         : s.status === "partial" ? "#f59e0b" : "#ef4444";
+              const dirDetail = dir === "X" ? result.pushover_X : result.pushover_Y;
               return (
-                <div key={dir} className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 flex flex-col gap-2">
+                <div key={dir} className="pl-glass rounded-xl p-4 flex flex-col gap-2">
                   <div className="flex items-center justify-between">
                     <span className="text-sm font-semibold">Dirección {dir}</span>
                     <span className="text-[10px] font-bold px-2 py-0.5 rounded"
@@ -309,6 +313,7 @@ export default function NLFramePushoverPanel({ projectId, hideLauncher = false }
                     <div className="h-full rounded-full"
                          style={{ width: `${pct}%`, background: col }} />
                   </div>
+                  {dirDetail?.health && <AnalysisHealthBanner health={dirDetail.health} projectId={projectId} />}
                 </div>
               );
             })}
@@ -558,9 +563,10 @@ function PushoverChart({
   showDamageOverlay?: boolean;
 }) {
   const divRef = useRef<HTMLDivElement>(null);
+  const plotlyReady = usePlotly();
 
   useEffect(() => {
-    if (!divRef.current || !data.steps || data.steps.length === 0) return;
+    if (!plotlyReady || !divRef.current || !data.steps || data.steps.length === 0) return;
     const Plotly = (window as unknown as { Plotly?: {
       newPlot: (...a: unknown[]) => void;
       react:   (...a: unknown[]) => void;
@@ -568,8 +574,38 @@ function PushoverChart({
     } }).Plotly;
     if (!Plotly) return;
 
-    const drifts = data.steps.map((s) => s.drift_pct);
-    const shearsKN = data.steps.map((s) => s.base_shear_kN);
+    // Mostramos siempre |Vb| — convención estándar en pushover (SAP, ETABS,
+    // OpenSees-Navigator). El engine guarda el valor signado para diagnóstico,
+    // pero signos negativos al final de la curva son artefactos de MinMax
+    // post-colapso cuando las reacciones residuales oscilan y no representan
+    // la respuesta física real del edificio (verificado 2026-11-04).
+    const vbFullKN = data.steps.map((s) => Math.abs(s.base_shear_kN));
+
+    // Cortar la curva en el punto de colapso: Vb ≤ 25 % del pico durante 2
+    // pasos consecutivos = 75 % de pérdida de resistencia. Mismo criterio
+    // que el motor (Ola 4) — pero aplicado también sobre análisis previos
+    // que se corrieron antes de la detección automática del motor.
+    const COLLAPSE_FRAC  = 0.25;
+    const COLLAPSE_STEPS = 2;
+    const PEAK_MIN_KN    = 50;
+    let cutIdx = data.steps.length;
+    {
+      let vbPeak = 0;
+      let streak = 0;
+      for (let i = 0; i < vbFullKN.length; i++) {
+        if (vbFullKN[i] > vbPeak) vbPeak = vbFullKN[i];
+        if (vbPeak > PEAK_MIN_KN) {
+          if (vbFullKN[i] <= COLLAPSE_FRAC * vbPeak) {
+            streak += 1;
+            if (streak >= COLLAPSE_STEPS) { cutIdx = i + 1; break; }
+          } else {
+            streak = 0;
+          }
+        }
+      }
+    }
+    const drifts   = data.steps.slice(0, cutIdx).map((s) => s.drift_pct);
+    const shearsKN = vbFullKN.slice(0, cutIdx);
     const useRatio = vbUnit === "ratio" && wKN && wKN > 0;
     const y        = useRatio ? shearsKN.map((v) => v / (wKN as number)) : shearsKN;
     const yLabel   = useRatio ? "Vb / W" : "Cortante basal (kN)";
@@ -584,16 +620,39 @@ function PushoverChart({
 
     const hasEvents = showDamageOverlay && events &&
                       events.status === "success" && events.events.length > 0;
+    const trimmedByCollapse = cutIdx < data.steps.length;
 
-    // Curva base (una sola traza, limpia, del color de la dirección)
+    // Curva base — línea gruesa con smoothing ligero, área debajo semi-transparente
     traces.push({
       x: drifts, y,
       type: "scatter", mode: "lines",
-      line: { color, width: 2 },
+      line: { color, width: 2.5, shape: "spline", smoothing: 0.4 },
+      fill: "tozeroy",
+      fillcolor: `${color}14`,   // ~8% opacidad del color de la dirección
       hovertemplate: hover,
       name: `Pushover ${dir}`,
       showlegend: false,
     });
+
+    // Marcador de corte por colapso del edificio (si aplica).
+    if (trimmedByCollapse && drifts.length > 0) {
+      const xC = drifts[drifts.length - 1];
+      const yC = y[y.length - 1];
+      traces.push({
+        x: [xC], y: [yC],
+        type: "scatter", mode: "markers+text",
+        marker: { size: 14, color: "#991b1b", symbol: "x-thin",
+                   line: { color: "#991b1b", width: 3 } },
+        text: ["Colapso"], textposition: "top center",
+        textfont: { size: 10, color: "#991b1b", weight: 600 },
+        hovertemplate:
+          `<b>Colapso del edificio</b>` +
+          `<br>Vb cayó al 25 % del pico (75 % de pérdida)` +
+          `<br>Deriva: ${xC.toFixed(3)}%<extra></extra>`,
+        name: "Colapso",
+        showlegend: false,
+      });
+    }
 
     // Marcadores de estados de daño globales — primer paso en que ANY
     // elemento alcanza cada tipo de evento. Un marcador por estado.
@@ -678,17 +737,18 @@ function PushoverChart({
 
     // Caída de Vb post-pico: cuando Vb/Vb_pico < 0.80 (criterio GLOBAL de
     // colapso ATC-40 / FEMA 356). Dos marcadores: pico y punto de caída.
-    if (showDamageOverlay && data.steps.length > 0) {
-      const vbVals = data.steps.map(s => Math.abs(s.base_shear_kN));
+    // Usamos los arrays ya cortados en el punto de colapso para que todos los
+    // índices apunten a valores válidos.
+    if (showDamageOverlay && shearsKN.length > 0) {
       let peakIdx = 0;
-      for (let i = 1; i < vbVals.length; i++) {
-        if (vbVals[i] > vbVals[peakIdx]) peakIdx = i;
+      for (let i = 1; i < shearsKN.length; i++) {
+        if (shearsKN[i] > shearsKN[peakIdx]) peakIdx = i;
       }
       let dropIdx = -1;
-      const vbPeak = vbVals[peakIdx];
+      const vbPeak = shearsKN[peakIdx];
       if (vbPeak > 0) {
-        for (let i = peakIdx + 1; i < vbVals.length; i++) {
-          if (vbVals[i] / vbPeak < VB_DROP_THRESHOLD) { dropIdx = i; break; }
+        for (let i = peakIdx + 1; i < shearsKN.length; i++) {
+          if (shearsKN[i] / vbPeak < VB_DROP_THRESHOLD) { dropIdx = i; break; }
         }
       }
       if (dropIdx > 0) {
@@ -700,7 +760,7 @@ function PushoverChart({
           hovertemplate:
             `<b>Caída de Vb &gt; 20 % post-pico</b>` +
             `<br>Criterio GLOBAL de colapso (ATC-40)` +
-            `<br>Vb/Vb_pico = ${(vbVals[dropIdx] / vbPeak).toFixed(2)}` +
+            `<br>Vb/Vb_pico = ${(shearsKN[dropIdx] / vbPeak).toFixed(2)}` +
             `<br>Paso ${dropIdx} · Deriva: ${drifts[dropIdx].toFixed(3)}%<extra></extra>`,
           name: "Caída Vb (colapso global)",
           legendgroup: "vb-drop",
@@ -744,30 +804,24 @@ function PushoverChart({
       });
     }
 
+    const baseLayout = plotlyLayoutPremium({
+      xTitle: "Deriva de techo (%)",
+      yTitle: yLabel,
+      showLegend: !!hasEvents,
+      legendTop: false,
+    });
     Plotly.react(
       divRef.current,
       traces,
-      {
-        paper_bgcolor: "transparent", plot_bgcolor: "transparent",
-        font: { size: 11 },
-        margin: { t: 10, r: 10, b: 50, l: 60 },
-        xaxis: { title: { text: "Deriva de techo (%)" }, gridcolor: "var(--border)" },
-        yaxis: { title: { text: yLabel }, gridcolor: "var(--border)" },
-        shapes, annotations,
-        showlegend: hasEvents,
-        legend: {
-          orientation: "h", x: 0, y: -0.22, xanchor: "left", yanchor: "top",
-          font: { size: 10 }, bgcolor: "rgba(0,0,0,0)",
-        },
-      },
-      { responsive: true, displayModeBar: false },
+      { ...baseLayout, shapes, annotations },
+      { ...plotlyConfigPremium, displayModeBar: false },
     );
 
     return () => { if (divRef.current) Plotly.purge(divRef.current); };
-  }, [data, color, vbUnit, wKN, currentStep, playing, firstCollapseStep, events, showDamageOverlay]);
+  }, [plotlyReady, data, color, vbUnit, wKN, currentStep, playing, firstCollapseStep, events, showDamageOverlay]);
 
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4">
+    <div className="pl-glass rounded-xl p-4">
       <p className="text-xs font-semibold text-[var(--text-muted)] mb-3 uppercase tracking-wider">
         Curva Pushover — Dir {dir}
       </p>

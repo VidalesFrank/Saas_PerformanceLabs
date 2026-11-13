@@ -135,6 +135,60 @@ def _pick_record_elements(store_data: Dict[str, Any], prefer: str = "frame") -> 
     raise ValueError("[ERROR] No se encontraron elementos (beams/walls/slabs) en store_data para registrar.")
 
 
+def _populate_pathological_elements(
+    health: dict, elements: List[int], eletype: str, top_n: int = 5
+) -> None:
+    """
+    Al abortar, sondea los elementos registrados para encontrar el peor —
+    útil para decirle al usuario cuál elemento estaba causando la inestabilidad.
+
+    Para frames usa `plasticDeformation` (6 DOFs: 3 rot/extremo). Para muros
+    MVLEM_3D usa `globalForce` como proxy de nivel de demanda.
+    """
+    ranked: list[dict] = []
+    for tag in elements:
+        try:
+            if eletype == 'frame':
+                pd = ops.eleResponse(int(tag), 'plasticDeformation')
+                if pd is None:
+                    continue
+                arr = [abs(float(x)) for x in pd]
+                theta_max = max(arr) if arr else 0.0
+                # Captura también la sección actual (si se puede) para axial/curv
+                try:
+                    sd_i = ops.sectionDeformation(int(tag), 1)
+                    sd_j = ops.sectionDeformation(int(tag), 6)
+                    strain_axial = max(abs(float(sd_i[0])), abs(float(sd_j[0])))
+                except Exception:
+                    strain_axial = 0.0
+                ranked.append({
+                    "ele_tag":      int(tag),
+                    "theta_p_max":  round(theta_max, 5),
+                    "strain_axial": round(strain_axial, 5),
+                })
+            else:  # wall / shell
+                gf = ops.eleResponse(int(tag), 'globalForce')
+                if gf is None:
+                    continue
+                fmag = max(abs(float(x)) for x in gf)
+                ranked.append({
+                    "ele_tag":      int(tag),
+                    "force_max_kN": round(fmag, 2),
+                })
+        except Exception:
+            continue
+
+    if not ranked:
+        return
+
+    # Ordenar por métrica principal (θ_p para frames, force para walls)
+    key = "theta_p_max" if eletype == 'frame' else "force_max_kN"
+    ranked.sort(key=lambda r: -r.get(key, 0.0))
+
+    health["pathological_element"] = dict(ranked[0])
+    health["pathological_ranking"] = ranked[:top_n]
+
+
 #%% RUTINA DINAMICO ADAPTATIVO DE DTAN
 def dinamicoBD4_adaptive(
     record_paths: List[str],
@@ -178,9 +232,15 @@ def dinamicoBD4_adaptive(
     - Mantiene el mismo *output signature* que tu dinamicoBD4 original (incluye Prot si frame).
     """
 
-    # defaults
+    # Tol escalado con el tamaño del modelo, con CAP superior para evitar
+    # falsa convergencia. La fórmula 0.1·√(n·6) de estrucmed-web funciona
+    # para modelos chicos (nn<60 → Tol<2e-3), pero para edificios de varios
+    # cientos de nodos devuelve valores irreales (Prueba 4 con 425 nodos →
+    # Tol≈5.0, lo cual acepta ΔU<5m por iter en NormDispIncr y produce falsa
+    # convergencia). Cap a 1e-3: equivalente a ΔU<1mm/iter, 10× más laxo que
+    # el 1e-4 original pero sin degenerar en edificios grandes.
     if Tol is None:
-        Tol = 1e-4
+        Tol = min(_compute_tol(1e-4), 1e-3)
 
     # Preparación de direcciones ortogonales
     dir2 = 2 if IDctrlDOF == 1 else 1
@@ -204,18 +264,25 @@ def dinamicoBD4_adaptive(
     beta = 2.0 * damp / (w1 + w2)
     alfa = 2.0 * damp * w1 * w2 / (w1 + w2)
 
+    # Kswitch=1 → Rayleigh con K_tangente (default, estable con fibras+no-linealidad).
+    # Kswitch=2 → Rayleigh con K_initial (más rápido pero puede desacoplar damping
+    #             de la rigidez real post-fluencia; causa fallas de HHT::commit en
+    #             edificios con alta plasticidad distribuida).
     if Kswitch == 1:
-        ops.rayleigh(alfa, 0.0, beta, 0.0)
+        ops.rayleigh(alfa, 0.0, beta, 0.0)       # α·M + β·K_tangent (ESTABLE)
     else:
-        ops.rayleigh(alfa, beta, 0.0, 0.0)
+        ops.rayleigh(alfa, 0.0, 0.0, beta)       # α·M + β·K_initial (más rápido pero riesgoso)
 
-    # Configuración base de análisis — ajustada para velocidad con fibras HystereticSM
+    # Configuración base de análisis — ajustada para velocidad con fibras.
     ops.wipeAnalysis()
     ops.constraints('Transformation')
     ops.numberer('RCM')
     ops.system('UmfPack')              # más rápido que BandGeneral para matrices dispersas
     ops.test('NormDispIncr', Tol, maxNumIter)
     ops.algorithm('KrylovNewton')      # converge en 2-4 its vs 8-15 its de Newton para fibras
+    # Newmark 0.5/0.25 (constant average acceleration) — incondicionalmente
+    # estable, sin damping numérico espurio. Para fibras + plasticidad es más
+    # robusto que HHT α=0.1 (que puede fallar al commit en no-linealidad fuerte).
     ops.integrator('Newmark', 0.5, 0.25)
     ops.analysis('Transient')
 
@@ -272,21 +339,155 @@ def dinamicoBD4_adaptive(
     infill_elong_hist: list[list[list[float]]] = []
 
     # Bucle por tiempo REAL
-    while ops.getTime() + 1e-12 < time_target:
-        # 1) intento con dt original
-        ok = ops.analyze(1, dt)
+    # Safeguard: límite global de intentos fallidos consecutivos para romper
+    # bucles infinitos cuando un elemento se vuelve numéricamente patológico.
+    stall_fail_count = 0
+    stall_fail_limit = 20   # tras 20 pasos sin avance abortamos
 
-        # 2) si falla: reducir dt directamente a dt/4 (convergencia más rápida)
+    # Slow-progress detector (Ola 5 — 2026-11-04):
+    # Si el solver avanza pero con dt_efectivo << dt_nominal durante MUCHOS
+    # pasos consecutivos, significa que el edificio está en colapso numérico
+    # (típicamente una viga o columna con MinMax activado que pelea cada paso).
+    # Sin este corte, análisis de 30 s pueden gastar 45-60 min. Con el corte,
+    # abortamos limpiamente a los ~15-30 s después de detectar el patrón.
+    SLOW_DT_RATIO     = 0.05   # dt_efectivo < 5 % del dt_nominal se considera "slow"
+    SLOW_STREAK_LIMIT = 50     # 50 pasos consecutivos slow → entrar a bulldozer
+    slow_streak = 0
+
+    # Bulldozer mode (Ola 6 — 2026-11-04):
+    # Cuando un elemento está crónicamente mal condicionado (ej. una viga con
+    # pandeo severo que pelea con el solver eternamente), en vez de abortar el
+    # análisis global pasamos a "modo tolerante": Tol muy laxa + algorithm con
+    # line search bisection. Esto permite al solver "atravesar" el nudo
+    # numérico del elemento problemático mientras los otros 795+ elementos
+    # siguen respondiendo correctamente por redistribución. El análisis global
+    # continúa hasta terminar, o hasta que ni siquiera el modo bulldozer logre
+    # avanzar (señal de colapso realmente generalizado, no local).
+    bulldozer_mode               = False
+    bulldozer_steps_total        = 0     # métrica para reportar al usuario
+    bulldozer_consecutive_fail   = 0
+    bulldozer_t_entered          = None  # tiempo simulado cuando se activó
+    BULLDOZER_FAIL_LIMIT         = 50    # 50 pasos sin convergir → abortar
+    BULLDOZER_TOL                = 1.0   # tolerancia LAXA (acepta cualquier
+                                         # error local — el elemento roto
+                                         # queda con fuerzas basura, pero el
+                                         # resto del edificio avanza bien)
+    BULLDOZER_MAX_ITER           = 50    # pocas iteraciones, rápido
+    BULLDOZER_EXIT_STREAK        = 20    # tras N pasos normales exitosos,
+                                         # salimos del bulldozer
+    # dts a probar en bulldozer, en orden. Empezamos grande (dt nominal) para
+    # que el análisis avance rápido cuando el elemento roto permite paso completo;
+    # bajamos sólo si es necesario. Evita gastar 11 h en dt_min cuando dt/2 pasa.
+    _bulldozer_dt_ladder         = [dt, dt * 0.5, dt * 0.25, dt * 0.1, dt_min]
+
+    # Health tracking — permite al usuario entender qué pasó con la simulación.
+    # Se devuelve al final junto con los resultados numéricos.
+    health: dict = {
+        "status":                "success",   # success | partial | stall
+        "aborted":               False,
+        "abort_reason":          None,        # "step_fail" | "stall" | None
+        "abort_time_s":          None,        # t cuando se abortó
+        "abort_time_target_s":   time_target,
+        "n_failed_steps":        0,           # pasos que necesitaron bisección
+        "n_bisections_total":    0,
+        "n_fallback_algorithm":  0,           # veces que entramos a step 3
+        "max_dt_reduction":      0.0,         # min(dt_red/dt) alcanzado
+        "pathological_element":  None,        # dict con info del elemento peor
+        "pathological_ranking":  [],          # top 5 elementos por θ_p
+        "bulldozer_activated":   False,
+        "bulldozer_steps_total": 0,
+        "bulldozer_t_entered":   None,
+    }
+
+    # Contador para salir del modo bulldozer tras varios pasos normales OK.
+    bulldozer_recent_normal_ok = 0
+
+    while ops.getTime() + 1e-12 < time_target:
+        t_before = ops.getTime()
+
+        # ── Modo bulldozer: Tol muy laxa + algoritmo rápido ────────────────
+        # Probamos dts en escalera (dt → dt/2 → dt/4 → dt/10 → dt_min) para
+        # que avance rápido cuando el estado del elemento roto lo permite,
+        # y sólo baje a dt_min si hace falta. Esto evita gastar horas en
+        # dt_min cuando dt/2 pasaría sin problema.
+        if bulldozer_mode:
+            ops.test('NormDispIncr', BULLDOZER_TOL, BULLDOZER_MAX_ITER)
+            # Algoritmo ModifiedNewton: barato (reusa Jacobian), tolerante a
+            # error local porque el Jacobian viejo "promedia" el elemento roto.
+            try:
+                ops.algorithm('ModifiedNewton')
+            except Exception:
+                ops.algorithm('Newton')
+
+            ok     = -1
+            dt_used = _bulldozer_dt_ladder[-1]  # fallback
+            for dt_try in _bulldozer_dt_ladder:
+                ok = ops.analyze(1, dt_try)
+                if ok == 0:
+                    dt_used = dt_try
+                    break
+
+            # Restaurar configuración base para el próximo intento normal
+            ops.test('NormDispIncr', Tol, maxNumIter)
+            ops.algorithm('KrylovNewton')
+
+            if ok == 0:
+                bulldozer_steps_total      += 1
+                bulldozer_consecutive_fail  = 0
+                health["bulldozer_steps_total"] = bulldozer_steps_total
+                # Registrar paso y saltar a step 5 (bookkeeping normal)
+                dt_red = dt_used
+                step_had_failure = True  # cuenta como paso con conflicto
+            else:
+                bulldozer_consecutive_fail += 1
+                if bulldozer_consecutive_fail >= BULLDOZER_FAIL_LIMIT:
+                    # Ni bulldozer logra — colapso real generalizado
+                    health["status"]       = "partial"
+                    health["aborted"]      = True
+                    health["abort_reason"] = "bulldozer_failed"
+                    health["abort_time_s"] = float(ops.getTime())
+                    _populate_pathological_elements(health, elements, eletype)
+                    print(f'[dynamic] Modo bulldozer agotado tras '
+                          f'{BULLDOZER_FAIL_LIMIT} intentos en t={ops.getTime():.4f}s. '
+                          f'Colapso generalizado.')
+                    break
+                # Seguir intentando bulldozer
+                continue
+        else:
+            # 1) intento con dt original (modo normal)
+            ok = ops.analyze(1, dt)
+            dt_red = dt
+            step_had_failure = False
+
+        # 2) si falla: bisección con contador DURO para que no quede
+        #    atascada cuando dt_min también falla. Antes el max(.., dt_min)
+        #    hacía que `dt_red >= dt_min` nunca se rompiera y cuelga la task.
         if ok != 0:
-            dt_red = max(dt * reduce_factor * reduce_factor, dt_min)  # dt/4 de una vez
-            while ok != 0 and dt_red >= dt_min:
+            step_had_failure = True
+            dt_red = max(dt * reduce_factor * reduce_factor, dt_min)  # dt/4
+            for _ in range(10):  # máx 10 bisecciones (hasta ~dt/1024)
+                health["n_bisections_total"] += 1
                 ok = ops.analyze(1, dt_red)
                 if ok == 0:
                     break
-                dt_red = max(dt_red * reduce_factor, dt_min)
+                dt_red *= reduce_factor
+                if dt_red < dt_min:
+                    break
+
+            # Último intento explícito a dt_min por si la rampa no lo tocó
+            if ok != 0 and dt_red < dt_min:
+                dt_red = dt_min
+                health["n_bisections_total"] += 1
+                ok = ops.analyze(1, dt_min)
+
+            # Track mayor reducción alcanzada
+            dt_frac = dt_red / max(dt, 1e-12)
+            if dt_frac > health["max_dt_reduction"]:
+                health["max_dt_reduction"] = dt_frac if ok == 0 else dt_frac
 
         # 3) algoritmos alternativos con presupuesto de iteraciones acotado
         if ok != 0:
+            health["n_fallback_algorithm"] += 1
             for j, (alg_name, use_initial) in algoritmos.items():
                 if use_initial:
                     ops.algorithm(alg_name, '-initial')
@@ -297,15 +498,81 @@ def dinamicoBD4_adaptive(
                 if ok == 0:
                     break
 
-            # 4) si no hay convergencia por ningún camino: abortar
+            # 4) si no hay convergencia por ningún camino: abortar con mensaje
             if ok != 0:
-                print('Análisis dinámico fallido')
-                print('Desplazamiento alcanzado:', ops.nodeDisp(IDctrlNode, IDctrlDOF), 'm')
+                health["status"] = "partial"
+                health["aborted"] = True
+                health["abort_reason"] = "step_fail"
+                health["abort_time_s"] = float(ops.getTime())
+                _populate_pathological_elements(health, elements, eletype)
+                print(f'[dynamic] Análisis dinámico fallido en t={ops.getTime():.4f}s '
+                      f'(dt probado hasta {dt_min:.2e}s). Elementos inestables.')
+                print(f'  Desplazamiento alcanzado: {ops.nodeDisp(IDctrlNode, IDctrlDOF):.4f} m')
+                if health["pathological_element"]:
+                    pe = health["pathological_element"]
+                    print(f'  Peor elemento: tag={pe["ele_tag"]} θ_p={pe["theta_p_max"]:.4f} rad')
                 break
 
             # Restaurar configuración base eficiente
             ops.test('NormDispIncr', Tol, maxNumIter)
             ops.algorithm('KrylovNewton')
+
+        if step_had_failure and ok == 0:
+            health["n_failed_steps"] += 1
+
+        # 5a) guard contra "convergencia estéril": si el paso devolvió ok=0
+        #     pero getTime() no avanzó (ventana numérica), lo tratamos como
+        #     stall. Más de N stalls seguidos → abortar.
+        if ops.getTime() <= t_before + 1e-12:
+            stall_fail_count += 1
+            if stall_fail_count >= stall_fail_limit:
+                health["status"] = "partial"
+                health["aborted"] = True
+                health["abort_reason"] = "stall"
+                health["abort_time_s"] = float(ops.getTime())
+                _populate_pathological_elements(health, elements, eletype)
+                print(f'[dynamic] Análisis detenido: {stall_fail_count} pasos sin '
+                      f'avance en t={ops.getTime():.4f}s (elemento patológico).')
+                if health["pathological_element"]:
+                    pe = health["pathological_element"]
+                    print(f'  Peor elemento: tag={pe["ele_tag"]} θ_p={pe["theta_p_max"]:.4f} rad')
+                break
+            # El paso no avanzó: no registramos nada, volvemos al tope del while.
+            continue
+        else:
+            stall_fail_count = 0
+
+        # 5b) slow-progress: el solver avanzó pero con dt_efectivo << dt_nominal.
+        #     Si pasa durante muchos pasos consecutivos, activamos el modo
+        #     bulldozer (Tol laxa + LineSearch+Bisection) en vez de abortar —
+        #     permite "atravesar" elementos patológicos manteniendo el resto
+        #     del edificio en respuesta válida (redistribución global).
+        dt_actual = ops.getTime() - t_before
+        if not bulldozer_mode and dt_actual < SLOW_DT_RATIO * dt:
+            slow_streak += 1
+            if slow_streak >= SLOW_STREAK_LIMIT:
+                bulldozer_mode              = True
+                bulldozer_consecutive_fail  = 0
+                bulldozer_t_entered         = float(ops.getTime())
+                bulldozer_recent_normal_ok  = 0
+                health["bulldozer_activated"] = True
+                health["bulldozer_t_entered"] = bulldozer_t_entered
+                print(f'[dynamic] Elemento patológico — activando modo bulldozer en '
+                      f't={ops.getTime():.4f}s (Tol={BULLDOZER_TOL}, LineSearch+Bisection). '
+                      f'Edificio continúa por redistribución.')
+        elif not bulldozer_mode:
+            slow_streak = 0
+
+        # Si ya estamos en bulldozer, chequear si el edificio se recupera
+        # (varios pasos normales OK consecutivos) → volver a modo normal.
+        if bulldozer_mode and not step_had_failure:
+            bulldozer_recent_normal_ok += 1
+            if bulldozer_recent_normal_ok >= BULLDOZER_EXIT_STREAK:
+                print(f'[dynamic] Saliendo de modo bulldozer en t={ops.getTime():.4f}s '
+                      f'({bulldozer_steps_total} pasos bulldozer en total). Edificio recuperó estabilidad.')
+                bulldozer_mode = False
+                slow_streak    = 0
+                bulldozer_recent_normal_ok = 0
 
         # ----- Registro de resultados -----
         step += 1
@@ -483,18 +750,36 @@ def dinamicoBD4_adaptive(
         else np.zeros((0, 0, 2), dtype=np.float32)
     )
 
+    # Si no se abortó, siembrar los top-N elementos por θ_p histórico (sacados
+    # de Prot) para dar contexto incluso en análisis success. Útil cuando hubo
+    # warnings pero el motor terminó.
+    if not health["aborted"] and Prot is not None and Prot.size > 0:
+        try:
+            theta_max_per_el = np.max(np.abs(Prot), axis=(1, 2))
+            order = np.argsort(-theta_max_per_el)[:5]
+            health["pathological_ranking"] = [
+                {"ele_tag": int(elements[i]),
+                 "theta_p_max": round(float(theta_max_per_el[i]), 5)}
+                for i in order
+            ]
+        except Exception:
+            pass
+
     # Salida estable: siempre devolvemos Prot (None si no aplica) y Eds.
     # Si se solicitó captura de Vb, se añaden Vb_x y Vb_y al final para que
     # el llamador los pueda desempaquetar (nuevo); el llamador legacy ignora
     # la tupla extendida con *_ y recibe la tupla antigua intacta.
+    # **health** se añade SIEMPRE como último elemento (dict) para que los
+    # callers nuevos puedan consumir diagnóstico y los legacy lo ignoren.
     base_result = (tiempo, techo1, techo2, techoT,
                    node_disp, node_vel, node_acel, node_disp2, node_acel2,
                    driftX, driftY, Prot, Eds)
     if capture_vb and capture_sect:
-        return base_result + (Vb_x, Vb_y, sect_def_arr, sect_t_arr, infill_elong_arr)
+        return base_result + (Vb_x, Vb_y, sect_def_arr, sect_t_arr,
+                              infill_elong_arr, health)
     if capture_vb:
-        return base_result + (Vb_x, Vb_y)
-    return base_result
+        return base_result + (Vb_x, Vb_y, health)
+    return base_result + (health,)
     
 #%% FUNCION QUE CORRE EL DINAMICO
 def run_pair_dynamic(
