@@ -39,6 +39,8 @@ import type {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 const BASE    = `${API_URL}/api/v1/projects`;
+const FEMA_BASE  = `${API_URL}/api/v1/fema-library`;
+const LOCAL_BASE = `${API_URL}/api/v1/local-catalog`;
 
 function authHeaders(): Headers {
   const h = new Headers({ "Content-Type": "application/json" });
@@ -84,6 +86,13 @@ export const structuralProjectsApi = {
 
   get: (id: string) =>
     req<StructuralProject>(`/${id}`),
+
+  /** Renombra o ajusta la descripción del proyecto. Solo envía campos definidos. */
+  update: (id: string, payload: { name?: string; description?: string | null }) =>
+    req<StructuralProject>(`/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
 
   delete: (id: string) =>
     req<void>(`/${id}`, { method: "DELETE" }),
@@ -330,11 +339,199 @@ export const structuralAnalysisApi = {
       `/analysis/${projectId}/nlth/result`,
     ),
 
+  /** Historial de análisis NLTH del proyecto. */
+  listNLTHJobs: (projectId: string) =>
+    req<{ jobs: import("./structural-types").NLTHJobMeta[] }>(
+      `/analysis/${projectId}/nlth/jobs`,
+    ).then((r) => r.jobs),
+
+  /** Lee el resultado de un job histórico específico. */
+  getNLTHResultByJob: (projectId: string, jobId: string) =>
+    req<import("./structural-types").NLTHResult>(
+      `/analysis/${projectId}/nlth/result/${jobId}`,
+    ),
+
+  /** Activa un job histórico como "el último" (afecta verificador, export, etc.) */
+  activateNLTHJob: (projectId: string, jobId: string) =>
+    req<{ ok: boolean; activated_job_id: string }>(
+      `/analysis/${projectId}/nlth/activate/${jobId}`,
+      { method: "POST" },
+    ),
+
+  /** Borra un job histórico del disco. */
+  deleteNLTHJob: (projectId: string, jobId: string) =>
+    req<{ ok: boolean; deleted_job_id: string }>(
+      `/analysis/${projectId}/nlth/${jobId}`,
+      { method: "DELETE" },
+    ),
+
+  /** Importa un bundle NLTH JSON externo como nuevo job del proyecto. */
+  importNLTHBundle: (
+    projectId: string,
+    bundle: { export_meta?: unknown; result?: unknown } | import("./structural-types").NLTHResult,
+  ) =>
+    req<{ ok: boolean; job_id: string; meta: Record<string, unknown>; message: string }>(
+      `/analysis/${projectId}/nlth/import`,
+      { method: "POST", body: JSON.stringify(bundle) },
+    ),
+
+  /** Lee el último `modal_results.json` persistido (para T1 en escalado FEMA). */
+  getModalResult: (projectId: string) =>
+    req<ModalResult & { T1?: number; T1_x?: number; T1_y?: number }>(
+      `/analysis/${projectId}/modal/result`,
+    ),
+
+  /** Lee el último `spectral_results.json` persistido (espectro NSR-10 + FHE). */
+  getSpectralResult: (projectId: string) =>
+    req<SpectralResult & { spectrum?: { T_values: number[]; Sa: number[] } }>(
+      `/analysis/${projectId}/spectral/result`,
+    ),
+
   /** Lista los registros X/Y ya subidos — para re-poblar el UI al montar. */
   listNLTHRecords: (projectId: string) =>
     req<{ X: import("./structural-types").NLTHUploadResult | null;
           Y: import("./structural-types").NLTHUploadResult | null; }>(
       `/analysis/${projectId}/nlth/records`,
+    ),
+
+  /** Selecciona un par de la biblioteca FEMA P-695 → copia los dos archivos
+   *  al workspace y calcula el escalado. Compatible con `uploadX/Y`. */
+  selectFEMAPair: (
+    projectId: string,
+    body: {
+      pair_id:      number;
+      scale_mode:   "manual" | "sa_target" | "nsr10";
+      scale_manual?: number;
+      T1_s?:        number;
+      sa_target_g?: number;
+      xi?:          number;
+    },
+  ) =>
+    req<import("./structural-types").FEMASelectResult>(
+      `/analysis/${projectId}/nlth/select-library-pair`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  /** Defaults globales + rangos observados por elemento (sliders). */
+  getNLTHThresholdsMeta: (projectId: string) =>
+    req<import("./structural-types").NLTHThresholdsMeta>(
+      `/analysis/${projectId}/nlth/thresholds-meta`,
+    ),
+
+  /** Re-ejecuta el detector con umbrales custom sobre el NPZ existente. */
+  recomputeNLTHEvents: (
+    projectId: string,
+    overrides: Partial<Record<
+      "eps_sy" | "eps_cu_cover" | "eps_cu_core" | "eps_su" | "eps_bk",
+      number
+    >>,
+  ) =>
+    req<{ status: string; n_events: number;
+          events: import("./structural-types").LocalEventsPayload }>(
+      `/analysis/${projectId}/nlth/recompute-events`,
+      { method: "POST", body: JSON.stringify(overrides) },
+    ),
+
+  /** Clasifica columnas por modo de falla (ASCE 41 × hinges NLTHA). */
+  recomputeNLTHFailureModes: (projectId: string) =>
+    req<{ status: string; n_total: number;
+          counts: Record<import("./structural-types").FailureCategory, number>;
+          failure_modes: import("./structural-types").FailureModesClassification }>(
+      `/analysis/${projectId}/nlth/recompute-failure-modes`,
+      { method: "POST", body: JSON.stringify({}) },
+    ),
+
+  /** Ola 7 — Diagnóstico completo de un elemento con recomendaciones de refuerzo.
+   *  Si `theta_demand_override` no se pasa, usa el valor de nlth_results.json
+   *  (damage.hinges o pathological_element). */
+  getElementDiagnosis: (
+    projectId: string,
+    fid: string,
+    overrides?: { theta_demand?: number; V_demand_kN?: number; method?: string },
+  ) => {
+    const qs = new URLSearchParams();
+    if (overrides?.theta_demand != null)
+      qs.set("theta_demand_override", String(overrides.theta_demand));
+    if (overrides?.V_demand_kN != null)
+      qs.set("V_demand_kN_override", String(overrides.V_demand_kN));
+    if (overrides?.method) qs.set("method", overrides.method);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return req<import("./structural-types").ElementDiagnosis>(
+      `/analysis/${projectId}/nlth/element-diagnosis/${encodeURIComponent(fid)}${suffix}`,
+    );
+  },
+
+  /** Ola 7 — Persiste un override de refuerzo (invalidando el nonlinear_model.json).
+   *  Al relanzar NLTH/Pushover el motor leerá los cambios automáticamente. */
+  applyReinforcementFix: (
+    projectId: string,
+    body: import("./structural-types").ApplyReinforcementFixRequest,
+  ) =>
+    req<import("./structural-types").ApplyReinforcementFixResponse>(
+      `/analysis/${projectId}/nlth/apply-reinforcement-fix`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  /** Ola 8 — Verifica (y opcionalmente ajusta) el refuerzo para cumplir
+   *  θ_target por nivel de desempeño ASCE 41-17. */
+  verifyPerformanceCapacity: (
+    projectId: string,
+    body: import("./structural-types").PerformanceVerifyRequest,
+  ) =>
+    req<import("./structural-types").PerformanceVerificationResult>(
+      `/analysis/${projectId}/verify-performance-capacity`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  /** Lee el último reporte de verificación performance-based. */
+  getPerformanceVerification: (projectId: string) =>
+    req<import("./structural-types").PerformanceVerificationResult>(
+      `/analysis/${projectId}/verify-performance-capacity`,
+    ),
+
+  // ── IDA (Incremental Dynamic Analysis) ─────────────────────────────────
+  launchIDA: (
+    projectId: string,
+    body: import("./structural-types").IDALaunchRequest,
+  ) =>
+    req<import("./structural-types").IDALaunchResponse>(
+      `/analysis/${projectId}/ida/launch`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  getIDAResult: (projectId: string) =>
+    req<import("./structural-types").IDAResult>(
+      `/analysis/${projectId}/ida/result`,
+    ),
+
+  getIDAProgress: (projectId: string, jobId: string) =>
+    req<import("./structural-types").IDAProgress>(
+      `/analysis/${projectId}/ida/progress/${encodeURIComponent(jobId)}`,
+    ),
+
+  listIDAJobs: (projectId: string) =>
+    req<import("./structural-types").IDAJobSummary[]>(
+      `/analysis/${projectId}/ida/jobs`,
+    ),
+
+  // ── NLRHA (verificación NSR-10 / ASCE 7-22 Cap 16) ─────────────────────
+  launchNLRHA: (
+    projectId: string,
+    body: import("./structural-types").NLRHALaunchRequest,
+  ) =>
+    req<import("./structural-types").NLRHALaunchResponse>(
+      `/analysis/${projectId}/nlrha/launch`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  getNLRHAResult: (projectId: string) =>
+    req<import("./structural-types").NLRHAResult>(
+      `/analysis/${projectId}/nlrha/result`,
+    ),
+
+  listNLRHAJobs: (projectId: string) =>
+    req<import("./structural-types").IDAJobSummary[]>(
+      `/analysis/${projectId}/nlrha/jobs`,
     ),
 };
 
@@ -879,3 +1076,83 @@ export interface ElementDemandResult {
   n_from_nlth:       number;
   n_from_pushover:   number;
 }
+
+// ── FEMA P-695 Far-Field library (biblioteca global de registros) ───────────
+
+async function femaReq<T>(path: string, opts: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${FEMA_BASE}${path}`, { ...opts, headers: authHeaders() });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = typeof body.detail === "string"
+      ? body.detail : JSON.stringify(body.detail);
+    throw new ApiError(res.status, detail);
+  }
+  return res.json() as Promise<T>;
+}
+
+export const femaLibraryApi = {
+  /** Catálogo completo con espectros precomputados a 5 % ξ. */
+  listPairs: () =>
+    femaReq<import("./structural-types").FEMALibraryCatalog>("/pairs"),
+
+  /** Timeseries decimado para preview rápido (hasta 600 muestras). */
+  getRecordPreview: (gmName: string, maxPoints = 600) =>
+    femaReq<import("./structural-types").FEMARecordPreview>(
+      `/record/${gmName}/preview?max_points=${maxPoints}`,
+    ),
+
+  /** Calcula el factor de escala FEMA P-695 (geomean) para alcanzar Sa objetivo. */
+  computeScale: (body: {
+    pair_id:     number;
+    T1_s:        number;
+    sa_target_g: number;
+    xi?:         number;
+  }) =>
+    femaReq<import("./structural-types").FEMAScaleResult>("/scale-factor", {
+      method: "POST", body: JSON.stringify(body),
+    }),
+};
+
+// ── Catálogos sísmicos locales (campañas colombianas, p.ej. 10-ago-2026) ────
+
+async function localReq<T>(path: string, opts: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${LOCAL_BASE}${path}`, { ...opts, headers: authHeaders() });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = typeof body.detail === "string"
+      ? body.detail : JSON.stringify(body.detail);
+    throw new ApiError(res.status, detail);
+  }
+  return res.json() as Promise<T>;
+}
+
+export const localCatalogApi = {
+  /** Lista de campañas con registros disponibles en DB. */
+  listCampaigns: () =>
+    localReq<{ campaigns: import("./structural-types").LocalCampaign[] }>("/campaigns"),
+
+  /** Catálogo completo con espectros precomputados (shape FEMAPair extendido). */
+  getCatalog: (campaign: string) =>
+    localReq<import("./structural-types").LocalCatalog>(
+      `/catalog?campaign=${encodeURIComponent(campaign)}`,
+    ),
+
+  /** Timeseries decimado para preview rápido. */
+  getRecordPreview: (recordName: string, maxPoints = 600, campaign = "colombia_2026_08_10") =>
+    localReq<import("./structural-types").LocalRecordPreview>(
+      `/record/${encodeURIComponent(recordName)}/preview?max_points=${maxPoints}&campaign=${encodeURIComponent(campaign)}`,
+    ),
+
+  /** Factor de escala FEMA P-695 §6.2 para un par del catálogo local. */
+  computeScale: (body: {
+    pair_id:     number;
+    T1_s:        number;
+    sa_target_g: number;
+    campaign:    string;
+    xi?:         number;
+  }) =>
+    localReq<import("./structural-types").FEMAScaleResult & { campaign: string }>(
+      "/scale-factor",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+};

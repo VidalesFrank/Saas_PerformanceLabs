@@ -161,6 +161,14 @@ app.include_router(wall_design_router.router)
 # ── Ground Motion Analysis — Análisis de Acelerogramas ───────────────────────
 app.include_router(ground_motion_router.router)
 
+# ── Biblioteca FEMA P-695 Far-Field (lectura global, 22 pares) ───────────────
+from app.routers import fema_library as fema_library_router
+app.include_router(fema_library_router.router)
+
+# ── Catálogos locales (campañas colombianas; 10-ago-2026 San José del Palmar) ─
+from app.routers import local_catalog as local_catalog_router
+app.include_router(local_catalog_router.router)
+
 # ── Fase 0 — Toma de datos en campo y triaje sísmico post-sismo ──────────────
 from app.routers import field_assessment as field_assessment_router
 app.include_router(field_assessment_router.router)

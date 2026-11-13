@@ -1294,6 +1294,29 @@ export interface LocalEventsPayload {
   message?: string;
   events:  LocalEvent[];
   summary: Record<LocalEventType, number>;
+  /** Overrides globales enviados por el usuario en el último recálculo. */
+  thresholds_user_override?: Partial<Record<ThresholdKey, number>>;
+  /** Defaults del motor (ε_sy, ε_cu_cover, ε_cu_core, ε_su, ε_bk). */
+  thresholds_defaults?: Record<ThresholdKey, number>;
+  /** Rango min/max observado por elemento para los umbrales que varían. */
+  thresholds_observed?: Partial<Record<ThresholdKey, ThresholdStats>>;
+}
+
+export type ThresholdKey =
+  | "eps_sy" | "eps_cu_cover" | "eps_cu_core" | "eps_su" | "eps_bk";
+
+export interface ThresholdStats {
+  min:  number;
+  max:  number;
+  mean: number;
+  n:    number;
+}
+
+export interface NLTHThresholdsMeta {
+  defaults:            Record<ThresholdKey, number>;
+  observed:            Partial<Record<ThresholdKey, ThresholdStats>>;
+  user_override:       Partial<Record<ThresholdKey, number>>;
+  n_elements_detected: number;
 }
 
 export interface NLFramePushoverDirResult {
@@ -1309,6 +1332,8 @@ export interface NLFramePushoverDirResult {
     max_base_shear_kN:   number;
     last_displacement_m: number;
   };
+  /** Diagnóstico de salud del solver (Ola 2 2026-11-04). */
+  health?: AnalysisHealth;
   history?: {
     captured_steps: number;
     stride:         number;
@@ -1403,6 +1428,66 @@ export interface InfillDamageHistory {
   panels:      InfillDamagePanel[];
   /** matriz [n_frames, n_panels] con damage index 0..1 por paso submuestreado */
   history:     number[][];
+}
+
+// ── Clasificación de modo de falla por columna (ASCE 41 × hinges NLTHA) ────
+export type FailureCategory =
+  | "shear_failed"       // predicción cortante + plastificó
+  | "flexure_shear_risk" // predicción mixta + plastificó
+  | "flexural_ductile"   // predicción flexión + plastificó
+  | "no_damage";
+
+export interface FailureModeElement {
+  fid:             string;
+  kind:            "column";
+  story:           string;
+  section:         string;
+  asce_prediction: "flexion" | "flexion_cortante" | "cortante";
+  asce_condition:  "i" | "ii" | "iii" | "iv";
+  Vp_kN:           number;
+  Vn_kN:           number;
+  Vp_over_Vn:      number;
+  flags:           string[];
+  observed_hinge:  "none" | "near_io" | "io" | "ls" | "cp" | "collapse";
+  max_dcr:         number;
+  category:        FailureCategory;
+  needs_marker:    boolean;
+  marker_symbol:   "lightning" | "cross" | "";
+}
+
+export interface FailureModesClassification {
+  status:   string;
+  scheme:   string;
+  n_total:  number;
+  counts:   Record<FailureCategory, number>;
+  elements: FailureModeElement[];
+}
+
+/** Daño de mampostería por deriva de entrepiso (FEMA 356 C7-1 / HAZUS). */
+export interface InfillDamageByDriftPanel {
+  panel_id:            string;
+  story:               string;
+  orientation:         "X" | "Y";
+  story_idx:           number;
+  max_drift_pct:       number;
+  max_level:           InfillDamageLevel;
+  step_first_cracking: number;
+  step_first_collapse: number;
+}
+
+export interface InfillDamageByDrift {
+  status:         "success" | "no_infills" | "no_data" | "no_stories_z" | "failed";
+  message?:       string;
+  scheme?:        string;
+  thresholds?:    { cracking: number; degrading: number; collapse: number };
+  n_total:        number;
+  n_collapsed:    number;
+  n_degrading:    number;
+  max_drift_pct:  number;
+  panel_ids:      string[];
+  panels:         InfillDamageByDriftPanel[];
+  /** matriz [n_frames, n_panels] con deriva (fracción) por paso. */
+  history:        number[][];
 }
 
 export interface NLFramePushoverHistory {
@@ -1526,6 +1611,40 @@ export interface N2Result {
 
 // ── NLTHA (análisis cronológico no lineal) ──────────────────────────────────
 
+/**
+ * Metadata liviana de un job NLTH histórico. Un proyecto puede tener N
+ * análisis cronológicos, cada uno con su carpeta `nlth/<job_id>/` y su
+ * propio `meta.json`. Este es el shape que devuelve `/nlth/jobs`.
+ */
+export interface NLTHJobMeta {
+  job_id:         string;
+  project_id:     string;
+  system:         "frames" | "walls";
+  record_x_file:  string;
+  record_y_file:  string;
+  scale:          number;
+  dtrec:          number;
+  dt_analysis:    number;
+  damping:        number;
+  record_units:   string;
+  duration:       number | null;
+  collapse_mode:  string;
+  status:         string;
+  max_drift_pct:  number;
+  max_roof_m:     number;
+  pga_x_g:        number;
+  pga_y_g:        number;
+  Vb_peak_kN:     number;
+  residual_drift_pct: number;
+  t_elapsed_s:    number;
+  t_target_s:     number;
+  wall_time_min:  number;
+  aborted:        boolean;
+  abort_reason:   string | null;
+  computed_at:    string;              // ISO-8601 UTC
+  has_history_npz: boolean;
+}
+
 export interface NLTHUploadResult {
   ok:           boolean;
   direction:    "X" | "Y";
@@ -1541,6 +1660,117 @@ export interface NLTHUploadResult {
   header_lines: string[];
   description:  string;
   preview:      { t: number[]; a: number[]; stride: number };
+  /** Si el registro vino de la biblioteca FEMA, trae el id del par y nombre. */
+  fema_pair_id?: number;
+  fema_gm_name?: string;
+}
+
+// ── FEMA P-695 library ──────────────────────────────────────────────────────
+
+export interface FEMAPair {
+  pair:        number;             // 1..22
+  earthquake:  string;             // "Northridge"
+  year:        number;             // 1994
+  mw:          number;             // 6.7
+  station:     string;             // "Beverly Hills - Mulhol"
+  rrup_km:     number;             // 13.3
+  files:       [string, string];   // ["GM01", "GM02"]
+  dt:          [number, number];   // dt de cada componente (s)
+  pga:         (number | null)[];  // PGA máx de cada componente (g)
+  duration_s:  (number | null)[];
+  n_samples:   (number | null)[];
+  spectra: {
+    periods:  number[];
+    geomean:  number[];
+    [gm_key: string]: number[];     // "gm01": [...], "gm02": [...]
+  } | null;
+}
+
+export interface FEMALibraryCatalog {
+  pairs:     FEMAPair[];
+  periods:   number[];
+  available: boolean;
+}
+
+// ── Catálogos locales (campañas colombianas) — shape compatible con FEMAPair ─
+
+export interface LocalPair extends FEMAPair {
+  region:        string;             // "CALI" | "MANIZALES" | "PEREIRA" | "SGC"
+  soil_class:    string | null;      // "S1".."S5"
+  latitude:      number | null;
+  longitude:     number | null;
+  campaign:      string;
+  event_date:    string;
+  record_h1_id:  string;
+  record_h2_id:  string;
+}
+
+export interface LocalCampaign {
+  campaign:   string;
+  label:      string;
+  earthquake: string | null;
+  event_date: string | null;
+  mw:         number | null;
+  n_records:  number;
+}
+
+export interface LocalCatalog {
+  campaign:  string;
+  pairs:     LocalPair[];
+  periods:   number[];
+  available: boolean;
+}
+
+export interface LocalRecordPreview {
+  name:        string;
+  t:           number[];
+  a:           number[];
+  dt:          number;
+  n_full:      number;
+  pga:         number;
+  duration_s:  number;
+  region:      string | null;
+  station:     string | null;
+  component:   string | null;
+  soil_class:  string | null;
+}
+
+export interface FEMARecordPreview {
+  gm_name:     string;
+  t:           number[];
+  a:           number[];
+  dt:          number;
+  n_full:      number;
+  pga:         number;
+  duration_s:  number;
+}
+
+export interface FEMAScaleResult {
+  pair_id:                 number;
+  T1_s:                    number;
+  xi:                      number;
+  sa_target_g:             number;
+  sa_h1_unscaled_g:        number;
+  sa_h2_unscaled_g:        number;
+  sa_geomean_unscaled_g:   number;
+  sa_geomean_scaled_g:     number;
+  scale:                   number;
+}
+
+export interface FEMASelectResult {
+  pair: {
+    pair_id:    number;
+    earthquake: string;
+    year:       number;
+    mw:         number;
+    station:    string;
+    rrup_km:    number;
+    files:      [string, string];
+  };
+  scale:       number;
+  scale_info:  Record<string, number | string>;
+  upload_x:    NLTHUploadResult;
+  upload_y:    NLTHUploadResult;
 }
 
 export interface NLTHDamageHinges {
@@ -1587,8 +1817,26 @@ export interface NLTHResult {
     max_drift_pct:               number;
     max_drift_by_story_x:        number[];
     max_drift_by_story_y:        number[];
+    /** Aceleración ABSOLUTA máx por piso = ü_rel + ü_g. Es la que mide un
+     *  acelerómetro en el piso (relevante para daño a contenido, NSR-10 A.9). */
+    max_abs_accel_by_story_x_mps2?: number[];
+    max_abs_accel_by_story_y_mps2?: number[];
+    /** Aceleración relativa al suelo (deformación dinámica del edificio). */
+    max_rel_accel_by_story_x_mps2?: number[];
+    max_rel_accel_by_story_y_mps2?: number[];
+    /** Alias legacy — hoy apunta a la absoluta (que es la métrica correcta). */
     max_accel_by_story_x_mps2:   number[];
     max_accel_by_story_y_mps2:   number[];
+    /** PGA del registro ya con factor/escala aplicados. */
+    pga_x_mps2?:                 number;
+    pga_y_mps2?:                 number;
+    pga_x_g?:                    number;
+    pga_y_g?:                    number;
+    pga_vector_g?:               number;
+    /** Factor de amplificación por piso: PFA_i / PGA (adimensional). */
+    accel_amplification_by_story_x?: number[];
+    accel_amplification_by_story_y?: number[];
+    max_accel_amplification?:        number;
     max_Vb_x_kN:                 number;
     max_Vb_y_kN:                 number;
     max_roof_disp_total_m:       number;
@@ -1600,6 +1848,10 @@ export interface NLTHResult {
   element_lines?: ElementLine[];
   infill_lines?:  InfillLine[];
   infill_damage?: InfillDamageHistory;
+  /** Daño por deriva de entrepiso (FEMA 356 / HAZUS). Complementa infill_damage. */
+  infill_damage_by_drift?: InfillDamageByDrift;
+  /** Clasificación cruzada ASCE 41 × hinges del NLTHA por columna. */
+  failure_modes?: FailureModesClassification;
   runtime?: {
     wall_time_s:    number;    // segundos de reloj
     wall_time_min:  number;    // minutos de reloj
@@ -1625,6 +1877,416 @@ export interface NLTHResult {
     dt_rec:     number;
     n_elements: number;
   } | null;
+  /** Diagnóstico de salud del solver (Ola 2 2026-11-04). Siempre presente;
+   *  cuando status=success y no hubo bisecciones, los campos son neutrales. */
+  health?: AnalysisHealth;
+}
+
+export interface AnalysisHealth {
+  status: "success" | "partial" | "stall";
+  aborted: boolean;
+  abort_reason:
+    | "step_fail" | "stall" | "user_cancel" | "vb_near_zero" | "slow_progress"
+    | "bulldozer_failed" | null;
+  /** Para abort_reason=slow_progress: ratio dt_actual/dt_nominal al cortar. */
+  slow_dt_ratio?: number;
+  /** Modo bulldozer: solver aceptó error local severo en elementos patológicos
+   *  para que el resto del edificio avance por redistribución (Ola 6). */
+  bulldozer_activated?:   boolean;
+  bulldozer_steps_total?: number;
+  bulldozer_t_entered?:   number;
+  abort_time_s?:       number | null;
+  abort_time_target_s?: number | null;
+  /** Para pushover */
+  abort_step?:       number | null;
+  abort_drift_pct?:  number | null;
+  /** Para pushover con colapso (abort_reason=vb_near_zero). Umbral actual:
+   *  Vb ≤ 25 % del pico → se considera colapso del edificio (75 % pérdida). */
+  vb_peak_kN?:       number;
+  vb_at_abort_kN?:   number;
+  vb_loss_pct?:      number;
+  n_failed_steps:        number;
+  n_bisections_total:    number;
+  n_fallback_algorithm?: number;
+  max_dt_reduction?:     number;
+  pathological_element?: PathologicalElement | null;
+  pathological_ranking?: PathologicalElement[];
+}
+
+export interface PathologicalElement {
+  ele_tag:       number;
+  fid?:          string;
+  kind?:         string;
+  story?:        string;
+  theta_p_max?:  number;
+  strain_axial?: number;
+  force_max_kN?: number;
+  b_m?:          number;
+  h_m?:          number;
+}
+
+// ── Ola 7: Diagnóstico post-NLTH del elemento + recomendaciones ──────────────
+
+export type ReinforcementActionId =
+  | "fix_hook_90"
+  | "fix_splice_in_hinge"
+  | "reduce_tie_spacing"
+  | "add_tie_legs"
+  | "upgrade_tie_diameter"
+  | "cfrp_wrap"
+  | "upgrade_long_bars"
+  | "enlarge_section"
+  | "short_beam_coupling_detail";
+
+export interface ReinforcementOption {
+  action_id:           ReinforcementActionId | string;
+  description:         string;
+  cost_tier:           1 | 2 | 3;
+  cost_estimate_usd:   number;
+  rationale:           string;
+  changes:             Record<string, unknown>;
+  theta_cap_new:       number;
+  theta_u_new:         number;
+  Vn_new_kN:           number;
+  Vp_over_Vn_new:      number;
+  failure_mode_new:    string;
+  theta_cap_gain_pct:  number;
+  Vn_gain_pct:         number;
+  new_theta_dcr:       number;
+  new_vd_dcr:          number;
+  meets_target:        boolean;
+  notes:               string[];
+}
+
+export interface ElementDiagnosis {
+  fid:              string;
+  kind:             string;
+  story:            string;
+  b_m:              number;
+  h_m:              number;
+  L_m:              number;
+  rho_long:         number;
+  rho_sh:           number;
+  s_confined_mm:    number;
+  n_legs_h:         number;
+  tie_bar_label:    string;
+  long_bar_label:   string;
+  theta_IO:         number;
+  theta_LS:         number;
+  theta_CP:         number;
+  theta_u:          number;
+  Vp_kN:            number;
+  Vn_kN:            number;
+  Vp_over_Vn:       number;
+  failure_mode:     string;
+  asce_condition:   string;
+  flags:            string[];
+  theta_demand:     number;
+  V_demand_kN:      number | null;
+  theta_dcr:        number;
+  recommendations:  ReinforcementOption[];
+  verdict:          string;
+  verdict_class:    "ok" | "info" | "warning" | "danger";
+}
+
+export interface ApplyReinforcementFixRequest {
+  fid:        string;
+  action_id:  string;
+  changes:    Record<string, unknown>;
+  notes?:     string;
+}
+
+export interface ApplyReinforcementFixResponse {
+  saved:      boolean;
+  fid:        string;
+  action_id:  string;
+  message:    string;
+}
+
+// ── Ola 8: Performance-based design verifier ────────────────────────────────
+
+export type PerformanceLevel = "IO" | "LS" | "CP";
+
+export interface ElementVerification {
+  fid:                  string;
+  kind:                 string;
+  story:                string;
+  performance_level:    string;
+  theta_target:         number;
+  theta_CP_initial:     number;
+  theta_CP_final:       number;
+  meets_target_initial: boolean;
+  meets_target_final:   boolean;
+  iterations:           number;
+  adjustments:          string[];
+  changes:              Record<string, unknown>;
+  failure_mode_final:   string;
+  Vn_final_kN:          number;
+  Vp_over_Vn_final:     number;
+  unmet_reason:         string | null;
+}
+
+export interface PerformanceVerificationResult {
+  performance_level:    string;
+  theta_targets:        { column: number; beam: number };
+  method:               string;
+  n_elements:           number;
+  n_initial_pass:       number;
+  n_adjusted:           number;
+  n_unmet:              number;
+  max_iterations:       number;
+  elements:             ElementVerification[];
+  summary_adjustments:  Record<string, number>;
+  warnings:             string[];
+  saved_fixes?:         boolean;
+  saved_fixes_count?:   number;
+}
+
+export interface PerformanceVerifyRequest {
+  performance_level:    PerformanceLevel;
+  theta_target_column?: number;
+  theta_target_beam?:   number;
+  method?:              "haselton" | "ec8_3" | "mecanico";
+  max_iterations?:      number;
+  skip_coupling_beams?: boolean;
+  save_fixes?:          boolean;
+}
+
+// ── IDA — Incremental Dynamic Analysis ──────────────────────────────────────
+
+export interface IDALaunchRequest {
+  pair_ids:      number[];
+  sa_min:        number;
+  sa_max:        number;
+  n_levels:      number;
+  T1_s:          number;
+  system?:       "frames" | "walls";
+  damping?:      number;
+  dt_analysis?:  number;
+  spacing?:      "linear" | "log";
+  collapse_mode?: "ductile" | "brittle";
+  catalog_source?: string;   // "fema" | "colombia_2026_08_10" | ...
+}
+
+export interface IDALaunchResponse {
+  job_id:     string;
+  celery_id:  string;
+  pair_ids:   number[];
+  n_levels:   number;
+  n_total:    number;
+  status:     string;
+  message:    string;
+}
+
+/**
+ * Daño agregado por piso dentro de un análisis individual.
+ * Clave del dict `hinges_by_story` = etiqueta del piso (p. ej. "P03").
+ */
+export interface IDAHingeStoryCount {
+  io:             number;
+  ls:             number;
+  cp:             number;
+  collapse:       number;
+  total:          number;
+  theta_max_col:  number;
+  theta_max_beam: number;
+}
+
+export interface IDACurvePoint {
+  Sa_g:              number;
+  level_index:       number;
+  status?:           string;
+  max_drift_pct:     number | null;
+  max_roof_m?:       number;
+  Vb_peak_kN?:       number;
+  theta_col_max?:    number;
+  theta_beam_max?:   number;
+  collapsed:         boolean | null;
+  aborted?:          boolean;
+  abort_reason?:     string | null;
+  worst_fid?:        string;
+  n_critical_cols?:  number;
+  n_critical_beams?: number;
+  // ── Perfiles por piso (Ola A — radiografía post-sismo) ────────────────────
+  stories_z?:                      number[];
+  max_drift_by_story_x_pct?:       number[];
+  max_drift_by_story_y_pct?:       number[];
+  max_abs_accel_by_story_x_mps2?:  number[];
+  max_abs_accel_by_story_y_mps2?:  number[];
+  max_disp_by_story_x_m?:          number[];
+  max_disp_by_story_y_m?:          number[];
+  accel_amp_by_story_x?:           number[];
+  accel_amp_by_story_y?:           number[];
+  pga_x_g?:                        number;
+  pga_y_g?:                        number;
+  pga_vector_g?:                   number;
+  residual_drift_pct?:             number;
+  residual_drift_x_pct?:           number;
+  residual_drift_y_pct?:           number;
+  residual_drift_by_story_x_pct?:  number[];
+  residual_drift_by_story_y_pct?:  number[];
+  critical_story_idx?:             number;
+  critical_story_drift_pct?:       number;
+  hinges_by_story?:                Record<string, IDAHingeStoryCount>;
+}
+
+/**
+ * Percentiles entre pares para un perfil por piso (Ola A).
+ * Cada array tiene longitud = n_stories; indexado del piso 1 (más bajo) hacia arriba.
+ */
+export interface IDAProfilePercentiles {
+  p16: number[];
+  p50: number[];
+  p84: number[];
+}
+
+export interface IDAStatsPerLevel {
+  Sa_g:              number;
+  level_index:       number;
+  drift_p16:         number;
+  drift_p50:         number;
+  drift_p84:         number;
+  theta_col_p50:     number;
+  theta_col_p84:     number;
+  residual_p50?:     number;
+  residual_p84?:     number;
+  pga_p50_g?:        number;
+  n_collapsed:       number;
+  n_total:           number;
+  collapse_frac:     number;
+  // ── Perfiles por piso (envolvente X,Y) — percentiles entre pares ──────────
+  drift_profile?:    IDAProfilePercentiles;
+  accel_profile?:    IDAProfilePercentiles;
+  disp_profile?:     IDAProfilePercentiles;
+  accel_amp_profile?: IDAProfilePercentiles;
+}
+
+export interface IDAResult {
+  meta: {
+    ida_job_id:   string;
+    pair_ids:     number[];
+    sa_levels:    number[];
+    sa_min:       number;
+    sa_max:       number;
+    n_levels:     number;
+    T1_s:         number;
+    system:       string;
+    damping:      number;
+    spacing:      string;
+    launched_at:  string;
+    total_runs:   number;
+  };
+  curves:               Record<string, IDACurvePoint[]>;   // key = pair_id string
+  stats_per_level:      IDAStatsPerLevel[];
+  sa_median_collapse_g: number | null;
+  // Ola A — información global de la "radiografía post-sismo"
+  stories_z?:              number[];
+  n_stories?:              number;
+  most_critical_story_idx?: number | null;
+  n_pairs:              number;
+  n_levels:             number;
+  computed_at:          string;
+  job_id?:              string;
+}
+
+export interface IDAProgress {
+  job_id:   string;
+  status:   string;
+  n_done:   number;
+  n_total:  number;
+  pct:      number;
+  progress: Record<string, unknown> | null;
+  meta:     IDAResult["meta"] | null;
+}
+
+export interface IDAJobSummary {
+  job_id:         string;
+  status:         string;
+  created_at:     string | null;
+  finished_at:    string | null;
+  params:         IDALaunchRequest | null;
+  result_summary: {
+    n_pairs:              number;
+    n_levels:             number;
+    n_total:              number;
+    n_ok:                 number;
+    n_collapsed:          number;
+    sa_median_collapse_g: number | null;
+  } | null;
+}
+
+// ── NLRHA — Verificación NSR-10 / ASCE 7-22 Cap 16 ──────────────────────────
+
+export interface NLRHALaunchRequest {
+  pair_ids:        number[];
+  Aa:              number;             // NSR-10 A.2.3
+  Av:              number;
+  soil_type:       "A" | "B" | "C" | "D" | "E";
+  use_group:       "I" | "II" | "III" | "IV";
+  T1_s:            number;
+  mce_multiplier?: number;             // 1.0 (SDE) · 1.5 (MCE_R)
+  system?:         "frames" | "walls";
+  damping?:        number;
+  dt_analysis?:    number;
+  catalog_source?: string;             // "fema" | "colombia_2026_08_10" | ...
+}
+
+export interface NLRHASpectralParams {
+  SDs: number; SD1: number;
+  T0:  number; Ts:  number; TL: number;
+  Fa:  number; Fv:  number;
+}
+
+export interface NLRHALaunchResponse {
+  job_id:          string;
+  celery_id:       string;
+  pair_ids:        number[];
+  sa_nsr10_T1_g:   number;
+  I_factor:        number;
+  mce_multiplier:  number;
+  sa_target_g:     number;
+  spectral_params: NLRHASpectralParams;
+  status:          string;
+  message:         string;
+}
+
+/** Verificación piso-por-piso vs límite NSR-10 A.6.4.2 (1 % deriva). */
+export interface NLRHAStoryVerification {
+  story:           number;
+  drift_p50_pct:   number;
+  drift_p84_pct:   number;
+  ratio_vs_limit:  number;
+  ok:              boolean;
+}
+
+export interface NLRHAVerification {
+  overall:         "pass" | "fail" | "no_data";
+  limit_mean_pct:  number;
+  limit_max_pct:   number;
+  stories:         NLRHAStoryVerification[];
+  n_pairs:         number | null;
+  n_collapsed:     number | null;
+}
+
+/**
+ * NLRHAResult = IDAResult de 1 solo nivel + metadatos NSR-10 + verificación.
+ * Comparte el mismo esquema para reusar el task de IDA y todo el pipeline
+ * post-proceso (perfiles, hinges por piso, residual).
+ */
+export interface NLRHAResult extends IDAResult {
+  nlrha_meta?: {
+    mode?:              string;              // "nlrha"
+    nsr10_Aa?:          number;
+    nsr10_Av?:          number;
+    soil_type?:         string;
+    use_group?:         string;
+    importance_factor?: number;
+    mce_multiplier?:    number;
+    sa_nsr10_T1_g?:     number;
+    sa_target_g?:       number;
+    spectral_params?:   NLRHASpectralParams;
+  };
+  nsr10_verification: NLRHAVerification;
 }
 
 // ── Variantes de diseño (Fase 6) ─────────────────────────────────────────────
