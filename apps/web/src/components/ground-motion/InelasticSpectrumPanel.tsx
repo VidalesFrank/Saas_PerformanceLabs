@@ -29,6 +29,17 @@ const MU_COLORS: Record<string, string> = {
   '6.0': '#a855f7',   // violet-500
 }
 
+// Opciones de ductilidad — el elástico μ=1 siempre va incluido como referencia.
+const MU_OPTIONS: { value: number; label: string }[] = [
+  { value: 1.5, label: '1.5' },
+  { value: 2.0, label: '2' },
+  { value: 3.0, label: '3' },
+  { value: 4.0, label: '4' },
+  { value: 6.0, label: '6' },
+]
+
+const CACHE_KEY_PREFIX = 'pl-gm-inelastic-v1-'
+
 type ViewTab = 'Sa' | 'Sd' | 'R'
 
 const TABS: { id: ViewTab; label: string; desc: string }[] = [
@@ -54,17 +65,55 @@ export default function InelasticSpectrumPanel({ recordId, component = '', dt }:
   const [nPoints, setNPoints]     = useState('80')
   const [xi, setXi]               = useState('0.05')
   const [Tinspect, setTinspect]   = useState('1.0')
+  // Selección de ductilidades — default μ = 2 (reducción típica de diseño)
+  const [muSelection, setMuSelection] = useState<Set<number>>(() => new Set([2.0]))
   const t = useGmTheme()
 
   const tMinNum = parseFloat(TMin) || 0.01
 
+  const cacheKey = `${CACHE_KEY_PREFIX}${recordId}:${component}`
+
+  // Hidrata desde localStorage al montar
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const raw = localStorage.getItem(cacheKey)
+      if (!raw) return
+      const cached = JSON.parse(raw) as {
+        params?: { TMin?: string; TMax?: string; nPoints?: string; xi?: string; mu?: number[] }
+        result?: InelasticResult
+      }
+      if (cached.result) setResult(cached.result)
+      if (cached.params) {
+        if (cached.params.TMin)    setTMin(cached.params.TMin)
+        if (cached.params.TMax)    setTMax(cached.params.TMax)
+        if (cached.params.nPoints) setNPoints(cached.params.nPoints)
+        if (cached.params.xi)      setXi(cached.params.xi)
+        if (cached.params.mu?.length) setMuSelection(new Set(cached.params.mu))
+      }
+    } catch { /* cache corrupto */ }
+  }, [cacheKey])
+
+  const toggleMu = (v: number) => {
+    setMuSelection(prev => {
+      const next = new Set(prev)
+      if (next.has(v)) next.delete(v); else next.add(v)
+      if (next.size === 0) next.add(2.0)  // mantener al menos uno
+      return next
+    })
+  }
+
   const compute = async () => {
+    const mu_sel = Array.from(muSelection).sort((a, b) => a - b)
+    if (mu_sel.length === 0) { setError('Selecciona al menos un valor de ductilidad μ.'); return }
     setIsLoading(true); setError(null)
     try {
       const token = localStorage.getItem('pl_token')
+      // Elástico μ=1 siempre va incluido como curva de referencia
+      const mu_list = [1.0, ...mu_sel]
       const body = {
         xi: parseFloat(xi) || 0.05,
-        mu_list: [1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        mu_list,
         T_min: tMinNum,
         T_max: parseFloat(TMax) || 4.0,
         n_points: parseInt(nPoints) || 80,
@@ -75,10 +124,35 @@ export default function InelasticSpectrumPanel({ recordId, component = '', dt }:
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
       })
-      if (!res.ok) throw new Error((await res.json()).detail || 'Error computing inelastic spectrum')
-      setResult(await res.json())
+      // Lectura robusta: si el server devuelve HTML (nginx timeout, error 50x),
+      // el res.json() lanza "Unexpected token '<'". Capturamos y damos un
+      // mensaje legible.
+      if (!res.ok) {
+        const raw = await res.text()
+        let detail = raw
+        try { detail = JSON.parse(raw).detail ?? raw } catch { /* no JSON */ }
+        if (/<html/i.test(detail) || detail.length > 500) {
+          throw new Error(
+            'El servidor tardó demasiado. Reduce las ductilidades seleccionadas o el número de puntos.',
+          )
+        }
+        throw new Error(detail || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      setResult(data)
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify({
+          params: { TMin, TMax, nPoints, xi, mu: mu_sel },
+          result: data,
+        }))
+      } catch { /* quota */ }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Error')
+      const msg = e instanceof Error ? e.message : 'Error'
+      if (/Unexpected token '?<'?/.test(msg) || /<html/i.test(msg)) {
+        setError('El servidor tardó demasiado y devolvió HTML. Reduce ductilidades/puntos.')
+      } else {
+        setError(msg)
+      }
     } finally {
       setIsLoading(false)
     }
@@ -196,7 +270,7 @@ export default function InelasticSpectrumPanel({ recordId, component = '', dt }:
     <div className="flex flex-col gap-6">
       <SectionHeader
         title="Espectros de Respuesta Inelástica"
-        subtitle="Espectros de ductilidad constante con oscilador SDOF elasto-perfectamente plástico (EPP). Bisección sobre fy para μ = 1.5, 2, 3, 4, 6."
+        subtitle="Espectros de ductilidad constante con oscilador SDOF elasto-perfectamente plástico (EPP). Selecciona las ductilidades μ que necesitas (más μ = más tiempo); el elástico siempre se incluye como referencia."
         chip="EPP · μ constante"
       />
 
@@ -248,12 +322,37 @@ export default function InelasticSpectrumPanel({ recordId, component = '', dt }:
                          px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[var(--accent)]/40"
             />
           </div>
+          <div>
+            <label className="text-[10.5px] font-bold uppercase tracking-[0.14em] text-[var(--muted)] block mb-1.5">
+              Ductilidades μ (además del elástico)
+            </label>
+            <div className="flex gap-1.5">
+              {MU_OPTIONS.map(opt => {
+                const active = muSelection.has(opt.value)
+                return (
+                  <button
+                    key={opt.value}
+                    onClick={() => toggleMu(opt.value)}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold border transition-all
+                      ${active
+                        ? 'bg-[var(--accent)] text-white border-[var(--accent)] shadow-sm'
+                        : 'bg-[var(--surface-alt)] text-[var(--muted)] border-[var(--border)] hover:border-[var(--accent)]/40'}`}
+                    title={`${active ? 'Quitar' : 'Incluir'} μ = ${opt.label}`}
+                  >
+                    μ={opt.label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
           <button
-            onClick={compute} disabled={isLoading}
+            onClick={compute} disabled={isLoading || muSelection.size === 0}
             className="px-5 py-2 bg-[var(--accent)] text-white rounded-lg text-sm font-semibold
                        disabled:opacity-50 hover:opacity-90 transition-opacity shadow-sm"
           >
-            {isLoading ? 'Calculando…' : result ? 'Recalcular' : 'Calcular espectros inelásticos'}
+            {isLoading
+              ? `Calculando ${muSelection.size + 1} curvas…`
+              : result ? 'Recalcular' : `Calcular (${muSelection.size + 1} curvas)`}
           </button>
 
           {result && (

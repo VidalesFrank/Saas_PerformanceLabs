@@ -30,7 +30,16 @@ const XI_LABELS: Record<string, string> = {
   '0.2000': 'ξ = 20%',
 }
 
+// Opciones de amortiguamiento: el usuario elige cuáles correr (default 5%).
+const XI_OPTIONS: { value: number; key: string; label: string }[] = [
+  { value: 0.02, key: '0.0200', label: '2%' },
+  { value: 0.05, key: '0.0500', label: '5%' },
+  { value: 0.10, key: '0.1000', label: '10%' },
+  { value: 0.20, key: '0.2000', label: '20%' },
+]
+
 const G = 9.80665
+const CACHE_KEY_PREFIX = 'pl-gm-spectrum-v1-'
 
 export default function SpectrumPanel({ recordId, component = '', dt }: Props) {
   const chartRef  = useRef<HTMLDivElement>(null)
@@ -49,17 +58,56 @@ export default function SpectrumPanel({ recordId, component = '', dt }: Props) {
   })
   const [TMax, setTMax]           = useState('4.0')
   const [nPoints, setNPoints]     = useState('150')
+  // Selección de amortiguamientos — default ξ = 5 % (lo más común)
+  const [xiSelection, setXiSelection] = useState<Set<number>>(() => new Set([0.05]))
   const t = useGmTheme()
 
   const tMinNum = parseFloat(TMin) || 0.01
   const tMaxNum = parseFloat(TMax) || 4.0
 
+  const cacheKey = `${CACHE_KEY_PREFIX}${recordId}:${component}`
+
+  // ── Hidratar desde localStorage al montar (y cuando cambia el registro) ──
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      const raw = localStorage.getItem(cacheKey)
+      if (!raw) return
+      const cached = JSON.parse(raw) as {
+        params?: { TMin?: string; TMax?: string; nPoints?: string; xi?: number[] }
+        result?: SpectrumMultiXiResult
+      }
+      if (cached.result) setResult(cached.result)
+      if (cached.params) {
+        if (cached.params.TMin)    setTMin(cached.params.TMin)
+        if (cached.params.TMax)    setTMax(cached.params.TMax)
+        if (cached.params.nPoints) setNPoints(cached.params.nPoints)
+        if (cached.params.xi?.length) setXiSelection(new Set(cached.params.xi))
+      }
+    } catch { /* cache corrupto — ignorar */ }
+  }, [cacheKey])
+
+  const toggleXi = (v: number) => {
+    setXiSelection(prev => {
+      const next = new Set(prev)
+      if (next.has(v)) next.delete(v); else next.add(v)
+      // Garantizar al menos un ξ seleccionado
+      if (next.size === 0) next.add(0.05)
+      return next
+    })
+  }
+
   const compute = async () => {
+    const xi_list = Array.from(xiSelection).sort((a, b) => a - b)
+    if (xi_list.length === 0) {
+      setError('Selecciona al menos un amortiguamiento.')
+      return
+    }
     setIsLoading(true); setError(null)
     try {
       const res = await computeSpectrum(recordId, {
         component,
-        xi_list: [0.02, 0.05, 0.10, 0.20],
+        xi_list,
         T_min: tMinNum,
         T_max: tMaxNum,
         n_points: parseInt(nPoints) || 150,
@@ -67,26 +115,34 @@ export default function SpectrumPanel({ recordId, component = '', dt }: Props) {
       }) as SpectrumMultiXiResult
       setResult(res)
       setInspect(null)
+      // Persistir para sobrevivir refresh
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify({
+          params: { TMin, TMax, nPoints, xi: xi_list },
+          result: res,
+        }))
+      } catch { /* quota o storage no disponible */ }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Error calculando espectro.')
+      setError((e instanceof Error ? e.message : 'Error calculando espectro.'))
     } finally {
       setIsLoading(false)
     }
   }
 
   const exportFile = async (fmt: 'xlsx' | 'txt') => {
+    const xi_list = Array.from(xiSelection).sort((a, b) => a - b)
     setExportingFmt(fmt); setError(null)
     try {
       const { blob, filename } = await exportSpectrum(recordId, {
         component,
-        xi_list: [0.02, 0.05, 0.10, 0.20],
+        xi_list,
         T_min: tMinNum,
         T_max: tMaxNum,
         n_points: parseInt(nPoints) || 150,
       }, fmt)
       triggerDownload(blob, filename)
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : `Error exportando ${fmt.toUpperCase()}.`)
+      setError((e instanceof Error ? e.message : `Error exportando ${fmt.toUpperCase()}.`))
     } finally {
       setExportingFmt(null)
     }
@@ -202,7 +258,7 @@ export default function SpectrumPanel({ recordId, component = '', dt }: Props) {
     <div className="flex flex-col gap-6">
       <SectionHeader
         title="Espectro de Respuesta"
-        subtitle="Espectros elásticos Sd, Sv, Sa, PSA, PSV para múltiples amortiguamientos (ξ = 2 · 5 · 10 · 20 %). Integración Newmark-β."
+        subtitle="Espectros elásticos Sd, Sv, Sa, PSA, PSV. Selecciona los amortiguamientos ξ que necesitas (más ξ = más tiempo de cálculo). Integración Newmark-β."
         chip="Newmark-β"
       />
 
@@ -240,13 +296,38 @@ export default function SpectrumPanel({ recordId, component = '', dt }: Props) {
                          px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[var(--accent)]/40"
             />
           </div>
+          <div>
+            <label className="text-[10.5px] font-bold uppercase tracking-[0.14em] text-[var(--muted)] block mb-1.5">
+              Amortiguamientos ξ
+            </label>
+            <div className="flex gap-1.5">
+              {XI_OPTIONS.map(opt => {
+                const active = xiSelection.has(opt.value)
+                return (
+                  <button
+                    key={opt.key}
+                    onClick={() => toggleXi(opt.value)}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-semibold border transition-all
+                      ${active
+                        ? 'bg-[var(--accent)] text-white border-[var(--accent)] shadow-sm'
+                        : 'bg-[var(--surface-alt)] text-[var(--muted)] border-[var(--border)] hover:border-[var(--accent)]/40'}`}
+                    title={`${active ? 'Quitar' : 'Incluir'} ξ = ${opt.label}`}
+                  >
+                    {opt.label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
           <button
             onClick={compute}
-            disabled={isLoading}
+            disabled={isLoading || xiSelection.size === 0}
             className="px-5 py-2 bg-[var(--accent)] text-white rounded-lg text-sm font-semibold
                        disabled:opacity-50 hover:opacity-90 transition-opacity shadow-sm"
           >
-            {isLoading ? 'Calculando…' : result ? 'Recalcular' : 'Calcular Espectro'}
+            {isLoading
+              ? `Calculando ${xiSelection.size > 1 ? xiSelection.size + ' ξ' : '1 ξ'}…`
+              : result ? 'Recalcular' : `Calcular (${xiSelection.size} ξ)`}
           </button>
 
           {result && (
@@ -374,7 +455,7 @@ export default function SpectrumPanel({ recordId, component = '', dt }: Props) {
         <EmptyState
           icon="📈"
           title="Calcula el espectro de respuesta elástico"
-          subtitle="Integración Newmark-β · Sd, Sv, Sa, PSA, PSV para ξ = 2, 5, 10 y 20%"
+          subtitle={`Selección actual: ${Array.from(xiSelection).sort((a,b)=>a-b).map(v => (v*100).toFixed(0) + '%').join(' · ')} — Integración Newmark-β`}
         />
       )}
     </div>
@@ -393,3 +474,4 @@ function InspectorCell({ label, value, unit, accent }: {
     </div>
   )
 }
+

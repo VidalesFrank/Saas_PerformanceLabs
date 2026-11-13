@@ -77,10 +77,84 @@ def _gm_dir(record_id: str) -> str:
 
 
 def _load_record_data(record: GroundMotionRecord):
-    """Carga el registro desde disco (autodetecta formato v1 JSON / v2 binario)."""
-    if not record.raw_data_path or not os.path.exists(record.raw_data_path):
-        raise HTTPException(404, "Datos del registro no encontrados en disco.")
-    return load_record_auto(record.raw_data_path)
+    """Carga el registro desde disco.
+
+    Soporta tres orígenes:
+      1. Formato interno v1/v2 (JSON o binario) via `raw_data_path`.
+      2. Archivos .AT2 formato CEER (campañas locales, p.ej. Colombia
+         10-ago-2026): `raw_data_path` queda None, el seed solo apunta
+         a `source_file`; aquí los parseamos on-the-fly.
+    """
+    # Camino normal (registros importados por el usuario)
+    if record.raw_data_path and os.path.exists(record.raw_data_path):
+        return load_record_auto(record.raw_data_path)
+
+    # Camino alterno: .AT2 CEER (catálogo local) — parseo lazy
+    md = record.metadata_json or {}
+    if (
+        record.source_file
+        and os.path.exists(record.source_file)
+        and (md.get("source_format") == "CEER" or record.source_file.lower().endswith(".at2"))
+    ):
+        return _build_gmrecord_from_at2(record)
+
+    raise HTTPException(404, "Datos del registro no encontrados en disco.")
+
+
+def _build_gmrecord_from_at2(record: GroundMotionRecord):
+    """Construye un GroundMotionRecord en memoria desde un .AT2 CEER.
+
+    Usado para registros del catálogo local donde `raw_data_path` es None y
+    solo tenemos el `.AT2` en disco. El objeto resultante es compatible con
+    todo el resto del pipeline (get_acceleration_channel, effective_values_si,
+    integración, FFT, intensidad, espectros).
+    """
+    import numpy as np
+    from app.engine.building.at2_parser import parse_at2_ceer
+    from app.engine.ground_motion.record import (
+        GroundMotionRecord as GMRecord, SignalChannel,
+    )
+
+    dt, ag_g = parse_at2_ceer(record.source_file)
+    n = int(len(ag_g))
+    md = record.metadata_json or {}
+    component = (md.get("component") or "H1").upper()
+
+    # Convertir g → m/s²  (SI);  raw_values queda en g.
+    a_si = (ag_g * 9.80665).astype(np.float64)
+
+    ch = SignalChannel(
+        name=f"ACC_{component}",
+        quantity="acceleration",
+        component=component,
+        original_unit="g",
+        si_unit="m/s²",
+        raw_values=ag_g.astype(np.float64),
+        values_si=a_si,
+    )
+    gm = GMRecord(
+        id=record.id,
+        name=record.name,
+        source_file=record.source_file,
+        source_format="at2_ceer",
+        dt=float(dt),
+        n_samples=n,
+        duration=float((n - 1) * dt) if n > 1 else 0.0,
+        fs=float(1.0 / dt) if dt > 0 else 0.0,
+        nyquist=float(0.5 / dt) if dt > 0 else 0.0,
+        time=np.arange(n, dtype=np.float64) * dt,
+        channels=[ch],
+        metadata={
+            "event":     md.get("event_name"),
+            "station":   md.get("station"),
+            "component": component,
+            "soil_type": md.get("soil_class"),
+            "region":    md.get("region"),
+            "campaign":  md.get("campaign"),
+            "source":    "CEER .AT2",
+        },
+    )
+    return gm
 
 
 def _save_record_data(record_db: GroundMotionRecord, gm_rec) -> str:
