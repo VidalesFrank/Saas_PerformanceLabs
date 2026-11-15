@@ -21,6 +21,7 @@ import type {
 } from "@/lib/structural-types";
 import { usePlotly } from "@/lib/use-plotly";
 import { plotlyLayoutPremium, plotlyAxisPremium, plotlyConfigPremium } from "@/lib/plotly-theme";
+import { SummaryChip } from "@/components/ui/summary-chip";
 
 interface Props {
   projectId: string;
@@ -1202,6 +1203,29 @@ function interpSaAt(periods: number[], sa: number[], T: number): number {
   return sa[n-1];
 }
 
+/** Aproximación Abramowitz-Stegun 26.2.17 a la CDF normal estándar. */
+function normCdf(z: number): number {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const d = 0.3989422804014327 * Math.exp(-(z * z) / 2);
+  const p = d * t * ((((1.330274429 * t - 1.821255978) * t + 1.781477937) * t - 0.356563782) * t + 0.319381530);
+  return z > 0 ? 1 - p : p;
+}
+
+/** P(X > x) para X ~ lognormal estimada desde P16/P50/P84:
+ *  μ_ln = ln(P50), σ_ln = (ln(P84) − ln(P16)) / 2. Fallback binario si σ ≈ 0. */
+function lognormalProbExceeds(p16: number, p50: number, p84: number, x: number): number {
+  const FLOOR = 1e-4;
+  const p16s = Math.max(p16, FLOOR);
+  const p50s = Math.max(p50, FLOOR);
+  const p84s = Math.max(p84, FLOOR);
+  const sigma = (Math.log(p84s) - Math.log(p16s)) / 2;
+  if (!isFinite(sigma) || sigma <= 1e-6) {
+    return p50 >= x ? 1 : 0;
+  }
+  const z = (Math.log(x) - Math.log(p50s)) / sigma;
+  return 1 - normCdf(z);
+}
+
 function ForensicAnalysisSection({
   result, catalog, T1, levelIdx, setLevelIdx,
   selectedPairId, setSelectedPairId,
@@ -1215,8 +1239,9 @@ function ForensicAnalysisSection({
   setSelectedPairId: (pid: number | null) => void;
 }) {
   const plotlyReady = usePlotly();
-  const heatmapRef  = useRef<HTMLDivElement | null>(null);
-  const spectrumRef = useRef<HTMLDivElement | null>(null);
+  const cascadeRefs  = useRef<(HTMLDivElement | null)[]>([]);
+  const fragilityRef = useRef<HTMLDivElement | null>(null);
+  const spectrumRef  = useRef<HTMLDivElement | null>(null);
 
   const stories_z = result.stories_z ?? [];
   const n_stories = result.n_stories ?? stories_z.length;
@@ -1226,25 +1251,17 @@ function ForensicAnalysisSection({
   );
   const level = result.stats_per_level[levelIdx];
 
-  // ── 1. Matriz Z[story][level] = deriva P50 ───────────────────────────────
-  const heatmapZ = useMemo(() => {
-    const z: (number | null)[][] = [];
-    for (let s = 0; s < n_stories; s++) {
-      const row: (number | null)[] = [];
-      for (const lvl of result.stats_per_level) {
-        const prof: IDAProfilePercentiles | undefined = lvl.drift_profile;
-        row.push(prof?.p50[s] ?? null);
-      }
-      z.push(row);
-    }
-    return z;
-  }, [result.stats_per_level, n_stories]);
-
-  const heatmapZMax = useMemo(() => {
+  // Rango X compartido entre los mini-perfiles — misma escala para que el ojo
+  // compare la progresión de daño de un Sa al siguiente.
+  const xMaxGlobal = useMemo(() => {
     let m = 0;
-    for (const r of heatmapZ) for (const v of r) if (v != null && v > m) m = v;
-    return Math.max(3.0, m * 1.1);
-  }, [heatmapZ]);
+    for (const lvl of result.stats_per_level) {
+      const p = lvl.drift_profile;
+      if (!p) continue;
+      for (const v of p.p84) if (v > m) m = v;
+    }
+    return Math.max(2.5, m * 1.05);
+  }, [result.stats_per_level]);
 
   // ── 2. Piso crítico por nivel ────────────────────────────────────────────
   const criticalByLevel = useMemo(() => {
@@ -1302,48 +1319,103 @@ function ForensicAnalysisSection({
     }
   }, [worstPairs, selectedPairId, setSelectedPairId]);
 
-  // ── Plot heatmap ─────────────────────────────────────────────────────────
+  // ── Plot 1: cascada small multiples — un mini-perfil por nivel Sa ────────
   useEffect(() => {
-    if (!plotlyReady || !heatmapRef.current || n_stories === 0) return;
+    if (!plotlyReady || n_stories === 0) return;
     const Plotly = (window as unknown as { Plotly: {
       newPlot: (el: HTMLElement, traces: unknown[], layout: unknown, config: unknown) => void;
     } }).Plotly;
 
-    const sa = result.stats_per_level.map((s) => s.Sa_g);
-    const traces: unknown[] = [
-      {
-        type: "heatmap",
-        z: heatmapZ,
-        x: sa,
-        y: storyLabels,
-        zmin: 0,
-        zmax: heatmapZMax,
-        colorscale: [
-          [0.00, "#065f46"],  // verde oscuro — elástico
-          [0.15, "#10b981"],  // verde — OK
-          [0.30, "#84cc16"],
-          [0.45, "#eab308"],  // ámbar — atención
-          [0.60, "#f97316"],  // naranja — daño severo
-          [0.80, "#dc2626"],  // rojo
-          [1.00, "#7f1d1d"],  // rojo oscuro — colapso
-        ],
-        colorbar: { title: { text: "Deriva P50 (%)" }, thickness: 14, len: 0.85, x: 1.02 },
-        hovertemplate: "<b>%{y}</b> · Sa=%{x:.2f}g<br>Deriva P50 = %{z:.2f} %<extra></extra>",
-      },
-      // Isolínea NSR-10 Δ = 1%
-      {
-        type: "contour",
-        z: heatmapZ, x: sa, y: storyLabels,
-        contours: {
-          showlabels: true, labelfont: { color: "#ffffff", size: 10 },
-          start: 1.0, end: 1.0, size: 1.0, coloring: "none",
-        },
-        line: { color: "#ffffff", width: 2.5, dash: "dash" },
-        showscale: false, hoverinfo: "skip",
-        name: "NSR-10 Δ = 1 %",
-      },
-    ];
+    result.stats_per_level.forEach((lvl, idx) => {
+      const el = cascadeRefs.current[idx];
+      const profile: IDAProfilePercentiles | undefined = lvl.drift_profile;
+      if (!el || !profile) return;
 
+      const stories = Array.from({ length: n_stories }, (_, i) => i + 1);
+      const isActive = idx === levelIdx;
+
+      // Piso crítico por P50 (coincide con la tabla "piso crítico por nivel").
+      let maxP50 = -Infinity;
+      let critStory = 1;
+      for (let i = 0; i < profile.p50.length; i++) {
+        if (profile.p50[i] > maxP50) { maxP50 = profile.p50[i]; critStory = i + 1; }
+      }
+
+      const traces: unknown[] = [
+        // Banda P16-P84: traza invisible superior + inferior con fill tonextx.
+        { type: "scatter", mode: "lines", x: profile.p84, y: stories,
+          line: { color: "rgba(0,0,0,0)", width: 0 },
+          showlegend: false, hoverinfo: "skip" },
+        { type: "scatter", mode: "lines", x: profile.p16, y: stories,
+          line: { color: "rgba(0,0,0,0)", width: 0 },
+          fill: "tonextx", fillcolor: "rgba(99,102,241,0.18)",
+          showlegend: false, hoverinfo: "skip" },
+        // Mediana P50.
+        { type: "scatter", mode: "lines+markers", x: profile.p50, y: stories,
+          line: { color: "#4f46e5", width: 2.2 },
+          marker: { size: 4, color: "#4f46e5" },
+          hovertemplate: "Piso %{y} · P50 = %{x:.2f}%<extra></extra>",
+          showlegend: false },
+        // Piso crítico (anillo rojo).
+        { type: "scatter", mode: "markers", x: [maxP50], y: [critStory],
+          marker: { symbol: "circle-open", size: 14, color: "#ef4444", line: { width: 2 } },
+          hovertemplate: `piso crítico ${critStory} · Δ = ${maxP50.toFixed(2)}%<extra></extra>`,
+          showlegend: false },
+      ];
+
+      // Umbrales NSR-10 / ASCE 41 verticales (IO · LS · CP).
+      const shapes: unknown[] = [
+        { type: "line", xref: "x", yref: "paper", x0: 0.5, x1: 0.5, y0: 0, y1: 1,
+          line: { color: "#10b981", width: 1, dash: "dot" } },
+        { type: "line", xref: "x", yref: "paper", x0: 1.0, x1: 1.0, y0: 0, y1: 1,
+          line: { color: "#f59e0b", width: 1, dash: "dot" } },
+        { type: "line", xref: "x", yref: "paper", x0: 2.0, x1: 2.0, y0: 0, y1: 1,
+          line: { color: "#ef4444", width: 1, dash: "dot" } },
+      ];
+
+      const dtickStories = Math.max(1, Math.round(n_stories / 8));
+
+      Plotly.newPlot(el, traces, {
+        ...plotlyLayoutPremium({ showLegend: false }),
+        xaxis: plotlyAxisPremium({ title: "Δ [%]", range: [0, xMaxGlobal] }),
+        yaxis: {
+          ...plotlyAxisPremium({
+            title: idx === 0 ? "Piso" : "",
+            range: [0.5, n_stories + 0.5],
+          }),
+          dtick: dtickStories,
+        },
+        shapes,
+        margin: { l: idx === 0 ? 46 : 28, r: 10, t: 34, b: 42 },
+        title: {
+          text: `Sa=${lvl.Sa_g.toFixed(2)}g · col ${(lvl.collapse_frac * 100).toFixed(0)}%`,
+          font: { size: 10.5, color: isActive ? "#6366f1" : "#64748b" },
+          x: 0.5, xref: "paper",
+        },
+      }, plotlyConfigPremium);
+    });
+  }, [plotlyReady, result.stats_per_level, n_stories, levelIdx, xMaxGlobal]);
+
+  // ── Plot 2: fragility heatmap — P(Δ > LS = 1 %) por piso × Sa ────────────
+  useEffect(() => {
+    if (!plotlyReady || !fragilityRef.current || n_stories === 0) return;
+    const Plotly = (window as unknown as { Plotly: {
+      newPlot: (el: HTMLElement, traces: unknown[], layout: unknown, config: unknown) => void;
+    } }).Plotly;
+
+    const LS = 1.0;
+    const zFrag: (number | null)[][] = [];
+    for (let s = 0; s < n_stories; s++) {
+      const row: (number | null)[] = [];
+      for (const lvl of result.stats_per_level) {
+        const p: IDAProfilePercentiles | undefined = lvl.drift_profile;
+        if (!p || p.p50.length <= s) { row.push(null); continue; }
+        row.push(lognormalProbExceeds(p.p16[s], p.p50[s], p.p84[s], LS));
+      }
+      zFrag.push(row);
+    }
+
+    const sa = result.stats_per_level.map((s) => s.Sa_g);
     const selSa = level?.Sa_g;
     const shapes: unknown[] = [];
     if (selSa != null) {
@@ -1354,14 +1426,39 @@ function ForensicAnalysisSection({
       });
     }
 
-    Plotly.newPlot(heatmapRef.current, traces, {
+    Plotly.newPlot(fragilityRef.current, [
+      {
+        type: "heatmap",
+        z: zFrag, x: sa, y: storyLabels,
+        zmin: 0, zmax: 1,
+        colorscale: [
+          [0.00, "#065f46"],
+          [0.10, "#10b981"],
+          [0.30, "#eab308"],
+          [0.60, "#f97316"],
+          [1.00, "#7f1d1d"],
+        ],
+        colorbar: { title: { text: "P(Δ > LS)" }, thickness: 14, len: 0.85, x: 1.02, tickformat: ".0%" },
+        hovertemplate: "<b>%{y}</b> · Sa=%{x:.2f}g<br>P(Δ > 1%) = %{z:.0%}<extra></extra>",
+      },
+      {
+        type: "contour",
+        z: zFrag, x: sa, y: storyLabels,
+        contours: {
+          showlabels: true, labelfont: { color: "#ffffff", size: 10 },
+          start: 0.1, end: 0.9, size: 0.4, coloring: "none",
+        },
+        line: { color: "#ffffff", width: 1.5, dash: "dot" },
+        showscale: false, hoverinfo: "skip",
+      },
+    ], {
       ...plotlyLayoutPremium({ showLegend: false }),
-      xaxis: plotlyAxisPremium({ title: "Sa(T₁)   [g]" }),
+      xaxis: plotlyAxisPremium({ title: "Sa(T₁) [g]" }),
       yaxis: plotlyAxisPremium({ title: "Piso" }),
       shapes,
       margin: { l: 70, r: 100, t: 20, b: 55 },
     }, plotlyConfigPremium);
-  }, [plotlyReady, heatmapZ, heatmapZMax, storyLabels, result.stats_per_level, level, n_stories]);
+  }, [plotlyReady, result.stats_per_level, n_stories, level, storyLabels]);
 
   // ── Plot mini-espectro par seleccionado ──────────────────────────────────
   useEffect(() => {
@@ -1437,24 +1534,133 @@ function ForensicAnalysisSection({
     <section className="pl-glass rounded-xl p-5 space-y-5">
       <header className="flex flex-col md:flex-row md:items-baseline md:justify-between gap-2">
         <div>
+          <div className="inline-flex items-center gap-1.5 rounded-full bg-violet-500/15 border border-violet-500/30 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-violet-600 dark:text-violet-300 mb-1.5">
+            <span className="h-1 w-1 rounded-full bg-violet-500" style={{ boxShadow: "0 0 5px #8b5cf6" }} />
+            Ola C · Forense
+          </div>
           <h3 className="text-sm font-semibold text-[var(--text)]">
             Análisis forense · dónde duele y qué registro lo causa
           </h3>
           <p className="text-[11px] text-[var(--text-muted)]">
-            Vista panorámica: el heatmap muestra el daño distribuido por piso en
-            cada nivel Sa; abajo, qué piso concentra el daño y qué pares son los
-            críticos. La línea blanca marca el umbral NSR-10 (Δ = 1 %); la vertical
-            índigo señala el nivel Sa seleccionado.
+            Cascada de perfiles por piso (un mini-gráfico por nivel Sa) con banda
+            P16–P84 y umbrales NSR-10 / ASCE 41 (IO · LS · CP); debajo, un mapa de
+            probabilidad P(Δ &gt; LS) sintetiza el riesgo. Las tablas identifican el
+            piso crítico y los pares más agresivos; el mini-espectro muestra el par
+            seleccionado escalado al Sa objetivo.
           </p>
         </div>
       </header>
 
-      {/* ── Heatmap piso × nivel Sa ──────────────────────────────────────── */}
+      {/* ── Strip resumen del nivel Sa activo ───────────────────────────── */}
+      {(() => {
+        const critical = criticalByLevel[levelIdx];
+        if (!critical) return null;
+        const driftTone =
+          critical.drift == null ? "neutral" :
+          critical.drift >= 2.0  ? "rose" :
+          critical.drift >= 1.0  ? "amber" : "emerald";
+        const residualTone =
+          critical.residual == null ? "neutral" :
+          critical.residual >= 0.5  ? "rose" :
+          critical.residual >= 0.2  ? "amber" : "emerald";
+        const collapseTone =
+          level.collapse_frac >= 0.5 ? "rose" :
+          level.collapse_frac >= 0.1 ? "amber" : "emerald";
+        return (
+          <div className="flex flex-wrap gap-2 rounded-lg border border-[var(--panel-muted)]/40 bg-[var(--panel-muted)]/25 p-2">
+            <SummaryChip
+              label="Sa activo"
+              value={`${level.Sa_g.toFixed(2)} g`}
+              hint={`nivel ${levelIdx + 1} de ${result.stats_per_level.length}`}
+              tone="indigo"
+            />
+            <SummaryChip
+              label="Deriva P50 máx"
+              value={critical.drift != null ? `${critical.drift.toFixed(2)} %` : "—"}
+              hint={critical.story != null ? `piso crítico ${critical.story}` : undefined}
+              tone={driftTone}
+            />
+            <SummaryChip
+              label="Residual P50"
+              value={critical.residual != null ? `${critical.residual.toFixed(2)} %` : "—"}
+              hint="deformación permanente"
+              tone={residualTone}
+            />
+            <SummaryChip
+              label="% colapso"
+              value={`${(level.collapse_frac * 100).toFixed(0)} %`}
+              hint={`${level.n_collapsed} / ${level.n_total} pares`}
+              tone={collapseTone}
+            />
+          </div>
+        );
+      })()}
+
+      {/* ── 1. Cascada small multiples ──────────────────────────────────── */}
+      <div className="space-y-2">
+        <div className="flex items-baseline justify-between flex-wrap gap-2">
+          <h4 className="text-xs uppercase tracking-wider font-semibold text-[var(--text-muted)]">
+            Perfiles de deriva por piso · banda P16–P84 · por nivel Sa
+          </h4>
+          <div className="flex gap-3 text-[10px] text-[var(--text-muted)]">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full" style={{ background: "#10b981" }} />
+              IO 0.5 %
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full" style={{ background: "#f59e0b" }} />
+              LS 1.0 %
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full" style={{ background: "#ef4444" }} />
+              CP 2.0 %
+            </span>
+            <span className="inline-flex items-center gap-1.5 ml-2">
+              <span className="h-2 w-5" style={{ background: "rgba(99,102,241,0.3)" }} />
+              banda P16–P84
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full border-2" style={{ borderColor: "#ef4444" }} />
+              piso crítico
+            </span>
+          </div>
+        </div>
+        <div
+          className="grid gap-2"
+          style={{ gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))" }}
+        >
+          {result.stats_per_level.map((lvl, idx) => (
+            <div
+              key={idx}
+              onClick={() => setLevelIdx(idx)}
+              className={`cursor-pointer rounded-md border transition ${
+                idx === levelIdx
+                  ? "border-indigo-400/60 bg-indigo-500/5 ring-1 ring-indigo-400/30"
+                  : "border-[var(--panel-muted)]/30 hover:border-indigo-400/30 hover:bg-indigo-500/5"
+              }`}
+              title={`Sa = ${lvl.Sa_g.toFixed(2)} g · clic para fijar este nivel`}
+            >
+              <div
+                ref={(el) => { cascadeRefs.current[idx] = el; }}
+                style={{ width: "100%", height: 230 }}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ── 2. Fragility heatmap — P(Δ > LS) ──────────────────────────── */}
       <div className="space-y-1">
         <h4 className="text-xs uppercase tracking-wider font-semibold text-[var(--text-muted)]">
-          Mapa de calor — deriva P50 (%) por piso y nivel Sa
+          Mapa de probabilidad de excedencia — P(Δ &gt; LS = 1 %)
         </h4>
-        <div ref={heatmapRef} style={{ width: "100%", height: 380 }} />
+        <div ref={fragilityRef} style={{ width: "100%", height: 300 }} />
+        <div className="text-[10px] italic text-[var(--text-muted)]">
+          Calculado desde los percentiles P16/P50/P84 asumiendo distribución
+          lognormal de la deriva entre pares (β = [ln(P84) − ln(P16)] / 2).
+          Isolíneas blancas en 10 %, 50 %, 90 % delimitan zonas de riesgo. La
+          vertical índigo marca el nivel Sa seleccionado.
+        </div>
       </div>
 
       {/* ── Dos tablas lado a lado ──────────────────────────────────────── */}
@@ -1608,3 +1814,4 @@ function ForensicAnalysisSection({
     </section>
   );
 }
+

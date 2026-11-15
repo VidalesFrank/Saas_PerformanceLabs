@@ -7,15 +7,18 @@ import { SpectrumChart, interpolateSpectrum } from "@/components/seismic/Spectru
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Input, Label } from "@/components/ui/input";
-import { PageHero } from "@/components/ui/page-hero";
+import { PageHero, PageHeroChip } from "@/components/ui/page-hero";
 import { api } from "@/lib/api";
 import type {
   EspectroMicrozonificacionResult,
   EspectroResult,
   MicrozonificacionInfo,
   MunicipioInfo,
+  MunicipiosStats,
   SoilType,
   SoilTypeInfo,
+  UseGroup,
+  UseGroupInfo,
   ZonaSismica,
 } from "@/lib/seismic-types";
 import { useRequireAuth } from "@/lib/use-require-auth";
@@ -49,8 +52,8 @@ function exportCSV(result: EspectroResult) {
   const m = result.municipio;
   const header = [
     `# Espectro NSR-10 — ${m.nombre} (${m.departamento})`,
-    `# Suelo ${result.soil_type} | Aa=${m.Aa}g | Av=${m.Av}g | Fa=${result.params.Fa} | Fv=${result.params.Fv}`,
-    `# SDs=${result.params.SDs}g | SD1=${result.params.SD1}g | T0=${result.params.T0}s | Ts=${result.params.Ts}s | TL=${result.params.TL}s`,
+    `# Suelo ${result.soil_type} | Grupo ${result.params.use_group} (I=${result.params.I.toFixed(2)}) | Aa=${m.Aa}g | Av=${m.Av}g | Fa=${result.params.Fa} | Fv=${result.params.Fv}`,
+    `# SDs=${result.params.SDs}g | SD1=${result.params.SD1}g | T0=${result.params.T0}s | Ts=${result.params.Ts}s | TL=${result.params.TL}s | Sa incluye factor I`,
     "T (s),Sa (g),Sd (cm),Sv (cm/s)",
   ].join("\n");
   const rows = result.puntos.map((p) => `${p.T},${p.Sa},${p.Sd},${p.Sv}`).join("\n");
@@ -89,7 +92,7 @@ async function exportPDF(result: EspectroResult, chartsEl: HTMLElement | null) {
   doc.text(`Municipio: ${m.nombre}, ${m.departamento}`, margin, y);
   y += 5;
   doc.text(
-    `Perfil de suelo: ${result.soil_type}   |   Zona: ${zone.charAt(0).toUpperCase() + zone.slice(1)}   |   Generado: ${new Date().toLocaleDateString("es-CO")}`,
+    `Perfil de suelo: ${result.soil_type}   |   Grupo de uso: ${p.use_group} (I = ${p.I.toFixed(2)})   |   Zona: ${zone.charAt(0).toUpperCase() + zone.slice(1)}   |   Generado: ${new Date().toLocaleDateString("es-CO")}`,
     margin,
     y
   );
@@ -108,9 +111,9 @@ async function exportPDF(result: EspectroResult, chartsEl: HTMLElement | null) {
   const paramRows: [string, string, string, string][] = [
     ["Aa", `${p.Aa} g`, "Av", `${p.Av} g`],
     ["Fa", p.Fa.toFixed(3), "Fv", p.Fv.toFixed(3)],
+    [`I (Grupo ${p.use_group})`, p.I.toFixed(2), "TL", `${p.TL.toFixed(1)} s`],
     ["SDs = 2.5·Aa·Fa", `${p.SDs.toFixed(4)} g`, "SD1 = Av·Fv", `${p.SD1.toFixed(4)} g`],
     ["T₀ = 0.2·Ts", `${p.T0.toFixed(4)} s`, "Ts = SD1/SDs", `${p.Ts.toFixed(4)} s`],
-    ["TL", `${p.TL.toFixed(1)} s`, "", ""],
   ];
 
   doc.setFontSize(9);
@@ -179,9 +182,12 @@ export default function SeismicPage() {
   const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<MunicipioInfo[]>([]);
   const [allMunicipios, setAllMunicipios] = useState<MunicipioInfo[]>([]);
+  const [stats, setStats] = useState<MunicipiosStats | null>(null);
   const [selected, setSelected] = useState<MunicipioInfo | null>(null);
   const [soilType, setSoilType] = useState<SoilType>("D");
   const [soilTypes, setSoilTypes] = useState<SoilTypeInfo[]>([]);
+  const [useGroup, setUseGroup] = useState<UseGroup>("I");
+  const [useGroups, setUseGroups] = useState<UseGroupInfo[]>([]);
   const [result, setResult] = useState<EspectroResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -203,6 +209,8 @@ export default function SeismicPage() {
   useEffect(() => {
     api.get<MunicipioInfo[]>("/api/v1/seismic/municipios/all", false).then(setAllMunicipios).catch(() => {});
     api.get<SoilTypeInfo[]>("/api/v1/seismic/soil-types", false).then(setSoilTypes).catch(() => {});
+    api.get<UseGroupInfo[]>("/api/v1/seismic/use-groups", false).then(setUseGroups).catch(() => {});
+    api.get<MunicipiosStats>("/api/v1/seismic/municipios/stats", false).then(setStats).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -210,7 +218,7 @@ export default function SeismicPage() {
     if (!query.trim()) { setSuggestions([]); return; }
     searchDebounce.current = setTimeout(() => {
       api
-        .get<MunicipioInfo[]>(`/api/v1/seismic/municipios?q=${encodeURIComponent(query)}&limit=8`, false)
+        .get<MunicipioInfo[]>(`/api/v1/seismic/municipios?q=${encodeURIComponent(query)}&limit=20`, false)
         .then(setSuggestions)
         .catch(() => setSuggestions([]));
     }, 280);
@@ -229,7 +237,7 @@ export default function SeismicPage() {
       .catch(() => setMicroData(null));
   }, [selected]);
 
-  // Compute microzonification spectrum when zone changes
+  // Compute microzonification spectrum when zone / use_group changes
   useEffect(() => {
     setMicroResult(null);
     if (!selected || !selectedZona) return;
@@ -238,11 +246,12 @@ export default function SeismicPage() {
       .post<EspectroMicrozonificacionResult>("/api/v1/seismic/espectro/microzonificacion", {
         municipio_id: selected.id,
         zona_id: selectedZona,
+        use_group: useGroup,
       })
       .then(setMicroResult)
       .catch(() => setMicroResult(null))
       .finally(() => setMicroLoading(false));
-  }, [selected, selectedZona]);
+  }, [selected, selectedZona, useGroup]);
 
   const spectrumExtra = useMemo(() => {
     if (!microResult || !selectedZona || !microData) return null;
@@ -272,13 +281,14 @@ export default function SeismicPage() {
   );
 
   const calculateSpectrum = useCallback(
-    async (mun: MunicipioInfo, soil: SoilType) => {
+    async (mun: MunicipioInfo, soil: SoilType, group: UseGroup) => {
       setLoading(true);
       setError(null);
       try {
         const res = await api.post<EspectroResult>("/api/v1/seismic/espectro", {
           municipio_id: mun.id,
-          soil_type: soil,
+          soil_type:    soil,
+          use_group:    group,
         });
         setResult(res);
       } catch (err: unknown) {
@@ -295,12 +305,17 @@ export default function SeismicPage() {
     setSelected(m);
     setQuery(m.nombre);
     setSuggestions([]);
-    calculateSpectrum(m, soilType);
+    calculateSpectrum(m, soilType, useGroup);
   }
 
   function onSoilChange(s: SoilType) {
     setSoilType(s);
-    if (selected) calculateSpectrum(selected, s);
+    if (selected) calculateSpectrum(selected, s, useGroup);
+  }
+
+  function onUseGroupChange(g: UseGroup) {
+    setUseGroup(g);
+    if (selected) calculateSpectrum(selected, soilType, g);
   }
 
   async function handlePDF() {
@@ -322,11 +337,22 @@ export default function SeismicPage() {
     <div className="flex flex-1 flex-col">
       <AppHeader crumb="Espectros NSR-10" />
       <PageHero
-        eyebrow="Sismología · Espectros"
+        eyebrow="Sismología · Espectros NSR-10"
         title="Espectros de diseño NSR-10"
         subtitle="Genera los espectros Sa, Sd y Sv por municipio y tipo de suelo, con microzonificación cuando aplica. Exportable a CSV y PDF."
         tone="blue"
         icon="wave"
+        meta={
+          stats ? (
+            <>
+              <PageHeroChip label="Municipios" value={stats.total.toLocaleString()} tone="cyan" />
+              <PageHeroChip label="Zona alta" value={`${stats.por_zona.alta ?? 0}`} tone="amber" />
+              <PageHeroChip label="Zona intermedia" value={`${stats.por_zona.intermedia ?? 0}`} tone="amber" />
+              <PageHeroChip label="Zona baja" value={`${stats.por_zona.baja ?? 0}`} tone="emerald" />
+              <PageHeroChip label="Con mapa" value={stats.con_coordenadas.toLocaleString()} tone="blue" />
+            </>
+          ) : null
+        }
       />
 
       <main className="mx-auto grid w-full max-w-7xl flex-1 grid-cols-1 gap-6 px-6 py-8 lg:grid-cols-[360px_1fr]">
@@ -342,36 +368,60 @@ export default function SeismicPage() {
             </CardHeader>
             <CardBody className="flex flex-col gap-4">
               <div className="relative">
-                <Label htmlFor="mun-search">Municipio</Label>
+                <div className="flex items-baseline justify-between mb-1">
+                  <Label htmlFor="mun-search">Municipio</Label>
+                  {stats && (
+                    <span className="text-[10px] font-mono text-text-muted">
+                      {stats.total.toLocaleString()} en catálogo
+                    </span>
+                  )}
+                </div>
                 <Input
                   id="mun-search"
-                  placeholder="Buscar municipio o ciudad…"
+                  placeholder="Buscar municipio, ciudad o departamento…"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   autoComplete="off"
                 />
                 {suggestions.length > 0 && (
-                  <ul className="absolute z-50 mt-1 w-full overflow-hidden rounded-md border border-border bg-surface shadow-lg">
-                    {suggestions.map((m) => (
-                      <li key={m.id}>
-                        <button
-                          type="button"
-                          className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-surface-2"
-                          onClick={() => selectMunicipio(m)}
-                        >
-                          <span>
-                            <span className="font-medium text-text">{m.nombre}</span>
-                            <span className="ml-2 text-xs text-text-muted">{m.departamento}</span>
-                          </span>
-                          <span
-                            className="ml-2 shrink-0 text-[10px] font-semibold uppercase tracking-wide"
-                            style={{ color: m.zona_sismica === "alta" ? "#c81e3a" : m.zona_sismica === "intermedia" ? "#b45309" : "#087f5b" }}
+                  <ul className="absolute z-50 mt-1 w-full overflow-hidden rounded-md border border-[var(--panel-muted)]/60 bg-[var(--color-surface)] shadow-xl max-h-96 overflow-y-auto">
+                    {suggestions.map((m) => {
+                      const zoneAccent = m.zona_sismica === "alta"
+                        ? "#ef4444"
+                        : m.zona_sismica === "intermedia" ? "#f59e0b" : "#10b981";
+                      return (
+                        <li key={m.id}>
+                          <button
+                            type="button"
+                            className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-[var(--panel-muted)]/40 transition-colors border-l-2 border-transparent hover:border-[color:var(--_acc)]"
+                            style={{ ["--_acc" as string]: zoneAccent } as React.CSSProperties}
+                            onClick={() => selectMunicipio(m)}
                           >
-                            {m.zona_sismica}
-                          </span>
-                        </button>
-                      </li>
-                    ))}
+                            <span className="min-w-0 flex-1">
+                              <span className="font-semibold text-text">{m.nombre}</span>
+                              <span className="ml-2 text-[11px] text-text-muted">{m.departamento}</span>
+                              {m.code_dane != null && (
+                                <span className="ml-2 text-[10px] font-mono text-text-muted/70">· {m.code_dane}</span>
+                              )}
+                            </span>
+                            <span
+                              className="ml-2 shrink-0 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9.5px] font-bold uppercase tracking-wider"
+                              style={{
+                                color:        zoneAccent,
+                                borderColor:  `${zoneAccent}55`,
+                                background:   `${zoneAccent}18`,
+                              }}
+                            >
+                              <span className="h-1 w-1 rounded-full" style={{ background: zoneAccent, boxShadow: `0 0 4px ${zoneAccent}` }} />
+                              {m.zona_sismica}
+                            </span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                    <li className="px-3 py-1.5 text-[10px] font-mono text-text-muted/70 border-t border-[var(--panel-muted)]/40 bg-[var(--panel-muted)]/20">
+                      {suggestions.length === 20 ? "Mostrando 20 · refina la búsqueda para ver más" : `${suggestions.length} resultado${suggestions.length === 1 ? "" : "s"}`}
+                    </li>
                   </ul>
                 )}
               </div>
@@ -397,6 +447,43 @@ export default function SeismicPage() {
                 {soilTypes.find((st) => st.id === soilType) && (
                   <p className="mt-2 text-xs text-text-muted leading-relaxed">
                     {soilTypes.find((st) => st.id === soilType)?.descripcion}
+                  </p>
+                )}
+              </div>
+
+              {/* Grupo de uso — coeficiente de importancia I (NSR-10 A.2.5) */}
+              <div>
+                <Label>Grupo de uso (NSR-10 A.2.5)</Label>
+                <div className="mt-1 grid grid-cols-4 gap-1.5">
+                  {(["I", "II", "III", "IV"] as UseGroup[]).map((g) => {
+                    const info = useGroups.find((u) => u.id === g);
+                    const active = useGroup === g;
+                    // Semaforización: I verde, II cian, III ámbar, IV rojo.
+                    const accent = g === "I" ? "#10b981" : g === "II" ? "#06b6d4" : g === "III" ? "#f59e0b" : "#ef4444";
+                    return (
+                      <button
+                        key={g}
+                        type="button"
+                        onClick={() => onUseGroupChange(g)}
+                        style={active
+                          ? { borderColor: accent, color: accent, background: `${accent}18` }
+                          : {}}
+                        className={`rounded-md border py-2 text-xs font-bold transition-colors ${
+                          active ? "border-current" : "border-border text-text-muted hover:text-text"
+                        }`}
+                        title={info?.nombre}
+                      >
+                        <div className="leading-none">{g}</div>
+                        <div className="text-[9.5px] font-mono opacity-80 mt-0.5">
+                          I = {info?.I.toFixed(2) ?? "—"}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+                {useGroups.find((u) => u.id === useGroup) && (
+                  <p className="mt-2 text-xs text-text-muted leading-relaxed">
+                    {useGroups.find((u) => u.id === useGroup)?.nombre}
                   </p>
                 )}
               </div>
@@ -437,8 +524,9 @@ export default function SeismicPage() {
                     { label: "Av", value: `${result.params.Av} g`, hint: "Coef. velocidad" },
                     { label: "Fa", value: result.params.Fa.toFixed(3), hint: "Factor sitio T-corto" },
                     { label: "Fv", value: result.params.Fv.toFixed(3), hint: "Factor sitio T-largo" },
-                    { label: "SDs = 2.5·Aa·Fa", value: `${result.params.SDs.toFixed(4)} g`, hint: "Meseta espectral" },
-                    { label: "SD1 = Av·Fv", value: `${result.params.SD1.toFixed(4)} g`, hint: "Sa en T=1s" },
+                    { label: `I (Grupo ${result.params.use_group})`, value: result.params.I.toFixed(2), hint: "Coef. de importancia" },
+                    { label: "SDs = 2.5·Aa·Fa", value: `${result.params.SDs.toFixed(4)} g`, hint: "Meseta espectral (sin I)" },
+                    { label: "SD1 = Av·Fv", value: `${result.params.SD1.toFixed(4)} g`, hint: "Sa en T=1s (sin I)" },
                     { label: "T₀ = 0.2·Ts", value: `${result.params.T0.toFixed(4)} s`, hint: "Inicio meseta" },
                     { label: "Ts = SD1/SDs", value: `${result.params.Ts.toFixed(4)} s`, hint: "Fin meseta" },
                     { label: "TL", value: `${result.params.TL.toFixed(1)} s`, hint: "Período largo" },

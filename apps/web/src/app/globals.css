@@ -52,6 +52,12 @@
   --border: var(--color-border);
   --surface: var(--color-surface);
   --surface-alt: var(--color-surface-2);
+
+  /* Aliases modernos usados por paneles técnicos (IDA, NLRHA, catalog, etc.).
+     Mismo valor que los anteriores, nombres más cortos y consistentes. */
+  --text:         var(--color-text);
+  --text-muted:   var(--color-text-muted);
+  --panel-muted:  var(--color-surface-2);
 }
 
 :root[data-theme="dark"] {
@@ -115,6 +121,17 @@ body {
 @keyframes pl-grid-drift {
   0%   { background-position: 0 0, 0 0; }
   100% { background-position: 60px 60px, 60px 60px; }
+}
+
+/* ── Tiles del mapa — filtro premium tech sobre OSM libre ──────────────────
+   Simula el look CartoDB Positron/Dark Matter sin requerir API key. Se aplica
+   a cada <img.leaflet-tile> via `className` del <TileLayer>. */
+
+.pl-tile-light {
+  filter: grayscale(0.35) brightness(1.02) saturate(0.85) contrast(0.95);
+}
+.pl-tile-dark {
+  filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.95) saturate(0.8);
 }
 
 /* ── Skeleton shimmer ────────────────────────────────────────────────────── */
@@ -327,15 +344,25 @@ body {
 /* ── Chips "stat" en banda inferior del hero ─────────────────────────────── */
 
 .pl-stat-chip {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 16px;
+  padding: 10px 16px 10px 18px;
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(148, 163, 184, 0.14);
   font-size: 12.5px;
   color: var(--hero-text-muted);
+  overflow: hidden;
+}
+.pl-stat-chip::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: var(--_stat-accent, #22d3ee);
+  box-shadow: 0 0 10px var(--_stat-accent, #22d3ee);
 }
 .pl-stat-chip-num {
   font-family: var(--font-mono);
@@ -404,8 +431,15 @@ body {
     0 4px 12px -6px rgba(15, 23, 42, 0.08);
 }
 .pl-tool-card[data-active="false"] {
-  opacity: 0.55;
-  border-style: dashed;
+  opacity: 0.78;
+  background:
+    linear-gradient(135deg,
+      color-mix(in srgb, var(--_card-accent, #22d3ee) 4%, transparent) 0%,
+      var(--color-surface) 70%);
+  border-color: color-mix(in srgb, var(--_card-accent, #22d3ee) 18%, var(--color-border));
+}
+.pl-tool-card[data-active="false"]::before {
+  opacity: 0.45;
 }
 .pl-tool-card-icon {
   width: 40px;

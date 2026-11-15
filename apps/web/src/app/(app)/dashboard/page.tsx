@@ -293,16 +293,24 @@ function StatsBand({ modules }: { modules: CatalogModule[] | null }) {
         strokeLinecap="round" strokeLinejoin="round"><path d="M9 11H3V3h6zM21 21h-6v-8h6zM15 11h6V3h-6zM3 21h6v-8H3z" /></svg>],
   ];
 
+  const STAT_ACCENT = ["#22d3ee", "#3b82f6", "#f59e0b", "#8b5cf6"];
   return (
     <div className="border-t border-white/5 px-8 py-5" style={{ background: "rgba(5, 11, 24, 0.5)" }}>
       <div className="mx-auto flex max-w-7xl flex-wrap items-center justify-center gap-3 md:justify-between">
-        {items.map(([val, label, icon]) => (
-          <div key={label} className="pl-stat-chip">
-            <span style={{ color: "#67e8f9" }}>{icon}</span>
-            {modules ? <span className="pl-stat-chip-num">{val}</span> : <Sk w={28} h={18} />}
-            <span>{label}</span>
-          </div>
-        ))}
+        {items.map(([val, label, icon], i) => {
+          const accent = STAT_ACCENT[i % STAT_ACCENT.length];
+          return (
+            <div
+              key={label}
+              className="pl-stat-chip"
+              style={{ "--_stat-accent": accent } as React.CSSProperties}
+            >
+              <span style={{ color: accent }}>{icon}</span>
+              {modules ? <span className="pl-stat-chip-num">{val}</span> : <Sk w={28} h={18} />}
+              <span>{label}</span>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -490,7 +498,7 @@ function RoadmapSection({ mod }: { mod: CatalogModule }) {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between rounded-xl border border-border bg-surface px-5 py-4 text-left transition-colors hover:bg-surface-2"
+        className="flex w-full items-center justify-between rounded-xl border border-[var(--panel-muted)]/60 bg-[var(--color-surface)] px-5 py-4 text-left transition-colors hover:bg-[var(--panel-muted)]/40 hover:border-[var(--color-accent)]/40"
       >
         <div className="flex items-center gap-3">
           <div

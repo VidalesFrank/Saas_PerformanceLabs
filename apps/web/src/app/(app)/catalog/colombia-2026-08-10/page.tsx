@@ -15,6 +15,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { AppHeader } from "@/components/app-header";
+import { PageHero, PageHeroChip } from "@/components/ui/page-hero";
+import { regionColor } from "@/components/catalog/StationsMap";
 import { localCatalogApi } from "@/lib/structural-api";
 import type { LocalCatalog, LocalPair, LocalRecordPreview } from "@/lib/structural-types";
 import { usePlotly } from "@/lib/use-plotly";
@@ -46,6 +48,8 @@ export default function ColombiaCatalogPage() {
   const [previewH2, setPreviewH2] = useState<LocalRecordPreview | null>(null);
 
   const [sortBy, setSortBy] = useState<"pga" | "sa">("pga");
+  const [showAll, setShowAll] = useState(false);
+  const TABLE_TOP_N = 20;
 
   const accelH1Ref = useRef<HTMLDivElement | null>(null);
   const accelH2Ref = useRef<HTMLDivElement | null>(null);
@@ -140,15 +144,27 @@ export default function ColombiaCatalogPage() {
 
     // Duración máxima (como proxy de D5-95 sin FFT)
     let durMax = 0;
+    const pgaList: number[] = [];
     for (const p of catalog.pairs) {
       const d = Math.max(p.duration_s?.[0] ?? 0, p.duration_s?.[1] ?? 0);
       if (d > durMax) durMax = d;
+      const peak = Math.max(p.pga?.[0] ?? 0, p.pga?.[1] ?? 0);
+      if (peak > 0) pgaList.push(peak);
     }
+    // Estadísticos forenses de PGA sobre el catálogo completo.
+    pgaList.sort((a, b) => a - b);
+    const pgaMedian = pgaList.length > 0
+      ? pgaList[Math.floor(pgaList.length / 2)]
+      : 0;
+    const pgaP84 = pgaList.length > 0
+      ? pgaList[Math.min(pgaList.length - 1, Math.floor(pgaList.length * 0.84))]
+      : 0;
     // Total de estaciones únicas con al menos 1 par válido
     const stations = new Set(catalog.pairs.map((p) => p.station));
     const regions  = new Set(catalog.pairs.map((p) => p.region));
 
-    return { pgaPeak, saPeak, saPeakT, durMax, nStations: stations.size, nRegions: regions.size, nPairs: catalog.pairs.length };
+    return { pgaPeak, saPeak, saPeakT, pgaMedian, pgaP84, durMax,
+             nStations: stations.size, nRegions: regions.size, nPairs: catalog.pairs.length };
   }, [catalog]);
 
   // ── Tabla ordenable ───────────────────────────────────────────────────────
@@ -215,6 +231,22 @@ export default function ColombiaCatalogPage() {
   useEffect(() => { plotAccel(accelH1Ref.current, previewH1, "H1 (NS)", "#4f46e5"); }, [plotAccel, previewH1]);
   useEffect(() => { plotAccel(accelH2Ref.current, previewH2, "H2 (EW)", "#059669"); }, [plotAccel, previewH2]);
 
+  // ── Resize: los 3 plots se adaptan al ancho del contenedor ────────────────
+  useEffect(() => {
+    if (!plotlyReady) return;
+    const Plotly = (window as unknown as { Plotly?: { Plots: { resize: (el: HTMLElement) => void } } }).Plotly;
+    if (!Plotly) return;
+    const els = [accelH1Ref.current, accelH2Ref.current, spectrumRef.current].filter(
+      (el): el is HTMLDivElement => el != null,
+    );
+    if (els.length === 0) return;
+    const ro = new ResizeObserver(() => {
+      els.forEach((el) => { try { Plotly.Plots.resize(el); } catch { /* silencioso */ } });
+    });
+    els.forEach((el) => { if (el.parentElement) ro.observe(el.parentElement); });
+    return () => ro.disconnect();
+  }, [plotlyReady]);
+
   // ── Plot espectro Sa(T) ───────────────────────────────────────────────────
   useEffect(() => {
     if (!spectrumRef.current || !selectedPair?.spectra || !plotlyReady) return;
@@ -243,39 +275,32 @@ export default function ColombiaCatalogPage() {
   return (
     <div className="flex flex-col h-screen">
       <AppHeader crumb="Catálogo · Sismo Colombia 10-ago-2026" />
+      <PageHero
+        tone="amber"
+        icon="wave"
+        eyebrow="Catálogo local · 10 de agosto de 2026"
+        title="Sismo San José del Palmar"
+        subtitle="Catálogo integral de acelerogramas horizontales (NS/EW) registrados por las redes de Cali, Manizales, Pereira y la Red Nacional SGC. Los pares se integran al pipeline IDA / NLRHA para verificación NSR-10 con registros locales."
+        meta={
+          kpis ? (
+            <>
+              <PageHeroChip label="Estaciones" value={`${kpis.nStations}`} tone="amber" />
+              <PageHeroChip label="Pares NS+EW" value={`${kpis.nPairs}`} tone="amber" />
+              <PageHeroChip label="Regiones" value={`${kpis.nRegions}`} tone="amber" />
+              <PageHeroChip label="Duración máx." value={`${kpis.durMax.toFixed(0)} s`} tone="amber" />
+              <PageHeroChip label="Dominio" value="T ∈ [0.05, 4] s · ξ = 5 %" tone="amber" />
+            </>
+          ) : null
+        }
+      />
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-7xl mx-auto px-6 py-6 space-y-6">
-
-          {/* ── Hero ───────────────────────────────────────────────────── */}
-          <section className="pl-glass rounded-2xl p-6 bg-gradient-to-br from-orange-500/15 via-rose-500/5 to-transparent border border-orange-500/30">
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-orange-500/20 text-orange-700 dark:text-orange-300 text-[11px] font-semibold uppercase tracking-wider mb-3">
-              Reporte técnico · catálogo sísmico
-            </div>
-            <h1 className="text-3xl font-extrabold text-[var(--text)] tracking-tight">
-              Sismo San José del Palmar
-            </h1>
-            <p className="text-sm text-[var(--text-muted)] mt-1">10 de agosto de 2026 · Colombia</p>
-            <p className="text-sm text-[var(--text)] mt-4 max-w-3xl">
-              Catálogo integral de acelerogramas horizontales (NS y EW) registrados por las redes
-              acelerográficas de <b>Cali</b>, <b>Manizales</b>, <b>Pereira</b> y la Red Nacional <b>SGC</b>.
-              Los pares se integran al pipeline de análisis dinámico no lineal (IDA / NLRHA) para
-              verificación NSR-10 con registros locales.
-            </p>
-            {kpis && (
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-5 pt-5 border-t border-[var(--panel-muted)]/40">
-                <HeroStat label="Estaciones"     value={`${kpis.nStations}`} hint={`${kpis.nRegions} regiones`} />
-                <HeroStat label="Pares NS+EW"    value={`${kpis.nPairs}`}    hint="horizontales válidos" />
-                <HeroStat label="Duración máx."  value={`${kpis.durMax.toFixed(0)} s`} hint="registro más largo" />
-                <HeroStat label="Dominio"        value="T ∈ [0.05, 4] s"     hint="ξ = 5 %" />
-              </div>
-            )}
-          </section>
 
           {/* ── KPI cards ──────────────────────────────────────────────── */}
           {kpis && (
             <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
               <KpiCard
-                color="rose" title="PGA máximo registrado"
+                color="rose" title="PGA pico del catálogo"
                 value={`${kpis.pgaPeak.value.toFixed(3)} g`}
                 subtitle={`${kpis.pgaPeak.station} · ${kpis.pgaPeak.component} · ${kpis.pgaPeak.region} · suelo ${kpis.pgaPeak.soil ?? "s/d"}`}
               />
@@ -285,23 +310,19 @@ export default function ColombiaCatalogPage() {
                 subtitle={`${kpis.saPeak.station} · T = ${kpis.saPeakT.toFixed(2)} s · ξ = 5 %`}
               />
               <KpiCard
-                color="emerald" title="Duración máxima (registro)"
-                value={`${kpis.durMax.toFixed(1)} s`}
-                subtitle="proxy de contenido energético"
+                color="emerald" title="PGA mediana / P84"
+                value={`${kpis.pgaMedian.toFixed(3)} / ${kpis.pgaP84.toFixed(3)} g`}
+                subtitle={`${kpis.nPairs} pares · dispersión del catálogo`}
               />
               <KpiCard
-                color="amber" title="Cobertura regional"
-                value={`${kpis.nRegions} regiones`}
-                subtitle={`${kpis.nStations} estaciones · ${kpis.nPairs} pares horizontales`}
+                color="cyan" title="Período crítico del pico"
+                value={`T = ${kpis.saPeakT.toFixed(2)} s`}
+                subtitle={`crítico para edificios ${(kpis.saPeakT * 10).toFixed(0)} pisos aprox. (T₁ ≈ 0.1·N)`}
               />
             </section>
           )}
 
-          {status === "loading" && (
-            <div className="pl-glass-soft rounded-xl p-6 text-sm text-[var(--text-muted)]">
-              Cargando catálogo del sismo (espectros 5 % ξ por par)…
-            </div>
-          )}
+          {status === "loading" && <CatalogSkeleton />}
           {status === "error" && (
             <div className="rounded-xl border border-rose-500/40 bg-rose-500/5 p-4 text-sm text-rose-700 dark:text-rose-300">
               Error cargando catálogo: {error}
@@ -322,11 +343,12 @@ export default function ColombiaCatalogPage() {
                     onSelect={setSelectedStation}
                   />
                 </div>
-                <div className="flex gap-3 text-[11px] text-[var(--text-muted)]">
-                  <LegendDot color="#2563eb" label="CALI" />
-                  <LegendDot color="#059669" label="MANIZALES" />
-                  <LegendDot color="#d97706" label="PEREIRA" />
-                  <LegendDot color="#dc2626" label="SGC" />
+                <div className="flex flex-wrap gap-3 text-[11px] text-[var(--text-muted)]">
+                  {[...new Set(catalog.pairs.map((p) => p.region))]
+                    .sort()
+                    .map((region) => (
+                      <LegendDot key={region} color={regionColor(region)} label={region} />
+                    ))}
                 </div>
               </div>
 
@@ -417,7 +439,7 @@ export default function ColombiaCatalogPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {tableRows.map((r, idx) => {
+                    {(showAll ? tableRows : tableRows.slice(0, TABLE_TOP_N)).map((r, idx) => {
                       const top3 = idx < 3;
                       const sel = r.station === selectedStation;
                       return (
@@ -453,6 +475,28 @@ export default function ColombiaCatalogPage() {
                 </table>
               </div>
 
+              <div className="flex items-center justify-between gap-3 flex-wrap pt-1">
+                <div className="text-[11px] text-[var(--text-muted)]">
+                  Mostrando{" "}
+                  <span className="font-semibold text-[var(--text)]">
+                    {showAll ? tableRows.length : Math.min(TABLE_TOP_N, tableRows.length)}
+                  </span>
+                  {" "}de{" "}
+                  <span className="font-semibold text-[var(--text)]">{tableRows.length}</span>
+                  {" "}pares · ordenado por {sortBy === "pga" ? "PGA" : "Sa máximo"}
+                </div>
+                {tableRows.length > TABLE_TOP_N && (
+                  <button
+                    onClick={() => setShowAll((v) => !v)}
+                    className="text-[11px] font-semibold text-indigo-600 dark:text-indigo-400 hover:underline"
+                  >
+                    {showAll
+                      ? `Ver solo top ${TABLE_TOP_N}`
+                      : `Ver todos los ${tableRows.length} pares`}
+                  </button>
+                )}
+              </div>
+
               <div className="text-[11px] italic text-[var(--text-muted)]">
                 ★ Top 3 por {sortBy === "pga" ? "PGA" : "Sa máximo"}. Sa calculado como
                 geomean H1/H2, amortiguamiento 5 %, Newmark β = 1/4. Todos los pares están
@@ -469,16 +513,6 @@ export default function ColombiaCatalogPage() {
 }
 
 // ── Sub-componentes ──────────────────────────────────────────────────────────
-
-function HeroStat({ label, value, hint }: { label: string; value: string; hint?: string }) {
-  return (
-    <div>
-      <div className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] font-semibold">{label}</div>
-      <div className="text-lg font-mono font-semibold text-[var(--text)] mt-0.5">{value}</div>
-      {hint && <div className="text-[10px] text-[var(--text-muted)]">{hint}</div>}
-    </div>
-  );
-}
 
 const KPI_COLOR: Record<string, string> = {
   rose:    "from-rose-500/25 to-transparent border-rose-500/40 text-rose-500",
@@ -508,5 +542,57 @@ function LegendDot({ color, label }: { color: string; label: string }) {
       <span className="h-2.5 w-2.5 rounded-full" style={{ background: color }} />
       {label}
     </span>
+  );
+}
+
+/** Esqueleto estructural mostrado mientras carga el catálogo. Preserva la
+ * silueta de la página final (4 KPIs + mapa+plots + tabla) para que el salto
+ * visual al terminar la carga sea mínimo. */
+function CatalogSkeleton() {
+  return (
+    <>
+      <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div key={i} className="pl-glass rounded-xl p-4 space-y-3">
+            <div className="pl-skeleton h-3 w-32" />
+            <div className="pl-skeleton h-7 w-24" />
+            <div className="pl-skeleton h-2.5 w-44" />
+          </div>
+        ))}
+      </section>
+
+      <section className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+        <div className="lg:col-span-2 pl-glass rounded-xl p-4 space-y-3">
+          <div className="pl-skeleton h-3 w-40" />
+          <div className="pl-skeleton w-full" style={{ height: 420 }} />
+          <div className="flex gap-3">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="pl-skeleton h-3 w-20" />
+            ))}
+          </div>
+        </div>
+        <div className="lg:col-span-3 pl-glass rounded-xl p-4 space-y-3">
+          <div className="pl-skeleton h-3 w-56" />
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+            <div className="pl-skeleton w-full" style={{ height: 180 }} />
+            <div className="pl-skeleton w-full" style={{ height: 180 }} />
+          </div>
+          <div className="pl-skeleton w-full" style={{ height: 260 }} />
+        </div>
+      </section>
+
+      <section className="pl-glass rounded-xl p-5 space-y-3">
+        <div className="flex items-baseline justify-between">
+          <div className="pl-skeleton h-4 w-56" />
+          <div className="flex gap-1">
+            <div className="pl-skeleton h-6 w-24" />
+            <div className="pl-skeleton h-6 w-28" />
+          </div>
+        </div>
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="pl-skeleton h-4 w-full" />
+        ))}
+      </section>
+    </>
   );
 }

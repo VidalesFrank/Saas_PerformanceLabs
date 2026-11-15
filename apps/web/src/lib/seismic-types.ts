@@ -7,10 +7,21 @@ export interface MunicipioInfo {
   departamento: string;
   Aa: number;
   Av: number;
-  lat: number;
-  lon: number;
+  lat: number | null;
+  lon: number | null;
   zona_sismica: ZonaSismica;
+  code_dane?: number | null;
+  zona?: string | null;   // "ALTA" / "INTERMEDIA" / "BAJA" oficial del Excel
 }
+
+export interface MunicipiosStats {
+  total: number;
+  con_coordenadas: number;
+  por_zona: Record<ZonaSismica, number>;
+  por_departamento: Record<string, number>;
+}
+
+export type UseGroup = "I" | "II" | "III" | "IV";
 
 export interface ParametrosEspectro {
   Aa: number;
@@ -22,6 +33,14 @@ export interface ParametrosEspectro {
   T0: number;
   Ts: number;
   TL: number;
+  I: number;
+  use_group: UseGroup;
+}
+
+export interface UseGroupInfo {
+  id: UseGroup;
+  nombre: string;
+  I: number;
 }
 
 export interface PuntoEspectro {
