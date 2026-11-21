@@ -588,6 +588,16 @@ class LinearOPSBuilder:
         wall_joints = getattr(self, "_wall_joints", set())
         valid_fr_j  = getattr(self, "_valid_frame_joints", set())
 
+        # Filtro user-defined: si metadata.rigid_diaphragms esta definido (lista
+        # no None), SOLO los pisos listados son rigidos. Si esta ausente, se
+        # mantiene compat con modelos ETABS importados: todos los pisos con CM
+        # son rigidos (comportamiento historico).
+        rigid_filter = self._m.get("metadata", {}).get("rigid_diaphragms", None)
+        if rigid_filter is not None:
+            rigid_set = set(rigid_filter)
+        else:
+            rigid_set = None  # None = sin filtro (todos rigidos)
+
         # Construir story_joints rastreando labels (para clasificar flotantes)
         story_labels: dict[str, list[str]] = {}
         for label, jd in joints.items():
@@ -600,6 +610,10 @@ class LinearOPSBuilder:
         for story, cm_info in cm_nodes.items():
             labels = story_labels.get(story, [])
             if not labels:
+                continue
+            if rigid_set is not None and story not in rigid_set:
+                # Diafragma flexible: no aplicar rigidDiaphragm (joints
+                # mantienen sus DOFs independientes salvo fix en flotantes).
                 continue
             slave_tags = [_joint_tag(l) for l in labels]
             try:

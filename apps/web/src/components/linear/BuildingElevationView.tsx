@@ -31,7 +31,7 @@ interface Props {
   infills?: Record<string, InfillPanel>;
   projectId?: string;
   onModelChanged?: () => void | Promise<void>;
-  onElementClick?: (info: { id: string; type: "wall" | "beam" | "column" | "infill"; label: string }) => void;
+  onElementClick?: (info: { id: string; type: "wall" | "beam" | "column" | "infill"; label: string; shiftKey?: boolean }) => void;
 }
 
 interface PendingPoint { x: number; y: number; jointId?: string }   // x = horizontal, y = z (elevación)
@@ -738,7 +738,7 @@ export default function BuildingElevationView({
                     fill={COLORS.infillFill} stroke={COLORS.infill} strokeWidth={0.8}
                     strokeDasharray={inf.opening_ratio > 0 ? "4 2" : undefined}
                     vectorEffect="non-scaling-stroke"
-                    onClick={() => tool === "select" && onElementClick?.({ id: inf.id, type: "infill", label: inf.id })}
+                    onClick={(e) => tool === "select" && onElementClick?.({ id: inf.id, type: "infill", label: inf.id, shiftKey: e.shiftKey })}
                     style={{ cursor: tool === "select" && onElementClick ? "pointer" : "default" }} />
                   {/* Puntales cruzados (referencia visual) */}
                   <line x1={inf.x1} y1={inf.z1} x2={inf.x2} y2={inf.z2}
@@ -756,7 +756,7 @@ export default function BuildingElevationView({
               <rect key={`w-${w.id}`} x={w.x1} y={w.z1} width={w.x2 - w.x1} height={w.z2 - w.z1}
                 fill={COLORS.wallFill} stroke={COLORS.wall} strokeWidth={1.2}
                 vectorEffect="non-scaling-stroke"
-                onClick={() => tool === "select" && onElementClick?.({ id: w.id, type: "wall", label: w.pier })}
+                onClick={(e) => tool === "select" && onElementClick?.({ id: w.id, type: "wall", label: w.pier, shiftKey: e.shiftKey })}
                 style={{ cursor: tool === "select" && onElementClick ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }}
               />
             ))}
@@ -782,7 +782,7 @@ export default function BuildingElevationView({
                   fill={f.kind === "column" ? COLORS.columnFill : COLORS.beamFill}
                   stroke={f.kind === "column" ? COLORS.column : COLORS.beam}
                   strokeWidth={1.0} vectorEffect="non-scaling-stroke"
-                  onClick={() => tool === "select" && onElementClick?.({ id: f.id, type: f.kind, label: f.id })}
+                  onClick={(e) => tool === "select" && onElementClick?.({ id: f.id, type: f.kind, label: f.id, shiftKey: e.shiftKey })}
                   style={{ cursor: tool === "select" && onElementClick ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }} />
               );
             })}

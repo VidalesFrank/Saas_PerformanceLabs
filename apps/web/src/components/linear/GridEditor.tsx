@@ -11,16 +11,19 @@
 import { useEffect, useState } from "react";
 import type { GridDefinition, GridAxis, StoryDef } from "@/lib/structural-types";
 import { structuralEditorApi } from "@/lib/structural-api";
+import { ApiError } from "@/lib/api";
 
 interface Props {
   projectId: string;
   initial?: GridDefinition;
+  /** Lista de pisos con diafragma rígido (viene de `fullModel.metadata.rigid_diaphragms`). */
+  rigidDiaphragms?: string[];
   onSaved?: () => void | Promise<void>;
 }
 
 const EMPTY: GridDefinition = { axes_x: [], axes_y: [], stories: [] };
 
-export default function GridEditor({ projectId, initial, onSaved }: Props) {
+export default function GridEditor({ projectId, initial, rigidDiaphragms, onSaved }: Props) {
   const [grid, setGrid] = useState<GridDefinition>(initial ?? EMPTY);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -109,6 +112,10 @@ export default function GridEditor({ projectId, initial, onSaved }: Props) {
         stories={grid.stories}
         onChange={(s) => update({ stories: s })}
         onAdd={addStory}
+        projectId={projectId}
+        gridDirty={dirty}
+        onCopiedStory={onSaved}
+        rigidDiaphragms={rigidDiaphragms ?? []}
       />
     </div>
   );
@@ -163,12 +170,68 @@ function AxisList({ title, axes, onChange, onAdd, example }: {
   );
 }
 
-function StoryList({ stories, onChange, onAdd }: {
+function StoryList({
+  stories, onChange, onAdd, projectId, gridDirty, onCopiedStory, rigidDiaphragms,
+}: {
   stories: StoryDef[];
   onChange: (s: StoryDef[]) => void;
   onAdd: () => void;
+  projectId: string;
+  gridDirty: boolean;
+  onCopiedStory?: () => void | Promise<void>;
+  rigidDiaphragms: string[];
 }) {
   const totalH = stories.reduce((a, s) => a + s.height_m, 0);
+  const [copySourceIdx, setCopySourceIdx] = useState<number | null>(null);
+  const [copyTarget,    setCopyTarget]    = useState<string>("");
+  const [copying,       setCopying]       = useState(false);
+  const [copyError,     setCopyError]     = useState<string | null>(null);
+  const [copyResult,    setCopyResult]    = useState<{ frames: number; shells: number; joints: number } | null>(null);
+  const [rigidBusy,     setRigidBusy]     = useState(false);
+  const [rigidError,    setRigidError]    = useState<string | null>(null);
+
+  async function toggleRigid(storyName: string) {
+    setRigidBusy(true); setRigidError(null);
+    try {
+      const nextSet = new Set(rigidDiaphragms);
+      if (nextSet.has(storyName)) nextSet.delete(storyName);
+      else                        nextSet.add(storyName);
+      await structuralEditorApi.upsertRigidDiaphragms(projectId, [...nextSet]);
+      await onCopiedStory?.();
+    } catch (e) {
+      setRigidError(e instanceof ApiError ? e.message : (e as Error).message);
+    } finally {
+      setRigidBusy(false);
+    }
+  }
+
+  async function handleCopy() {
+    if (copySourceIdx === null || !copyTarget) return;
+    const source = stories[copySourceIdx].name;
+    if (source === copyTarget) return;
+    setCopying(true); setCopyError(null); setCopyResult(null);
+    try {
+      const r = await structuralEditorApi.copyStory(projectId, {
+        source_story: source,
+        target_story: copyTarget,
+      });
+      setCopyResult({
+        frames: r.frames_created,
+        shells: r.shells_created,
+        joints: r.joints_created,
+      });
+      await onCopiedStory?.();
+      // Deja el panel abierto 2 s para que el usuario vea el resumen
+      setTimeout(() => {
+        setCopySourceIdx(null); setCopyResult(null); setCopyTarget("");
+      }, 2200);
+    } catch (e) {
+      setCopyError(e instanceof ApiError ? e.message : (e as Error).message);
+    } finally {
+      setCopying(false);
+    }
+  }
+
   return (
     <div className="border border-[var(--border)] rounded-lg bg-[var(--surface-2)] p-3">
       <div className="flex items-center justify-between mb-2">
@@ -179,35 +242,106 @@ function StoryList({ stories, onChange, onAdd }: {
           + Piso
         </button>
       </div>
+      {rigidError && (
+        <div className="text-[10px] px-2 py-1 rounded bg-rose-500/10 border border-rose-500/30 text-rose-500">
+          {rigidError}
+        </div>
+      )}
       {stories.length === 0 ? (
         <p className="text-[11px] text-[var(--text-muted)]">Sin pisos definidos. Añade al menos uno para dibujar en 3D.</p>
       ) : (
         <ul className="space-y-1">
-          {stories.map((s, i) => (
-            <li key={i} className="flex items-center gap-2 text-[11px]">
-              <span className="text-[10px] text-[var(--text-muted)] w-8">#{i + 1}</span>
-              <input
-                value={s.name}
-                onChange={(e) => {
-                  const next = [...stories]; next[i] = { ...s, name: e.target.value }; onChange(next);
-                }}
-                className="w-32 bg-[var(--surface)] border border-[var(--border)] rounded px-1.5 py-0.5"
-              />
-              <input
-                type="number" step="0.1" min={0.1}
-                value={s.height_m}
-                onChange={(e) => {
-                  const next = [...stories]; next[i] = { ...s, height_m: Math.max(0.1, Number(e.target.value) || 3.0) }; onChange(next);
-                }}
-                className="w-20 bg-[var(--surface)] border border-[var(--border)] rounded px-1.5 py-0.5 font-mono"
-              />
-              <span className="text-[10px] text-[var(--text-muted)]">m alto</span>
-              <button
-                onClick={() => onChange(stories.filter((_, j) => j !== i))}
-                className="ml-auto text-[10px] text-red-600 hover:underline"
-              >Eliminar</button>
-            </li>
-          ))}
+          {stories.map((s, i) => {
+            const otherStories = stories.filter((_, j) => j !== i).map((st) => st.name);
+            const canCopy = !gridDirty && otherStories.length > 0;
+            const isExpanded = copySourceIdx === i;
+            return (
+              <li key={i} className="flex flex-col gap-1">
+                <div className="flex items-center gap-2 text-[11px]">
+                  <span className="text-[10px] text-[var(--text-muted)] w-8">#{i + 1}</span>
+                  <input
+                    value={s.name}
+                    onChange={(e) => {
+                      const next = [...stories]; next[i] = { ...s, name: e.target.value }; onChange(next);
+                    }}
+                    className="w-32 bg-[var(--surface)] border border-[var(--border)] rounded px-1.5 py-0.5"
+                  />
+                  <input
+                    type="number" step="0.1" min={0.1}
+                    value={s.height_m}
+                    onChange={(e) => {
+                      const next = [...stories]; next[i] = { ...s, height_m: Math.max(0.1, Number(e.target.value) || 3.0) }; onChange(next);
+                    }}
+                    className="w-20 bg-[var(--surface)] border border-[var(--border)] rounded px-1.5 py-0.5 font-mono"
+                  />
+                  <span className="text-[10px] text-[var(--text-muted)]">m alto</span>
+                  <label
+                    className="ml-2 flex items-center gap-1 text-[10px] text-[var(--text-muted)] hover:text-[var(--text)] cursor-pointer"
+                    title="Si está marcado, todos los nodos del piso se consideran rígidamente conectados (master-slave al centro de masas)"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={rigidDiaphragms.includes(s.name)}
+                      onChange={() => toggleRigid(s.name)}
+                      disabled={rigidBusy || gridDirty}
+                      className="accent-indigo-600"
+                    />
+                    Diafragma rígido
+                  </label>
+                  <button
+                    onClick={() => {
+                      if (isExpanded) { setCopySourceIdx(null); setCopyError(null); setCopyResult(null); }
+                      else           { setCopySourceIdx(i); setCopyTarget(otherStories[0] ?? ""); setCopyError(null); setCopyResult(null); }
+                    }}
+                    disabled={!canCopy}
+                    title={
+                      gridDirty      ? "Guarda el grid primero" :
+                      !otherStories.length ? "Define al menos otro piso para copiar" :
+                      "Copiar elementos de este piso a otro"
+                    }
+                    className="ml-auto text-[10px] px-2 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text)] disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {isExpanded ? "Cancelar" : "⎘ Copiar"}
+                  </button>
+                  <button
+                    onClick={() => onChange(stories.filter((_, j) => j !== i))}
+                    className="text-[10px] text-red-600 hover:underline"
+                  >Eliminar</button>
+                </div>
+
+                {isExpanded && (
+                  <div className="ml-10 flex flex-wrap items-center gap-2 text-[11px] rounded-md border border-indigo-400/40 bg-indigo-500/5 px-2.5 py-2">
+                    <span className="text-[var(--text-muted)]">Copiar elementos de</span>
+                    <span className="font-mono text-[var(--text)]">{s.name}</span>
+                    <span className="text-[var(--text-muted)]">a</span>
+                    <select
+                      value={copyTarget}
+                      onChange={(e) => setCopyTarget(e.target.value)}
+                      disabled={copying}
+                      className="bg-[var(--surface)] border border-[var(--border)] rounded px-1.5 py-0.5 font-mono"
+                    >
+                      {otherStories.map((n) => <option key={n} value={n}>{n}</option>)}
+                    </select>
+                    <button
+                      onClick={handleCopy}
+                      disabled={copying || !copyTarget}
+                      className="px-3 py-0.5 rounded bg-indigo-600 text-white font-semibold disabled:opacity-40 disabled:cursor-not-allowed hover:bg-indigo-700"
+                    >
+                      {copying ? "Copiando…" : "Confirmar"}
+                    </button>
+                    {copyResult && (
+                      <span className="text-emerald-500 font-medium">
+                        ✓ {copyResult.frames} frames + {copyResult.shells} shells + {copyResult.joints} joints nuevos
+                      </span>
+                    )}
+                    {copyError && (
+                      <span className="text-rose-500">{copyError}</span>
+                    )}
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

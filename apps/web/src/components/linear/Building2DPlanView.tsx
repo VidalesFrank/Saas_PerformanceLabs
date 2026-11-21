@@ -20,6 +20,7 @@ import type {
   DrawingTool,
 } from "@/lib/structural-types";
 import { structuralEditorApi } from "@/lib/structural-api";
+import { ApiError } from "@/lib/api";
 
 interface Props {
   geometry: ModelGeometry;
@@ -34,7 +35,9 @@ interface Props {
   projectId?: string;
   /** Callback tras crear/eliminar elementos — la página debe recargar el modelo. */
   onModelChanged?: () => void | Promise<void>;
-  onElementClick?: (info: { id: string; type: "slab" | "wall" | "beam" | "column" | "infill"; label: string }) => void;
+  onElementClick?: (info: { id: string; type: "slab" | "wall" | "beam" | "column" | "infill"; label: string; shiftKey?: boolean }) => void;
+  /** Selección rectangular (rubber-band con Shift+drag) — recibe lote de elementos encerrados. */
+  onMultiSelect?: (items: Array<{ id: string; type: "slab" | "wall" | "beam" | "column" }>) => void;
 }
 
 interface HoverInfo { x: number; y: number; label: string; section?: string; extra?: string; }
@@ -70,6 +73,7 @@ export default function Building2DPlanView({
   projectId,
   onModelChanged,
   onElementClick,
+  onMultiSelect,
 }: Props) {
   const canEdit = !!projectId;
 
@@ -108,6 +112,14 @@ export default function Building2DPlanView({
   const [defaultMasonry, setDefaultMasonry] = useState<string>("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+
+  // ── Drag de joints (tool "move") ────────────────────────────────────────
+  const dragJointRef = useRef<{ id: string; originX: number; originY: number } | null>(null);
+  const [jointPreview, setJointPreview] = useState<{ id: string; x: number; y: number } | null>(null);
+
+  // ── Rubber-band (shift+drag en tool "select") ───────────────────────────
+  const rubberRef = useRef<{ x0: number; y0: number } | null>(null);
+  const [rubber, setRubber] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
 
   // Auto-selecciona sección por defecto cuando cambian las secciones disponibles
   useEffect(() => {
@@ -234,11 +246,12 @@ export default function Building2DPlanView({
   }, [vbX, vbY, vbW, vbH]);
 
   // ── Snap: prioridad joint existente > intersección de grid ────────────────
-  const snapPoint = useCallback((mx: number, my: number): PendingPoint => {
+  const snapPoint = useCallback((mx: number, my: number, excludeJointId?: string): PendingPoint => {
     const tol = Math.max(rawW, rawH) * 0.015 / zoom;   // ~1.5% del span, ajustado por zoom
     // Joints existentes
     let bestJoint: { id: string; x: number; y: number; d: number } | null = null;
     for (const j of jointsInStory) {
+      if (excludeJointId && j.id === excludeJointId) continue;
       const d = Math.hypot(j.x - mx, j.y - my);
       if (d < tol && (!bestJoint || d < bestJoint.d)) {
         bestJoint = { id: j.id, x: j.x, y: j.y, d };
@@ -264,11 +277,31 @@ export default function Building2DPlanView({
   }, []);
   const onMouseDown = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
     if (e.button !== 0) return;
+    // Shift+drag en modo select con target = SVG → rubber-band
+    if (tool === "select" && e.shiftKey && e.target === svgRef.current && canEdit) {
+      const pt = svgToModel(e.clientX, e.clientY);
+      if (pt) {
+        rubberRef.current = { x0: pt.x, y0: pt.y };
+        setRubber({ x0: pt.x, y0: pt.y, x1: pt.x, y1: pt.y });
+      }
+      return;
+    }
     dragRef.current = { x: e.clientX, y: e.clientY, startPan: { ...pan }, moved: false };
-  }, [pan]);
+  }, [pan, tool, canEdit, svgToModel]);
   const onMouseMove = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
     const pt = svgToModel(e.clientX, e.clientY);
     if (pt) setPointerXY(pt);
+    // Drag de joint — tiene prioridad sobre pan
+    if (dragJointRef.current && pt) {
+      const sp = snapPoint(pt.x, pt.y, dragJointRef.current.id);
+      setJointPreview({ id: dragJointRef.current.id, x: sp.x, y: sp.y });
+      return;
+    }
+    // Rubber-band activo
+    if (rubberRef.current && pt) {
+      setRubber({ x0: rubberRef.current.x0, y0: rubberRef.current.y0, x1: pt.x, y1: pt.y });
+      return;
+    }
     if (!dragRef.current || !svgRef.current) return;
     const dx = e.clientX - dragRef.current.x;
     const dy = e.clientY - dragRef.current.y;
@@ -280,8 +313,75 @@ export default function Building2DPlanView({
       x: dragRef.current.startPan.x - dx * scaleX,
       y: dragRef.current.startPan.y - dy * scaleY,
     });
-  }, [vbW, vbH, svgToModel]);
-  const endDrag = useCallback(() => { dragRef.current = null; }, []);
+  }, [vbW, vbH, svgToModel, snapPoint]);
+
+  // Commit del drag de joint vía PATCH, o cierre del drag de pan / rubber-band
+  const endDrag = useCallback(async () => {
+    if (dragJointRef.current && jointPreview && projectId) {
+      const { id, originX, originY } = dragJointRef.current;
+      const moved = Math.hypot(jointPreview.x - originX, jointPreview.y - originY) > 1e-4;
+      dragJointRef.current = null;
+      const preview = jointPreview;
+      setJointPreview(null);
+      if (moved) {
+        setSaving(true); setSaveError(null);
+        try {
+          await structuralEditorApi.updateJoint(projectId, id, { x: preview.x, y: preview.y });
+          await onModelChanged?.();
+        } catch (e) {
+          setSaveError(e instanceof ApiError ? e.message : (e as Error).message);
+        } finally {
+          setSaving(false);
+        }
+      }
+      return;
+    }
+    // Rubber-band — calcular elementos encerrados y emitir batch
+    if (rubberRef.current && rubber && onMultiSelect) {
+      const x0 = Math.min(rubber.x0, rubber.x1);
+      const x1 = Math.max(rubber.x0, rubber.x1);
+      const y0 = Math.min(rubber.y0, rubber.y1);
+      const y1 = Math.max(rubber.y0, rubber.y1);
+      rubberRef.current = null;
+      setRubber(null);
+      if (Math.hypot(x1 - x0, y1 - y0) < 0.3) return;  // click, no drag real
+      const inside = (x: number, y: number) => x >= x0 && x <= x1 && y >= y0 && y <= y1;
+      const hits: Array<{ id: string; type: "slab" | "wall" | "beam" | "column" }> = [];
+      // Columnas: joint único
+      for (const [id, f] of framesInStory) {
+        if (f.element_type !== "column") continue;
+        const ji = geometry.joints[f.joint_i];
+        if (ji && inside(ji.x, ji.y)) hits.push({ id, type: "column" });
+      }
+      // Vigas: centroide
+      for (const [id, f] of framesInStory) {
+        if (f.element_type !== "beam") continue;
+        const ji = geometry.joints[f.joint_i];
+        const jj = geometry.joints[f.joint_j];
+        if (!ji || !jj) continue;
+        const cx = (ji.x + jj.x) / 2, cy = (ji.y + jj.y) / 2;
+        if (inside(cx, cy)) hits.push({ id, type: "beam" });
+      }
+      // Losas: centroide del polígono
+      for (const [id, s] of slabsInStory) {
+        const pts = s.joints.map((jl) => geometry.joints[jl]).filter(Boolean);
+        if (pts.length < 3) continue;
+        const cx = pts.reduce((a, p) => a + p.x, 0) / pts.length;
+        const cy = pts.reduce((a, p) => a + p.y, 0) / pts.length;
+        if (inside(cx, cy)) hits.push({ id, type: "slab" });
+      }
+      // Muros: centroide del primer shell del grupo
+      for (const g of wallsInStory) {
+        if (g.allXY.length === 0) continue;
+        const cx = g.allXY.reduce((a, p) => a + p.x, 0) / g.allXY.length;
+        const cy = g.allXY.reduce((a, p) => a + p.y, 0) / g.allXY.length;
+        if (inside(cx, cy) && g.shell_ids[0]) hits.push({ id: g.shell_ids[0], type: "wall" });
+      }
+      onMultiSelect(hits);
+      return;
+    }
+    dragRef.current = null;
+  }, [jointPreview, projectId, onModelChanged, rubber, onMultiSelect, framesInStory, slabsInStory, wallsInStory, geometry.joints]);
   const resetView = useCallback(() => { setZoom(1); setPan({ x: 0, y: 0 }); }, []);
   useEffect(() => { resetView(); }, [story, resetView]);
 
@@ -534,7 +634,7 @@ export default function Building2DPlanView({
         strokeLinejoin="round" vectorEffect="non-scaling-stroke"
         onMouseEnter={(e) => setHover({ x: e.clientX, y: e.clientY, label: id, section, extra: "Losa" })}
         onMouseLeave={() => setHover(null)}
-        onClick={() => tool === "select" && onElementClick?.({ id, type: "slab", label: id })}
+        onClick={(e) => tool === "select" && onElementClick?.({ id, type: "slab", label: id, shiftKey: e.shiftKey })}
         style={{ cursor: onElementClick && tool === "select" ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }}
       />
     );
@@ -565,7 +665,7 @@ export default function Building2DPlanView({
           extra: `Muro · lw=${lw.toFixed(2)}m tw=${twReal.toFixed(3)}m · ${g.shell_ids.length} sub-paneles`,
         })}
         onMouseLeave={() => setHover(null)}
-        onClick={() => tool === "select" && onElementClick?.({ id: firstId, type: "wall", label: g.pier })}
+        onClick={(e) => tool === "select" && onElementClick?.({ id: firstId, type: "wall", label: g.pier, shiftKey: e.shiftKey })}
         style={{ cursor: onElementClick && tool === "select" ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }}
       />
     );
@@ -585,7 +685,7 @@ export default function Building2DPlanView({
         vectorEffect="non-scaling-stroke"
         onMouseEnter={(e) => setHover({ x: e.clientX, y: e.clientY, label: id, section, extra: `Columna · h=${h.toFixed(2)}m b=${b.toFixed(2)}m` })}
         onMouseLeave={() => setHover(null)}
-        onClick={() => tool === "select" && onElementClick?.({ id, type: "column", label: id })}
+        onClick={(e) => tool === "select" && onElementClick?.({ id, type: "column", label: id, shiftKey: e.shiftKey })}
         style={{ cursor: onElementClick && tool === "select" ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }}
       />
     );
@@ -602,7 +702,7 @@ export default function Building2DPlanView({
         strokeLinejoin="miter" vectorEffect="non-scaling-stroke"
         onMouseEnter={(e) => setHover({ x: e.clientX, y: e.clientY, label: id, section, extra: `Viga · L=${length.toFixed(2)}m b=${bWidth.toFixed(2)}m` })}
         onMouseLeave={() => setHover(null)}
-        onClick={() => tool === "select" && onElementClick?.({ id, type: "beam", label: id })}
+        onClick={(e) => tool === "select" && onElementClick?.({ id, type: "beam", label: id, shiftKey: e.shiftKey })}
         style={{ cursor: onElementClick && tool === "select" ? "pointer" : "default", pointerEvents: tool === "select" ? "auto" : "none" }}
       />
     );
@@ -689,7 +789,11 @@ export default function Building2DPlanView({
     return snapPoint(pointerXY.x, pointerXY.y);
   }, [canEdit, tool, pointerXY, snapPoint]);
 
-  const svgCursor = dragRef.current ? "grabbing" : (tool !== "select" && canEdit ? "crosshair" : "grab");
+  const svgCursor =
+    dragJointRef.current ? "grabbing" :
+    dragRef.current ? "grabbing" :
+    tool === "move" ? "default" :
+    (tool !== "select" && canEdit ? "crosshair" : "grab");
 
   return (
     <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] overflow-hidden">
@@ -728,6 +832,7 @@ export default function Building2DPlanView({
         <div className="px-4 py-2 border-b border-[var(--border)] bg-[var(--surface)] flex items-center gap-2 flex-wrap text-xs">
           <span className="text-[var(--text-muted)] uppercase tracking-wider text-[10px]">Herramienta</span>
           <ToolButton active={tool === "select"} onClick={() => setTool("select")} label="Seleccionar" hotkey="S" />
+          <ToolButton active={tool === "move"}   onClick={() => setTool("move")}   label="Mover"       hotkey="X" />
           <ToolButton active={tool === "column"} onClick={() => setTool("column")} label="Columna" hotkey="C" />
           <ToolButton active={tool === "beam"}   onClick={() => setTool("beam")}   label="Viga"    hotkey="V" />
           <ToolButton active={tool === "wall"}   onClick={() => setTool("wall")}   label="Muro"    hotkey="M" />
@@ -775,7 +880,8 @@ export default function Building2DPlanView({
           )}
 
           <span className="ml-auto text-[10px] font-mono text-[var(--text-muted)]">
-            {tool === "select" && "Modo selección"}
+            {tool === "select" && "Modo selección · clic simple / Shift+clic acumula / Shift+arrastrar rectángulo"}
+            {tool === "move"   && "Arrastra un joint para moverlo (los elementos conectados lo siguen)"}
             {tool === "column" && `Clic para colocar columna · z=${(geometry.stories[story]?.elevation_m ?? 0).toFixed(2)}m`}
             {tool === "beam"   && `Clic 2 puntos para viga · ${pending.length}/2`}
             {tool === "wall"   && `Clic 2 esquinas del muro · ${pending.length}/2`}
@@ -826,6 +932,53 @@ export default function Building2DPlanView({
           })}
           {showWalls && wallsInStory.map((g) => renderWallGroup(g))}
 
+          {/* Joint handles — solo en modo "move" ─────────────────────── */}
+          {tool === "move" && canEdit && jointsInStory.map((j) => {
+            const isDragging = dragJointRef.current?.id === j.id;
+            const px = isDragging && jointPreview ? jointPreview.x : j.x;
+            const py = isDragging && jointPreview ? jointPreview.y : j.y;
+            const handleMouseDown = (e: React.MouseEvent) => {
+              e.stopPropagation();
+              dragJointRef.current = { id: j.id, originX: j.x, originY: j.y };
+              setJointPreview({ id: j.id, x: j.x, y: j.y });
+            };
+            return (
+              <g key={`handle-${j.id}`}>
+                {/* Línea fantasma desde posición original */}
+                {isDragging && (
+                  <line
+                    x1={j.x} y1={j.y} x2={px} y2={py}
+                    stroke="#f59e0b" strokeWidth={1.2} strokeDasharray="4 3"
+                    vectorEffect="non-scaling-stroke" style={{ pointerEvents: "none" }}
+                  />
+                )}
+                {/* Círculo invisible grande (target de clic) */}
+                <circle
+                  cx={px} cy={py} r={0.35}
+                  fill="transparent"
+                  onMouseDown={handleMouseDown}
+                  style={{ cursor: "grab" }}
+                />
+                {/* Dot visible */}
+                <circle
+                  cx={px} cy={py} r={0.22}
+                  fill={isDragging ? "#f59e0b" : "#6366f1"}
+                  stroke="#fff" strokeWidth={1.2}
+                  vectorEffect="non-scaling-stroke"
+                  style={{ pointerEvents: "none" }}
+                />
+                {isDragging && (
+                  <text x={px} y={py - 0.5}
+                    fill="#f59e0b" fontSize={Math.max(0.3, rawH / 100)}
+                    textAnchor="middle" style={{ pointerEvents: "none", fontWeight: 600 }}
+                  >
+                    {j.id} → ({px.toFixed(2)}, {py.toFixed(2)})
+                  </text>
+                )}
+              </g>
+            );
+          })}
+
           {showLabels && wallLabels.map(({ pier, cx, cy }) => (
             <text key={`lbl-${pier}`} x={cx} y={cy}
               fill={COLORS.wallLbl} fontSize={labelFontSize}
@@ -867,6 +1020,22 @@ export default function Building2DPlanView({
                 />
               )}
             </>
+          )}
+
+          {/* Rubber-band rectangle (shift+drag) */}
+          {rubber && (
+            <rect
+              x={Math.min(rubber.x0, rubber.x1)}
+              y={Math.min(rubber.y0, rubber.y1)}
+              width={Math.abs(rubber.x1 - rubber.x0)}
+              height={Math.abs(rubber.y1 - rubber.y0)}
+              fill="rgba(99, 102, 241, 0.08)"
+              stroke="#6366f1"
+              strokeWidth={1.2}
+              strokeDasharray="4 3"
+              vectorEffect="non-scaling-stroke"
+              style={{ pointerEvents: "none" }}
+            />
           )}
 
           {/* Snap crosshair */}
