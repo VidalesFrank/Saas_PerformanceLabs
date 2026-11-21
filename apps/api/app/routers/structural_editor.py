@@ -243,6 +243,55 @@ class ShellCreate(BaseModel):
     story: str = ""
 
 
+class CopyStoryRequest(BaseModel):
+    source_story: str
+    target_story: str
+    include_frames: bool = True    # columnas y vigas
+    include_shells: bool = True    # muros y losas
+    xy_tol_m: float = 0.05         # tolerancia para reusar joints existentes
+
+
+class LoadPatternsRequest(BaseModel):
+    patterns: list[str]
+
+
+class LineLoadRequest(BaseModel):
+    loads: dict[str, float]        # {pattern: wz_kN_m} — carga uniforme Z en viga
+
+
+class ShellLoadRequest(BaseModel):
+    loads: dict[str, float]        # {pattern: kN_m2} — presion uniforme sobre losa
+
+
+class RigidDiaphragmsRequest(BaseModel):
+    rigid_stories: list[str]       # lista de nombres de pisos con diafragma rigido
+
+
+class ElementRef(BaseModel):
+    kind: str                      # "column" | "beam" | "wall" | "slab"
+    id:   str
+
+
+class MirrorRequest(BaseModel):
+    elements: list[ElementRef]
+    axis:     str                  # "x" (refleja Y) | "y" (refleja X)
+    coord:    float                # coordenada de la linea espejo
+    xy_tol_m: float = 0.05
+
+
+class ShellReplicateRequest(BaseModel):
+    dx:    float
+    dy:    float
+    count: int                     # total incluyendo el original, min 2
+    xy_tol_m: float = 0.05
+
+
+class SteelSectionCreate(BaseModel):
+    name:       str                # nombre user-facing de la seccion
+    shape_name: str                # nombre AISC: "W24X55", "HSS8X8X1/2", "PIPE8STD"
+    grade:      str = "A992"       # grado ASTM: "A36", "A572Gr50", "A992", "A500GrB-Round", "A500GrC-Rect", "A913Gr65"
+
+
 # ── Lectura del modelo ────────────────────────────────────────────────────────
 
 @router.get("/{project_id}/model-data")
@@ -268,6 +317,8 @@ async def get_model_data(project_id: str, user: CurrentUser, db: DB):
         "grid": model.get("grid", {}),
         "masonryMaterials": model.get("masonryMaterials", {}),
         "infills": model.get("infills", {}),
+        "line_loads":  model.get("line_loads", {}),
+        "shell_loads": model.get("shell_loads", {}),
     }
 
 
@@ -1055,6 +1106,35 @@ async def create_joint(project_id: str, body: JointCreate, user: CurrentUser, db
     return {"ok": True, "id": body.id, "data": joint}
 
 
+@router.patch("/{project_id}/model/joints/{joint_id}")
+async def update_joint(
+    project_id: str, joint_id: str,
+    body: dict,
+    user: CurrentUser, db: DB,
+):
+    """Actualiza la posicion (x, y, z) de un joint. Los frames y shells que
+    lo referencian se mueven con el automaticamente porque lo referencian por
+    ID, no por coordenadas. Util para el drag en el editor 2D."""
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+    joints = model.get("joints", {})
+    if joint_id not in joints:
+        raise HTTPException(status_code=404, detail=f"Joint '{joint_id}' no encontrado")
+
+    j = joints[joint_id]
+    for key in ("x", "y", "z"):
+        if key in body:
+            try:
+                j[key] = round(float(body[key]), 4)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail=f"{key} debe ser numerico")
+    if "story" in body:
+        j["story"] = str(body["story"] or "")
+
+    _save_canonical(project, model)
+    return {"ok": True, "id": joint_id, "data": j}
+
+
 @router.delete("/{project_id}/model/joints/{joint_id}")
 async def delete_joint(project_id: str, joint_id: str, user: CurrentUser, db: DB):
     project = _get_project(project_id, user, db)
@@ -1111,6 +1191,40 @@ async def create_frame(project_id: str, body: FrameCreate, user: CurrentUser, db
     model["metadata"]["n_frames"] = len(frames)
     _save_canonical(project, model)
     return {"ok": True, "id": body.id, "data": frame}
+
+
+@router.patch("/{project_id}/model/frames/{frame_id}")
+async def update_frame(
+    project_id: str, frame_id: str, body: dict,
+    user: CurrentUser, db: DB,
+):
+    """Actualiza seccion, release y/o story de un frame. Campos ausentes
+    no se tocan. release ∈ {"", "i", "j", "ij"} (convencion string)."""
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+    frames = model.get("frames", {})
+    if frame_id not in frames:
+        raise HTTPException(status_code=404, detail=f"Frame '{frame_id}' no encontrado")
+
+    fd = frames[frame_id]
+    if "section" in body:
+        section = str(body["section"] or "")
+        if section and section not in model.get("sections", {}):
+            raise HTTPException(status_code=422, detail=f"section '{section}' no existe")
+        fd["section"] = section
+    if "release" in body:
+        rel = str(body["release"] or "")
+        if rel not in ("", "i", "j", "ij"):
+            raise HTTPException(status_code=422, detail="release ∈ {'', 'i', 'j', 'ij'}")
+        if rel:
+            fd["release"] = rel
+        else:
+            fd.pop("release", None)
+    if "story" in body:
+        fd["story"] = str(body["story"] or "")
+
+    _save_canonical(project, model)
+    return {"ok": True, "id": frame_id, "data": fd}
 
 
 @router.delete("/{project_id}/model/frames/{frame_id}")
@@ -1172,3 +1286,677 @@ async def delete_shell(project_id: str, shell_id: str, user: CurrentUser, db: DB
     model["metadata"]["n_shells"] = len(shells)
     _save_canonical(project, model)
     return {"ok": True, "deleted": shell_id}
+
+
+# ── Copiar piso completo (replicar elementos a otro story) ────────────────────
+
+@router.post("/{project_id}/model/stories/copy")
+async def copy_story(project_id: str, body: CopyStoryRequest, user: CurrentUser, db: DB):
+    """Duplica todos los elementos (columnas + vigas + muros + losas) del piso
+    `source_story` al piso `target_story`.
+
+    Convención ETABS: un elemento "pertenece" a un story cuando su joint_j (top)
+    está en la elevación de ese story. Los joints se translan verticalmente por
+    `delta = target_elev - source_elev` (y análogamente para los bottom-joints
+    de columnas). Si ya existe un joint cercano (dentro de xy_tol_m) en la
+    elevación destino, se reusa en vez de crear uno nuevo.
+
+    Returns: resumen de elementos nuevos + warnings.
+    """
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+
+    if body.source_story == body.target_story:
+        raise HTTPException(status_code=422, detail="source_story y target_story deben ser distintos")
+
+    stories = model.get("stories", {})
+    if body.source_story not in stories:
+        raise HTTPException(status_code=422, detail=f"source_story '{body.source_story}' no existe")
+    if body.target_story not in stories:
+        raise HTTPException(status_code=422, detail=f"target_story '{body.target_story}' no existe")
+
+    src = stories[body.source_story]
+    tgt = stories[body.target_story]
+    src_top    = float(src.get("elevation_m", 0.0))
+    src_h      = float(src.get("height_m", 0.0))
+    src_bottom = src_top - src_h
+    tgt_top    = float(tgt.get("elevation_m", 0.0))
+    tgt_h      = float(tgt.get("height_m", src_h))
+    tgt_bottom = tgt_top - tgt_h
+
+    joints = model.setdefault("joints", {})
+    frames = model.setdefault("frames", {})
+    shells = model.setdefault("shells", {})
+    tol    = float(body.xy_tol_m)
+
+    joint_map: dict[str, str] = {}   # old_id -> new_id
+    joints_created: list[str] = []
+    joints_reused:  list[str] = []
+    warnings:       list[str] = []
+
+    def _unique_id(prefix: str, pool: dict) -> str:
+        """Genera un ID único añadiendo sufijo numérico si hay colisión."""
+        if prefix not in pool:
+            return prefix
+        n = 1
+        while f"{prefix}_{n}" in pool:
+            n += 1
+        return f"{prefix}_{n}"
+
+    def _ensure_joint_at_target(old_id: str, level: str) -> str | None:
+        """Obtiene o crea un joint destino.
+
+        level ∈ {"top", "bottom"} indica si el joint original estaba en el
+        top o bottom del source story → queda en el nivel análogo del target.
+        """
+        if old_id in joint_map:
+            return joint_map[old_id]
+        j = joints.get(old_id)
+        if j is None:
+            warnings.append(f"Joint '{old_id}' referenciado no existe; se omite elemento")
+            return None
+        x = float(j.get("x", 0.0))
+        y = float(j.get("y", 0.0))
+        new_z = tgt_top if level == "top" else tgt_bottom
+
+        # Reusar joint existente si hay uno cercano en la elevación destino
+        for jid, jd in joints.items():
+            if (abs(float(jd.get("x", 0.0)) - x) < tol
+                and abs(float(jd.get("y", 0.0)) - y) < tol
+                and abs(float(jd.get("z", 0.0)) - new_z) < tol):
+                joint_map[old_id] = jid
+                joints_reused.append(jid)
+                return jid
+
+        # Crear joint nuevo
+        new_id = _unique_id(f"{old_id}__{body.target_story}", joints)
+        joints[new_id] = {
+            "x": round(x, 4),
+            "y": round(y, 4),
+            "z": round(new_z, 4),
+            "story": body.target_story,
+            "is_restrained": False,
+        }
+        joint_map[old_id] = new_id
+        joints_created.append(new_id)
+        return new_id
+
+    frames_created: list[str] = []
+    shells_created: list[str] = []
+
+    # Frames (columnas y vigas) del source
+    if body.include_frames:
+        source_frames = [(fid, fd) for fid, fd in list(frames.items())
+                         if fd.get("story") == body.source_story]
+        for fid, fd in source_frames:
+            el_type = fd.get("element_type")
+            if el_type not in ("column", "beam"):
+                continue
+            ji_old = fd.get("joint_i")
+            jj_old = fd.get("joint_j")
+            ji = joints.get(ji_old, {})
+            jj = joints.get(jj_old, {})
+            if not ji or not jj:
+                warnings.append(f"Frame '{fid}' tiene joints faltantes; se omite")
+                continue
+
+            # Determinar nivel por z (robusto a joints reordenados)
+            z_i = float(ji.get("z", 0.0))
+            z_j = float(jj.get("z", 0.0))
+
+            def level_of(z: float) -> str:
+                if abs(z - src_top) < tol:    return "top"
+                if abs(z - src_bottom) < tol: return "bottom"
+                return "top"  # fallback para beams: todos sus joints están en src_top
+
+            lvl_i = level_of(z_i)
+            lvl_j = level_of(z_j)
+
+            new_ji = _ensure_joint_at_target(ji_old, lvl_i)
+            new_jj = _ensure_joint_at_target(jj_old, lvl_j)
+            if new_ji is None or new_jj is None:
+                continue
+
+            new_fid = _unique_id(f"{fid}__{body.target_story}", frames)
+            frames[new_fid] = {
+                "joint_i":      new_ji,
+                "joint_j":      new_jj,
+                "element_type": el_type,
+                "story":        body.target_story,
+                "section":      fd.get("section", ""),
+            }
+            if fd.get("release"):
+                frames[new_fid]["release"] = fd["release"]
+            frames_created.append(new_fid)
+
+    # Shells (muros y losas) del source
+    if body.include_shells:
+        source_shells = [(sid, sd) for sid, sd in list(shells.items())
+                         if sd.get("story") == body.source_story]
+        for sid, sd in source_shells:
+            el_type = sd.get("element_type")
+            if el_type not in ("wall", "slab"):
+                continue
+
+            new_joints: list[str] = []
+            skip = False
+            for jid_old in sd.get("joints", []):
+                j = joints.get(jid_old, {})
+                if not j:
+                    warnings.append(f"Shell '{sid}' tiene joints faltantes; se omite")
+                    skip = True
+                    break
+                z = float(j.get("z", 0.0))
+                lvl = "top" if abs(z - src_top) < tol else "bottom"
+                new_jid = _ensure_joint_at_target(jid_old, lvl)
+                if new_jid is None:
+                    skip = True
+                    break
+                new_joints.append(new_jid)
+            if skip or len(new_joints) < 3:
+                continue
+
+            new_sid = _unique_id(f"{sid}__{body.target_story}", shells)
+            shells[new_sid] = {
+                "joints":       new_joints,
+                "section":      sd.get("section", ""),
+                "element_type": el_type,
+                "story":        body.target_story,
+                "thickness_m":  float(sd.get("thickness_m", 0.2)),
+                "pier":         sd.get("pier", ""),
+            }
+            shells_created.append(new_sid)
+
+    # Actualizar contadores del metadata
+    model["metadata"]["n_joints"] = len(joints)
+    model["metadata"]["n_frames"] = len(frames)
+    model["metadata"]["n_shells"] = len(shells)
+
+    _save_canonical(project, model)
+
+    return {
+        "ok": True,
+        "source_story":    body.source_story,
+        "target_story":    body.target_story,
+        "joints_created":  len(joints_created),
+        "joints_reused":   len(joints_reused),
+        "frames_created":  len(frames_created),
+        "shells_created":  len(shells_created),
+        "warnings":        warnings,
+        "new_ids": {
+            "joints": joints_created,
+            "frames": frames_created,
+            "shells": shells_created,
+        },
+    }
+
+
+# ── Cargas: patrones + line_loads (vigas) + shell_loads (losas) ───────────────
+
+@router.put("/{project_id}/model/load-patterns")
+async def upsert_load_patterns(
+    project_id: str, body: LoadPatternsRequest, user: CurrentUser, db: DB,
+):
+    """Reemplaza la lista completa de patrones de carga (DL, LL, SDL, EQX, etc.).
+    Al borrar un patron, se eliminan en cascada todas las cargas asignadas a el
+    (tanto line_loads como shell_loads). Devuelve la lista final + cargas
+    huerfanas removidas."""
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+
+    # Dedup y normaliza
+    new_patterns = sorted({p.strip() for p in body.patterns if p and p.strip()})
+    old_patterns = list(model.get("metadata", {}).get("load_patterns", []))
+    removed = [p for p in old_patterns if p not in new_patterns]
+
+    model.setdefault("metadata", {})["load_patterns"] = new_patterns
+    # Mantener tambien el campo legacy load_patterns para compat con shells import
+    if "load_patterns" in model:
+        model["load_patterns"] = new_patterns
+
+    # Cascade: limpiar line_loads y shell_loads de patrones removidos
+    line_loads  = model.setdefault("line_loads",  {})
+    shell_loads = model.setdefault("shell_loads", {})
+    n_line_cleaned, n_shell_cleaned = 0, 0
+    for fid, lmap in list(line_loads.items()):
+        for p in removed:
+            if p in lmap:
+                del lmap[p]; n_line_cleaned += 1
+        if not lmap:
+            del line_loads[fid]
+    for sid, lmap in list(shell_loads.items()):
+        for p in removed:
+            if p in lmap:
+                del lmap[p]; n_shell_cleaned += 1
+        if not lmap:
+            del shell_loads[sid]
+
+    _save_canonical(project, model)
+    return {
+        "ok": True,
+        "patterns": new_patterns,
+        "removed_patterns": removed,
+        "line_loads_cleaned": n_line_cleaned,
+        "shell_loads_cleaned": n_shell_cleaned,
+    }
+
+
+@router.put("/{project_id}/model/line-loads/{frame_id}")
+async def upsert_line_load(
+    project_id: str, frame_id: str, body: LineLoadRequest,
+    user: CurrentUser, db: DB,
+):
+    """Asigna cargas lineales uniformes (kN/m, direccion gravitacional Z) a
+    una viga para uno o varios patrones. Reemplaza las cargas previas del
+    frame. Patron 'pattern: 0' elimina la asignacion de ese patron."""
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+
+    if frame_id not in model.get("frames", {}):
+        raise HTTPException(status_code=404, detail=f"Frame '{frame_id}' no encontrado")
+
+    valid_patterns = set(model.get("metadata", {}).get("load_patterns", []))
+    unknown = [p for p in body.loads if p not in valid_patterns]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Patrones desconocidos: {unknown}. Crealos primero en load-patterns.",
+        )
+
+    line_loads = model.setdefault("line_loads", {})
+    current = line_loads.get(frame_id, {})
+    for p, val in body.loads.items():
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail=f"Valor no numerico para '{p}'")
+        if abs(v) < 1e-9:
+            current.pop(p, None)
+        else:
+            current[p] = round(v, 4)
+    if current:
+        line_loads[frame_id] = current
+    else:
+        line_loads.pop(frame_id, None)
+
+    _save_canonical(project, model)
+    return {"ok": True, "frame_id": frame_id, "loads": current}
+
+
+@router.put("/{project_id}/model/shell-loads/{shell_id}")
+async def upsert_shell_load(
+    project_id: str, shell_id: str, body: ShellLoadRequest,
+    user: CurrentUser, db: DB,
+):
+    """Asigna presion uniforme (kN/m^2, gravitacional) a una losa por patron.
+    Reemplaza las cargas previas del shell. Patron 'pattern: 0' elimina la
+    asignacion de ese patron."""
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+
+    if shell_id not in model.get("shells", {}):
+        raise HTTPException(status_code=404, detail=f"Shell '{shell_id}' no encontrado")
+
+    valid_patterns = set(model.get("metadata", {}).get("load_patterns", []))
+    unknown = [p for p in body.loads if p not in valid_patterns]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Patrones desconocidos: {unknown}. Crealos primero en load-patterns.",
+        )
+
+    shell_loads = model.setdefault("shell_loads", {})
+    current = shell_loads.get(shell_id, {})
+    for p, val in body.loads.items():
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail=f"Valor no numerico para '{p}'")
+        if abs(v) < 1e-9:
+            current.pop(p, None)
+        else:
+            current[p] = round(v, 4)
+    if current:
+        shell_loads[shell_id] = current
+    else:
+        shell_loads.pop(shell_id, None)
+
+    _save_canonical(project, model)
+    return {"ok": True, "shell_id": shell_id, "loads": current}
+
+
+# ── Diafragmas rigidos por piso ──────────────────────────────────────────────
+
+@router.put("/{project_id}/model/rigid-diaphragms")
+async def upsert_rigid_diaphragms(
+    project_id: str, body: RigidDiaphragmsRequest,
+    user: CurrentUser, db: DB,
+):
+    """Define que pisos tienen diafragma rigido (todos los joints del piso
+    quedan master-slaved al centro de masas del piso durante el analisis).
+    Reemplaza la lista completa."""
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+
+    stories = model.get("stories", {})
+    unknown = [s for s in body.rigid_stories if s not in stories]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Pisos desconocidos: {unknown}. Deben existir en el grid.",
+        )
+
+    rigid_sorted = sorted(set(s for s in body.rigid_stories if s))
+    model.setdefault("metadata", {})["rigid_diaphragms"] = rigid_sorted
+    _save_canonical(project, model)
+    return {"ok": True, "rigid_diaphragms": rigid_sorted}
+
+
+# ── Mirror + Shell replicate (completan Fase 2 de edicion) ───────────────────
+
+def _unique_model_id(prefix: str, pool: dict) -> str:
+    """Devuelve un ID unico anadiendo sufijo numerico."""
+    if prefix not in pool:
+        return prefix
+    n = 1
+    while f"{prefix}_{n}" in pool:
+        n += 1
+    return f"{prefix}_{n}"
+
+
+def _ensure_joint_at(
+    joints: dict, src_id: str, new_xyz: tuple[float, float, float],
+    tol: float, suffix: str,
+) -> str:
+    """Obtiene o crea un joint en la posicion `new_xyz`. Si ya existe uno
+    cerca (dentro de tol en X, Y, Z) lo reusa. Retorna el ID final."""
+    nx, ny, nz = new_xyz
+    # Reuse existente
+    for jid, jd in joints.items():
+        if (abs(float(jd.get("x", 0.0)) - nx) < tol
+            and abs(float(jd.get("y", 0.0)) - ny) < tol
+            and abs(float(jd.get("z", 0.0)) - nz) < tol):
+            return jid
+    # Crear nuevo
+    src = joints.get(src_id, {})
+    new_id = _unique_model_id(f"{src_id}{suffix}", joints)
+    joints[new_id] = {
+        "x": round(nx, 4),
+        "y": round(ny, 4),
+        "z": round(nz, 4),
+        "story": src.get("story", ""),
+        "is_restrained": False,
+    }
+    return new_id
+
+
+@router.post("/{project_id}/model/mirror")
+async def mirror_elements(
+    project_id: str, body: MirrorRequest, user: CurrentUser, db: DB,
+):
+    """Refleja elementos (columnas, vigas, muros, losas) a traves de una linea
+    paralela al eje X o Y a la coordenada `coord`.
+        - axis="x": espejo horizontal (refleja la coordenada Y: y → 2*coord - y)
+        - axis="y": espejo vertical    (refleja la coordenada X: x → 2*coord - x)
+    Crea joints nuevos y elementos nuevos. Reusa joints existentes cercanos."""
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+    joints = model.setdefault("joints", {})
+    frames = model.setdefault("frames", {})
+    shells = model.setdefault("shells", {})
+    tol    = float(body.xy_tol_m)
+
+    if body.axis not in ("x", "y"):
+        raise HTTPException(status_code=422, detail="axis ∈ {'x', 'y'}")
+
+    def reflect(j: dict) -> tuple[float, float, float]:
+        x, y, z = float(j.get("x", 0.0)), float(j.get("y", 0.0)), float(j.get("z", 0.0))
+        if body.axis == "x":
+            return x, 2 * body.coord - y, z
+        else:
+            return 2 * body.coord - x, y, z
+
+    joint_map: dict[str, str] = {}
+    def mapped(src_id: str) -> str:
+        if src_id in joint_map:
+            return joint_map[src_id]
+        j = joints.get(src_id)
+        if j is None:
+            raise HTTPException(status_code=422, detail=f"Joint '{src_id}' no existe")
+        new_id = _ensure_joint_at(joints, src_id, reflect(j), tol, "__mir")
+        joint_map[src_id] = new_id
+        return new_id
+
+    frames_created: list[str] = []
+    shells_created: list[str] = []
+    warnings:       list[str] = []
+
+    for el in body.elements:
+        if el.kind in ("column", "beam"):
+            fd = frames.get(el.id)
+            if not fd:
+                warnings.append(f"Frame '{el.id}' no existe"); continue
+            new_ji = mapped(fd["joint_i"])
+            new_jj = mapped(fd["joint_j"])
+            new_id = _unique_model_id(f"{el.id}__mir", frames)
+            frames[new_id] = {
+                "joint_i": new_ji, "joint_j": new_jj,
+                "element_type": fd["element_type"],
+                "story": fd.get("story", ""),
+                "section": fd.get("section", ""),
+            }
+            if fd.get("release"):
+                frames[new_id]["release"] = fd["release"]
+            frames_created.append(new_id)
+        elif el.kind in ("wall", "slab"):
+            sd = shells.get(el.id)
+            if not sd:
+                warnings.append(f"Shell '{el.id}' no existe"); continue
+            new_joints = [mapped(j) for j in sd.get("joints", [])]
+            if len(new_joints) < 3:
+                warnings.append(f"Shell '{el.id}' tiene <3 joints"); continue
+            # Para muros/losas, invertir orden de joints para mantener orientacion
+            # del normal del polígono tras la reflexion (evita polígono invertido).
+            new_joints = list(reversed(new_joints))
+            new_id = _unique_model_id(f"{el.id}__mir", shells)
+            shells[new_id] = {
+                "joints": new_joints,
+                "section": sd.get("section", ""),
+                "element_type": sd["element_type"],
+                "story": sd.get("story", ""),
+                "thickness_m": float(sd.get("thickness_m", 0.2)),
+                "pier": sd.get("pier", ""),
+            }
+            shells_created.append(new_id)
+        else:
+            warnings.append(f"Kind desconocido '{el.kind}'")
+
+    model["metadata"]["n_joints"] = len(joints)
+    model["metadata"]["n_frames"] = len(frames)
+    model["metadata"]["n_shells"] = len(shells)
+    _save_canonical(project, model)
+    return {
+        "ok": True,
+        "frames_created": len(frames_created),
+        "shells_created": len(shells_created),
+        "joints_reused":  sum(1 for _ in joint_map),  # estimado
+        "warnings": warnings,
+        "new_ids": {"frames": frames_created, "shells": shells_created},
+    }
+
+
+@router.post("/{project_id}/model/shells/{shell_id}/replicate")
+async def replicate_shell(
+    project_id: str, shell_id: str, body: ShellReplicateRequest,
+    user: CurrentUser, db: DB,
+):
+    """Replica un muro o losa en array lineal: N-1 copias trasladadas por
+    multiplos de (dx, dy). Reusa joints existentes cercanos."""
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+    shells = model.setdefault("shells", {})
+    joints = model.setdefault("joints", {})
+
+    sd = shells.get(shell_id)
+    if not sd:
+        raise HTTPException(status_code=404, detail=f"Shell '{shell_id}' no encontrado")
+    if body.count < 2:
+        raise HTTPException(status_code=422, detail="count debe ser >= 2")
+    if abs(body.dx) + abs(body.dy) < 0.001:
+        raise HTTPException(status_code=422, detail="Offset Δx o Δy necesario")
+
+    count  = min(body.count, 50)
+    copies = count - 1
+    tol    = float(body.xy_tol_m)
+
+    shells_created: list[str] = []
+    for k in range(1, copies + 1):
+        odx, ody = body.dx * k, body.dy * k
+        new_joints: list[str] = []
+        for src_jid in sd.get("joints", []):
+            src = joints.get(src_jid, {})
+            new_jid = _ensure_joint_at(
+                joints, src_jid,
+                (float(src.get("x", 0.0)) + odx,
+                 float(src.get("y", 0.0)) + ody,
+                 float(src.get("z", 0.0))),
+                tol, f"__r{k}",
+            )
+            new_joints.append(new_jid)
+        new_sid = _unique_model_id(f"{shell_id}__r{k}", shells)
+        shells[new_sid] = {
+            "joints":       new_joints,
+            "section":      sd.get("section", ""),
+            "element_type": sd["element_type"],
+            "story":        sd.get("story", ""),
+            "thickness_m":  float(sd.get("thickness_m", 0.2)),
+            "pier":         sd.get("pier", ""),
+        }
+        shells_created.append(new_sid)
+
+    model["metadata"]["n_joints"] = len(joints)
+    model["metadata"]["n_shells"] = len(shells)
+    _save_canonical(project, model)
+    return {"ok": True, "shells_created": len(shells_created), "new_ids": shells_created}
+
+
+# ── Catalogo de perfiles AISC + secciones de acero ───────────────────────────
+
+@router.get("/steel/catalog")
+async def get_steel_catalog(user: CurrentUser):
+    """Devuelve el catalogo AISC v15.0 (perfiles + grados ASTM). Usado por
+    la UI para poblar los dropdowns del tab "Acero" en /sections."""
+    from engine.materials.structural_steel import GRADE_PRESETS
+    from engine.sections.steel_shapes import AISC_V15_SHAPES
+
+    # Agrupar por tipo para UI
+    shapes_by_type: dict[str, list[dict]] = {}
+    for name, s in AISC_V15_SHAPES.items():
+        key = s.type.value
+        shapes_by_type.setdefault(key, []).append({
+            "name": name,
+            "A_mm2": round(s.A, 1),
+            "d_mm":  round(s.d, 1),
+            "bf_mm": round(s.bf, 1),
+            "weight_kgm": round(s.weight_kgm, 2),
+            "Ix_mm4": round(s.Ix, 1),
+            "Iy_mm4": round(s.Iy, 1),
+            "Zx_mm3": round(s.Zx, 1),
+            "Zy_mm3": round(s.Zy, 1),
+        })
+    for key in shapes_by_type:
+        shapes_by_type[key].sort(key=lambda d: d["name"])
+
+    grades = [
+        {
+            "name":  p.grade,
+            "fy_mpa": p.fy,
+            "fu_mpa": p.fu,
+            "E_mpa": p.E0,
+            "G_mpa": p.G,
+            "eps_y": round(p.eps_y, 5),
+        }
+        for p in GRADE_PRESETS.values()
+    ]
+
+    return {
+        "shapes_by_type": shapes_by_type,
+        "grades": grades,
+        "total_shapes": len(AISC_V15_SHAPES),
+    }
+
+
+@router.post("/{project_id}/model/steel-sections")
+async def create_steel_section(
+    project_id: str, body: SteelSectionCreate,
+    user: CurrentUser, db: DB,
+):
+    """Crea una seccion metalica usando un perfil AISC + grado ASTM. Auto-crea
+    el material de acero si no existe. Computa A/Iy/Iz/J en SI (m²/m⁴) desde
+    el SteelFrameSection y los almacena en el schema estandar de `sections`
+    para que el `ops_builder` los consuma transparente."""
+    from engine.sections.steel_section import make_steel_section
+
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+
+    if body.name in model.get("sections", {}):
+        raise HTTPException(status_code=409, detail=f"Ya existe una seccion '{body.name}'")
+
+    try:
+        sf = make_steel_section(body.shape_name, body.grade)
+    except KeyError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Auto-crear material de acero si no existe. Nombre canonico: "Steel_<grade>".
+    mat_name = f"Steel_{body.grade}"
+    materials = model.setdefault("materials", {})
+    if mat_name not in materials:
+        materials[mat_name] = {
+            "type":    "steel",
+            "fpc_mpa": 0.0,                       # no aplica para acero
+            "fy_mpa":  round(sf.material.fy, 2),
+            "E_mpa":   round(sf.material.E0, 1),
+            "G_mpa":   round(sf.material.G,  1),
+        }
+        model["metadata"]["n_materials"] = len(materials)
+
+    # Convertir propiedades AISC (mm, mm², mm³, mm⁴) → SI (m, m², m³, m⁴)
+    # Las propiedades del SteelFrameSection vienen en mm. ops_builder espera m.
+    MM2_TO_M2 = 1e-6
+    MM4_TO_M4 = 1e-12
+
+    sec = {
+        "material":    mat_name,
+        "shape":       "steel",                   # tipo logico — ops_builder y UI
+        "shape_type":  "steel",                   # redundante pero explicito
+        "steel_grade": body.grade,
+        "steel_shape": body.shape_name,           # etiqueta AISC para preview
+        "aisc_type":   sf.type.value,             # W | HSS_RECT | PIPE | ...
+        # Dimensiones en m (algunas para preview, no todas aplican a todos los shapes)
+        "h_m":         round(sf.shape.d  * 1e-3, 4),
+        "b_m":         round(sf.shape.bf * 1e-3, 4),
+        "tw_m":        round(sf.shape.tw * 1e-3, 5),
+        "tf_m":        round(sf.shape.tf * 1e-3, 5),
+        "t_des_m":     round(sf.shape.t_des * 1e-3, 5),
+        "OD_m":        round(sf.shape.OD * 1e-3, 4),
+        # Propiedades geometricas en SI — consumidas por ops_builder
+        "A_m2":        round(sf.A  * MM2_TO_M2, 8),
+        "I33_m4":      round(sf.Iz * MM4_TO_M4, 12),   # eje fuerte (AISC Ix)
+        "I22_m4":      round(sf.Iy * MM4_TO_M4, 12),   # eje debil  (AISC Iy)
+        "J_m4":        round(sf.J  * MM4_TO_M4, 12),
+        "E_mpa":       round(sf.E, 1),
+        "G_mpa":       round(sf.G, 1),
+        # Modulos de diseno (AISC F / H)
+        "Zx_m3":       round(sf.Zx * 1e-9, 9),
+        "Zy_m3":       round(sf.Zy * 1e-9, 9),
+        "Sx_m3":       round(sf.Sx * 1e-9, 9),
+        "Sy_m3":       round(sf.Sy * 1e-9, 9),
+        "Mp_x_kNm":    round(sf.Mp_x * 1e-6, 2),       # N·mm → kN·m
+        "Mp_y_kNm":    round(sf.Mp_y * 1e-6, 2),
+        "Py_kN":       round(sf.Py  * 1e-3, 2),
+    }
+    model.setdefault("sections", {})[body.name] = sec
+    model["metadata"]["n_sections"] = len(model["sections"])
+    _save_canonical(project, model)
+    return {"ok": True, "name": body.name, "data": sec, "material_created": mat_name}

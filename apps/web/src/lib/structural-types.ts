@@ -862,6 +862,7 @@ export interface InfillPanel {
 
 export type DrawingTool =
   | "select"
+  | "move"
   | "column"
   | "beam"
   | "wall"
@@ -881,6 +882,8 @@ export interface FullModelData {
     story_names: string[];
     total_height_m: number;
     load_patterns: string[];
+    /** Pisos con diafragma rígido (lista de nombres). Vacía = todos flexibles. */
+    rigid_diaphragms?: string[];
   };
   stories: Record<string, { elevation_m: number; height_m: number }>;
   joints: Record<string, { x: number; y: number; z: number; story: string; is_restrained: boolean }>;
@@ -893,6 +896,10 @@ export interface FullModelData {
   grid?: GridDefinition;
   masonryMaterials?: Record<string, MasonryMaterial>;
   infills?: Record<string, InfillPanel>;
+  /** Cargas lineales sobre vigas: {frame_id: {pattern: kN/m}}. Dirección gravitacional Z. */
+  line_loads?:  Record<string, Record<string, number>>;
+  /** Cargas superficiales sobre losas: {shell_id: {pattern: kN/m²}}. Dirección gravitacional Z. */
+  shell_loads?: Record<string, Record<string, number>>;
 }
 
 /** Resultado del health check del modelo. */
@@ -2345,4 +2352,45 @@ export interface PierResponseData {
     level:     DamageLevel;
     drift_pct: number;
   } | null;
+}
+
+
+// ── Performance CSM (Capacity Spectrum Method ATC-40) ───────────────────────
+
+export interface AdrsCurve {
+  Sa: number[];   // aceleración espectral (g)
+  Sd: number[];   // desplazamiento espectral (m)
+  T:  number[];   // período (s) — vacío para curva de capacidad
+}
+
+export interface PerformancePoint {
+  Sa_pp:     number;
+  Sd_pp:     number;
+  drift_pp:  number;   // deriva de techo en PP (%)
+  beta_eff:  number;   // amortiguamiento efectivo (%)
+  T_eff:     number;
+  converged: boolean;
+}
+
+export interface PerformanceLevelInfo {
+  code:        string;  // "IO" | "LS" | "CP" | "C"
+  nombre:      string;
+  color:       string;
+  description: string;
+}
+
+export interface PerformanceCSMResult {
+  capacity_adrs:     AdrsCurve;
+  demand_elastic:    AdrsCurve;
+  demand_reduced:    AdrsCurve;
+  performance_point: PerformancePoint;
+  performance_level: PerformanceLevelInfo;
+  bilinear_Sa:       number[];
+  bilinear_Sd:       number[];
+  Sy:                number;
+  dy:                number;
+  total_height_m:    number;
+  Aa:                number;
+  Av:                number;
+  soil_type:         string;
 }

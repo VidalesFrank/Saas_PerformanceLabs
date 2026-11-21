@@ -180,6 +180,43 @@ def list_projects(user: CurrentUser, db: DB):
     return [ProjectOut.from_orm_extra(p) for p in projects]
 
 
+def _seed_empty_canonical_model() -> dict:
+    """Modelo canonico vacio pero valido. Sirve de punto de arranque para
+    proyectos construidos desde cero (sin import ETABS/E2K).
+
+    Estructura minima que satisface a `_load_canonical()` del editor y a
+    `FullModelData` del frontend. El usuario poblara joints/frames/shells/
+    materiales/secciones via los endpoints de structural_editor.py.
+    """
+    return {
+        "schema_version": "1.0",
+        "metadata": {
+            "n_stories":    0,
+            "n_joints":     0,
+            "n_frames":     0,
+            "n_shells":     0,
+            "n_sections":   0,
+            "n_materials":  0,
+            "story_names":   [],
+            "total_height_m": 0.0,
+            "load_patterns": [],
+        },
+        "stories":    {},
+        "joints":     {},
+        "restraints": {},
+        "sections":   {},
+        "materials":  {},
+        "frames":     {},
+        "shells":     {},
+        "masses":     {},
+        "grid":        {"axes_x": [], "axes_y": [], "stories": []},
+        "masonryMaterials": {},
+        "infills":    {},
+        "line_loads":  {},   # {frame_id: {pattern: wz_kN_m}}
+        "shell_loads": {},   # {shell_id: {pattern: kN_m2}}
+    }
+
+
 @router.post("", response_model=ProjectOut, status_code=201)
 def create_project(payload: ProjectCreate, user: CurrentUser, db: DB):
     project = StructuralProject(
@@ -190,6 +227,221 @@ def create_project(payload: ProjectCreate, user: CurrentUser, db: DB):
     db.add(project)
     db.commit()
     db.refresh(project)
+
+    # Sembrar modelo canonico vacio para habilitar "modelar desde cero".
+    # Si luego el usuario importa ETABS/E2K, el import_validate_task lo
+    # sobrescribe con el modelo parseado.
+    from app.tasks.structural_helpers import prepare_work_dir
+
+    work_dir = prepare_work_dir(project.id, settings.upload_dir)
+    canonical_path = os.path.join(work_dir, "canonical", "structural_model.json")
+    try:
+        with open(canonical_path, "w", encoding="utf-8") as f:
+            json.dump(_seed_empty_canonical_model(), f, ensure_ascii=False, indent=2)
+        project.canonical_model_path = canonical_path
+        project.validation_status = "ok"
+        db.commit()
+        db.refresh(project)
+    except Exception as e:
+        # Si falla la siembra (p.ej. permisos de disco), el proyecto sigue
+        # existiendo pero en estado "not_run" — el usuario puede importar un
+        # modelo para recuperar el flujo.
+        print(f"[create_project] seed_empty_canonical failed for {project.id}: {e}")
+
+    return ProjectOut.from_orm_extra(project)
+
+
+# ── DEMO: portico metalico 2x2 ejes, 2 pisos ─────────────────────────────────
+
+@router.post("/demo/steel-portal", response_model=ProjectOut, status_code=201)
+def create_demo_steel_portal(user: CurrentUser, db: DB):
+    """Crea un proyecto de demostración completo: pórtico metálico 2×2 ejes
+    por 2 pisos (W14X90 columnas + W18X50 vigas, A992). Grid, materiales,
+    secciones, joints, frames, parámetros NSR-10 y una carga de servicio
+    distribuida — todo pre-configurado para que al abrir el proyecto puedas
+    correr Modal + Spectral de inmediato."""
+    from engine.sections.steel_section import make_steel_section
+    from app.tasks.structural_helpers import prepare_work_dir
+
+    # 1. Crear el proyecto base (siembra canonical vacío + validation="ok")
+    project = StructuralProject(
+        owner_id=user.id,
+        name="Demo pórtico acero 2×2×2",
+        description="Pórtico metálico 2 ejes × 2 ejes × 2 pisos. "
+                    "W14X90 columnas + W18X50 vigas, A992. "
+                    "Pre-configurado para correr Modal + Spectral NSR-10.",
+    )
+    db.add(project); db.commit(); db.refresh(project)
+
+    work_dir = prepare_work_dir(project.id, settings.upload_dir)
+    canonical_path = os.path.join(work_dir, "canonical", "structural_model.json")
+
+    # 2. Construir el canonical completo
+    m = _seed_empty_canonical_model()
+
+    # Grid: 2 ejes X (A, B a 0 y 6 m), 2 ejes Y (1, 2 a 0 y 6 m), 2 pisos
+    STORY_H = 3.0
+    m["grid"] = {
+        "axes_x":  [{"name": "A", "coord_m": 0.0}, {"name": "B", "coord_m": 6.0}],
+        "axes_y":  [{"name": "1", "coord_m": 0.0}, {"name": "2", "coord_m": 6.0}],
+        "stories": [{"name": "N1", "height_m": STORY_H},
+                    {"name": "N2", "height_m": STORY_H}],
+    }
+    m["stories"] = {
+        "N1": {"elevation_m": STORY_H,     "height_m": STORY_H},
+        "N2": {"elevation_m": 2 * STORY_H, "height_m": STORY_H},
+    }
+
+    # Material + secciones de acero (A992 por default)
+    col_sf = make_steel_section("W14X90", "A992")
+    bm_sf  = make_steel_section("W18X50", "A992")
+
+    m["materials"]["Steel_A992"] = {
+        "type":    "steel",
+        "fpc_mpa": 0.0,
+        "fy_mpa":  round(col_sf.material.fy, 2),
+        "fu_mpa":  round(col_sf.material.fu, 2),
+        "E_mpa":   round(col_sf.material.E0, 1),
+        "G_mpa":   round(col_sf.material.G,  1),
+    }
+
+    def _steel_sec_dict(sf, shape_name: str) -> dict:
+        return {
+            "material":    "Steel_A992",
+            "shape":       "steel",
+            "shape_type":  "steel",
+            "steel_grade": "A992",
+            "steel_shape": shape_name,
+            "aisc_type":   sf.type.value,
+            "h_m":    round(sf.shape.d  * 1e-3, 4),
+            "b_m":    round(sf.shape.bf * 1e-3, 4),
+            "tw_m":   round(sf.shape.tw * 1e-3, 5),
+            "tf_m":   round(sf.shape.tf * 1e-3, 5),
+            "t_des_m": round(sf.shape.t_des * 1e-3, 5),
+            "OD_m":   round(sf.shape.OD * 1e-3, 4),
+            "A_m2":   round(sf.A  * 1e-6, 8),
+            "I33_m4": round(sf.Iz * 1e-12, 12),
+            "I22_m4": round(sf.Iy * 1e-12, 12),
+            "J_m4":   round(sf.J  * 1e-12, 12),
+            "E_mpa":  round(sf.E, 1),
+            "G_mpa":  round(sf.G, 1),
+            "Zx_m3":  round(sf.Zx * 1e-9, 9),
+            "Zy_m3":  round(sf.Zy * 1e-9, 9),
+            "Sx_m3":  round(sf.Sx * 1e-9, 9),
+            "Sy_m3":  round(sf.Sy * 1e-9, 9),
+            "Mp_x_kNm": round(sf.Mp_x * 1e-6, 2),
+            "Mp_y_kNm": round(sf.Mp_y * 1e-6, 2),
+            "Py_kN":    round(sf.Py  * 1e-3, 2),
+        }
+
+    m["sections"]["COL-W14X90"] = _steel_sec_dict(col_sf, "W14X90")
+    m["sections"]["VIG-W18X50"] = _steel_sec_dict(bm_sf,  "W18X50")
+
+    # Joints (12 total): 4 base empotrados + 4 en N1 + 4 en N2
+    # Nombrado J_<x>_<y>_<z>
+    axes_x = [("A", 0.0), ("B", 6.0)]
+    axes_y = [("1", 0.0), ("2", 6.0)]
+    elev = [("base", 0.0, True), ("N1", STORY_H, False), ("N2", 2 * STORY_H, False)]
+    for (ax, x) in axes_x:
+        for (ay, y) in axes_y:
+            for (sname, z, is_base) in elev:
+                jid = f"J_{ax}{ay}_{sname}"
+                story = "" if is_base else sname
+                jd = {
+                    "x": x, "y": y, "z": z, "story": story,
+                    "is_restrained": is_base,
+                }
+                m["joints"][jid] = jd
+                if is_base:
+                    m.setdefault("restraints", {})[jid] = [1, 1, 1, 1, 1, 1]
+
+    # Frames: columnas (vertical z) + vigas (horizontal X e Y) por piso
+    stories_order = [("base", 0.0), ("N1", STORY_H), ("N2", 2 * STORY_H)]
+    # Columnas: pisan de base a N1, luego N1 a N2
+    for i in range(len(stories_order) - 1):
+        s_bot, _ = stories_order[i]
+        s_top, _ = stories_order[i + 1]
+        for (ax, _) in axes_x:
+            for (ay, _) in axes_y:
+                j_i = f"J_{ax}{ay}_{s_bot}"
+                j_j = f"J_{ax}{ay}_{s_top}"
+                fid = f"C_{ax}{ay}_{s_top}"
+                m["frames"][fid] = {
+                    "joint_i":      j_i,
+                    "joint_j":      j_j,
+                    "element_type": "column",
+                    "story":        s_top,
+                    "section":      "COL-W14X90",
+                }
+
+    # Vigas: en cada piso superior (N1, N2), 2 en dirección Y (vanos A1-A2, B1-B2)
+    # y 2 en dirección X (vanos A1-B1, A2-B2)
+    for s_top in ("N1", "N2"):
+        # Dirección Y
+        for (ax, _) in axes_x:
+            j_i = f"J_{ax}1_{s_top}"
+            j_j = f"J_{ax}2_{s_top}"
+            fid = f"B_{ax}Y_{s_top}"
+            m["frames"][fid] = {
+                "joint_i": j_i, "joint_j": j_j,
+                "element_type": "beam", "story": s_top,
+                "section": "VIG-W18X50",
+            }
+        # Dirección X
+        for (ay, _) in axes_y:
+            j_i = f"J_A{ay}_{s_top}"
+            j_j = f"J_B{ay}_{s_top}"
+            fid = f"B_{ay}X_{s_top}"
+            m["frames"][fid] = {
+                "joint_i": j_i, "joint_j": j_j,
+                "element_type": "beam", "story": s_top,
+                "section": "VIG-W18X50",
+            }
+
+    # Patrones de carga + carga uniforme en vigas
+    m["metadata"]["load_patterns"] = ["DL", "LL"]
+    m.setdefault("line_loads", {})
+    for fid, fd in m["frames"].items():
+        if fd["element_type"] == "beam":
+            m["line_loads"][fid] = {"DL": -12.0, "LL": -5.0}  # kN/m
+
+    # Diafragmas rígidos en los 2 pisos (comportamiento ETABS default)
+    m["metadata"]["rigid_diaphragms"] = ["N1", "N2"]
+
+    # Update metadata counts
+    m["metadata"]["n_stories"]    = 2
+    m["metadata"]["n_joints"]     = len(m["joints"])
+    m["metadata"]["n_frames"]     = len(m["frames"])
+    m["metadata"]["n_materials"]  = len(m["materials"])
+    m["metadata"]["n_sections"]   = len(m["sections"])
+    m["metadata"]["story_names"]  = ["N1", "N2"]
+    m["metadata"]["total_height_m"] = 2 * STORY_H
+
+    # 3. Persistir canonical
+    with open(canonical_path, "w", encoding="utf-8") as f:
+        json.dump(m, f, ensure_ascii=False, indent=2)
+    project.canonical_model_path = canonical_path
+    project.validation_status = "ok"
+
+    # 4. Parámetros sísmicos NSR-10 Bogotá, pórtico metálico DMO
+    project.parameters_json = json.dumps({
+        "code":               "NSR-10",
+        "city":               "Bogotá",
+        "department":         "Cundinamarca",
+        "Aa":                 0.15,
+        "Av":                 0.20,
+        "soil_type":          "D",
+        "edification_use":    "II",
+        "importance_factor":  1.0,
+        "structure_system":   "SMF",     # Steel Moment Frame
+        "energy_dissipation": "DMO",
+        "R":                  5.0,       # NSR-10 F.3 / AISC 341 DMO
+        "damping_ratio":      0.02,      # 2% típico para acero
+        "n_modes":            12,
+        "combination_method": "CQC",
+    }, ensure_ascii=False)
+
+    db.commit(); db.refresh(project)
     return ProjectOut.from_orm_extra(project)
 
 

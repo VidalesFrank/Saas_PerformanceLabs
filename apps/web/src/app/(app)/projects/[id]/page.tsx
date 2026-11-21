@@ -28,6 +28,8 @@ import WallDesignPanel    from "@/components/linear/WallDesignPanel";
 import UnifiedPushoverPanel from "@/components/linear/UnifiedPushoverPanel";
 import ElementThresholdsPanel from "@/components/linear/ElementThresholdsPanel";
 import PerformanceVerifierPanel from "@/components/linear/PerformanceVerifierPanel";
+import PerformanceCSMPanel from "@/components/linear/PerformanceCSMPanel";
+import LoadsPanel from "@/components/linear/LoadsPanel";
 import IDAPanel from "@/components/linear/IDAPanel";
 import NLRHAPanel from "@/components/linear/NLRHAPanel";
 import NLTHPanel            from "@/components/linear/NLTHPanel";
@@ -89,6 +91,8 @@ type SectionId =
   | "nlrha"
   | "evaluacion-elemento"
   | "verif-desempeno"
+  | "performance-csm"
+  | "cargas"
   | "diseno"
   | "no-lineal";
 
@@ -126,6 +130,7 @@ function buildNav(hasSpectral: boolean, isValidated: boolean): NavGroup[] {
     {
       groupLabel: "Análisis de fuerzas",
       items: [
+        { id: "cargas",       label: "Cargas (DL/LL/sismo)",       locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "sismico",      label: "Sísmico + Modal + Espectral", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "wall-demands", label: "Demandas Muros",              locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
       ],
@@ -140,6 +145,7 @@ function buildNav(hasSpectral: boolean, isValidated: boolean): NavGroup[] {
     {
       groupLabel: "Modelo no lineal",
       items: [
+        { id: "no-lineal",      label: "Especificación no lineal",    locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "muros",          label: "Asignar Muros (MVLEM_3D)",    locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "pushover",       label: "Pushover No Lineal",          locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "nlth",           label: "Análisis Cronológico (NLTHA)", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
@@ -147,12 +153,7 @@ function buildNav(hasSpectral: boolean, isValidated: boolean): NavGroup[] {
         { id: "nlrha",          label: "NLRHA (verificación NSR-10)",   locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "evaluacion-elemento", label: "Evaluación por elemento",  locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
         { id: "verif-desempeno",     label: "Verificación por desempeño", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
-      ],
-    },
-    {
-      groupLabel: "Exportar",
-      items: [
-        { id: "no-lineal", label: "Exportar a Módulo 3", locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
+        { id: "performance-csm",     label: "Desempeño CSM (ATC-40)",     locked: !isValidated, lockReason: !isValidated ? "Requiere modelo validado" : undefined },
       ],
     },
   ];
@@ -323,7 +324,8 @@ export default function StructuralProjectPage() {
   // Carga lazy de fullModelData: Muros, Materiales y Secciones lo necesitan
   useEffect(() => {
     const needsModel = activeSection === "muros" || activeSection === "materiales" || activeSection === "secciones"
-      || activeSection === "grid" || activeSection === "mamposteria" || activeSection === "infills";
+      || activeSection === "grid" || activeSection === "mamposteria" || activeSection === "infills"
+      || activeSection === "cargas";
     if (needsModel && !fullModelData && project?.canonical_model_path) {
       structuralEditorApi.modelData(project.id).then(setFullModelData).catch(() => {});
     }
@@ -1720,6 +1722,7 @@ export default function StructuralProjectPage() {
               <GridEditor
                 projectId={project.id}
                 initial={fullModelData?.grid}
+                rigidDiaphragms={fullModelData?.metadata?.rigid_diaphragms ?? []}
                 onSaved={handleDrawnChange}
               />
             </div>
@@ -2208,6 +2211,28 @@ export default function StructuralProjectPage() {
                 projectId={project.id}
                 isValidated={isValidated}
               />
+            </div>
+          )}
+
+          {/* ── Performance CSM (ATC-40) ───────────────────────────────────── */}
+          {activeSection === "performance-csm" && (
+            <div className="mx-auto max-w-5xl px-6 py-8">
+              <PerformanceCSMPanel projectId={project.id} />
+            </div>
+          )}
+
+          {/* ── Cargas (DL/LL/sismo/viento) ─────────────────────────────────── */}
+          {activeSection === "cargas" && project && (
+            <div className="mx-auto max-w-5xl px-6 py-8">
+              {fullModelData ? (
+                <LoadsPanel
+                  projectId={project.id}
+                  fullModel={fullModelData}
+                  onChanged={handleModelDataChange}
+                />
+              ) : (
+                <p className="text-sm text-text-muted">Cargando modelo…</p>
+              )}
             </div>
           )}
 

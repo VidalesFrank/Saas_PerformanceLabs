@@ -287,6 +287,21 @@ class CanonicalModelBuilder:
             fpc = _to_float(row.get("Fc"))           # MPa
             G   = _to_float(row.get("G"))             # MPa
             E   = _to_float(row.get("E")) or _to_float(row.get("Ec"))  # MPa
+            # Flag opcional de acero propagado desde e2k_parser
+            is_steel = bool(row.get("_IsSteel", False))
+            fy = _to_float(row.get("Fy"))
+
+            if is_steel or (fy > 0 and fpc == 0):
+                materials[name] = {
+                    "type":    "steel",
+                    "fy_mpa":  round(fy, 2) if fy > 0 else 345.0,
+                    "fu_mpa":  round(_to_float(row.get("Fu")), 2) or 450.0,
+                    "E_mpa":   round(E, 1) if E > 0 else 200_000.0,
+                    "G_mpa":   round(G, 1) if G > 0 else 77_000.0,
+                    "fpc_mpa": 0.0,
+                }
+                continue
+
             if E == 0.0 and fpc > 0:
                 E = round(4700 * math.sqrt(fpc), 1)  # ACI 318: Ec = 4700√f'c (MPa)
             materials[name] = {

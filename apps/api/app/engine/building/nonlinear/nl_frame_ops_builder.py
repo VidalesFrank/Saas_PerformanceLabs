@@ -811,14 +811,17 @@ class NLFrameOPSBuilder:
         self._mat_concrete[key] = tag_wrap
         return tag_wrap
 
-    def _get_steel(self, fy_MPa: float, eps_su: float = 0.10) -> int:
+    def _get_steel(self, fy_MPa: float, eps_su: float = 0.10, b_hard: float = 0.01) -> int:
         """Steel02 (Menegotto-Pinto) envuelto en MinMax para fractura simétrica.
 
         Default εsu = 0.10 (A615 Gr60). Al llegar a |ε| ≥ εsu, la barra
         fractura (σ=0 definitivo) — captura el colapso dúctil del acero
         longitudinal, que Steel02 solo no hace.
+
+        Para acero estructural (A36/A572/A992/A500) usar b_hard ≈ 0.003 y
+        eps_su ≈ 0.20 — ductilidad del perfil laminado es mayor que la barra.
         """
-        key = (round(fy_MPa, 1), round(eps_su, 4))
+        key = (round(fy_MPa, 1), round(eps_su, 4), round(b_hard, 4))
         if key in self._mat_steel:
             return self._mat_steel[key]
         tag_base = self._next_mat()
@@ -826,7 +829,7 @@ class NLFrameOPSBuilder:
             "Steel02", tag_base,
             fy_MPa * 1000.0,       # Fy [kPa]
             200_000_000.0,          # E0 = 200 GPa [kPa]
-            0.01,                   # b (hardening)
+            b_hard,                 # b (hardening)
             15.0, 0.925, 0.15,      # R0, cR1, cR2
         )
         # Modo ductile → no envolvemos; Steel02 no fractura y mantiene
@@ -947,6 +950,155 @@ class NLFrameOPSBuilder:
             else:
                 # fibra puntual
                 ops.fiber(float(layer["y"]), float(layer["z"]), As, mat_steel)
+
+    # ── Sección fiber para acero estructural (W / HSS / Pipe) ────────────────
+
+    def _build_steel_fiber_section(
+        self, sec_tag: int, steel: dict,
+    ) -> None:
+        """Construye una seccion Fiber de perfil laminado AISC con un solo
+        material Steel02 (MinMax-wrapped para fractura ductil).
+
+        Convencion local: y = depth (strong), z = width (weak). Origen en el
+        centroide. Unidades: m / kN.
+
+        Soportados:
+        - W-shape: 3 patches (flange sup, flange inf, alma)
+        - HSS rectangular: 4 strips perimetrales (caja hueca)
+        - Pipe / HSS redondo: patch circular anular
+        """
+        ops = self._ops
+
+        fy = float(steel.get("fy_MPa", 345.0))
+        aisc_type = str(steel.get("aisc_type", "W")).upper()
+
+        # Material acero estructural: b=0.003, eps_su=0.20 (ductil A992/A500)
+        mat_tag = self._get_steel(fy, eps_su=0.20, b_hard=0.003)
+
+        # Rigidez torsional elastica
+        E = float(steel.get("E_MPa", 200_000.0)) * 1000.0   # kPa
+        G = float(steel.get("G_MPa", 77_000.0))  * 1000.0
+        J = float(steel.get("J_m4", 1e-6))
+        torsion_tag = self._get_torsion(G * J)
+        ops.section("Fiber", sec_tag, "-torsion", torsion_tag)
+
+        if aisc_type == "W":
+            d  = float(steel.get("d_m", 0.3))
+            bf = float(steel.get("bf_m", 0.2))
+            tw = float(steel.get("tw_m", 0.01))
+            tf = float(steel.get("tf_m", 0.015))
+            hd = d / 2.0
+            hb = bf / 2.0
+            hw_core = (d - 2.0 * tf) / 2.0
+            htw = tw / 2.0
+            nf_flange_w, nf_flange_t = 10, 2
+            nf_web_d, nf_web_t = 12, 2
+            # Flange superior
+            ops.patch("rect", mat_tag, nf_flange_t, nf_flange_w,
+                       hw_core, -hb,  hd,     hb)
+            # Flange inferior
+            ops.patch("rect", mat_tag, nf_flange_t, nf_flange_w,
+                      -hd,     -hb, -hw_core, hb)
+            # Alma
+            ops.patch("rect", mat_tag, nf_web_d, nf_web_t,
+                      -hw_core, -htw, hw_core, htw)
+
+        elif aisc_type == "HSS_RECT":
+            d  = float(steel.get("d_m", 0.2))
+            bf = float(steel.get("bf_m", 0.2))
+            t  = float(steel.get("t_des_m", 0.012))
+            hd = d / 2.0
+            hb = bf / 2.0
+            hd_in = hd - t
+            hb_in = hb - t
+            nfl, nft = 8, 1
+            # Strip superior
+            ops.patch("rect", mat_tag, nft, nfl, hd_in,  -hb, hd,     hb)
+            # Strip inferior
+            ops.patch("rect", mat_tag, nft, nfl, -hd,    -hb, -hd_in, hb)
+            # Strip izquierdo
+            ops.patch("rect", mat_tag, nfl, nft, -hd_in, -hb,    hd_in, -hb_in)
+            # Strip derecho
+            ops.patch("rect", mat_tag, nfl, nft, -hd_in, hb_in,  hd_in,  hb)
+
+        elif aisc_type in ("PIPE", "HSS_ROUND"):
+            OD = float(steel.get("OD_m", 0.2))
+            t  = float(steel.get("t_des_m", 0.008))
+            r_ext = OD / 2.0
+            r_int = r_ext - t
+            ops.patch("circ", mat_tag, 24, 3, 0.0, 0.0, r_int, r_ext)
+
+        else:
+            # Fallback: perfil desconocido → seccion rectangular solida con
+            # area A_m2. Marginalmente conservador pero evita fallo duro.
+            A = float(steel.get("A_m2", 0.01))
+            half = math.sqrt(A) / 2.0
+            ops.patch("rect", mat_tag, 6, 6, -half, -half, half, half)
+
+    def _build_steel_frame_element(
+        self, fid: str, el: dict, kind: str,
+    ) -> None:
+        """Construye un forceBeamColumn con seccion fiber de acero. Reusa
+        HingeRadau (mismo patron que RC) con sec_end = sec_mid = seccion de
+        acero (uniforme a lo largo). lp ≈ d/2 (regla de pulgar perfiles
+        laminados).
+
+        kind ∈ {"column", "beam"}.
+        """
+        ops = self._ops
+        steel = el.get("steel", {})
+        geo   = el.get("geometry", {})
+        L     = float(geo.get("L_m", 3.0))
+        d     = float(steel.get("d_m", 0.3))
+        lp    = self._lp_user if self._lp_user > 0.0 else max(d / 2.0, 0.10)
+        lp    = min(lp, L * 0.45)
+
+        ni_lbl = el["node_i"]; nj_lbl = el["node_j"]
+        ni = _joint_tag(ni_lbl); nj = _joint_tag(nj_lbl)
+
+        sec_tag = self._next_sec()
+        self._build_steel_fiber_section(sec_tag, steel)
+
+        integ_tag = self._next_integ()
+        try:
+            ops.beamIntegration(
+                "HingeRadau", integ_tag,
+                sec_tag, float(lp), sec_tag, float(lp), sec_tag,
+            )
+            transf = _TRANSF_COL if kind == "column" else _TRANSF_BM
+            if kind == "column":
+                ele_tag = _ELE_COL_OFFSET + len(self._ele_col_map) + 1
+            else:
+                ele_tag = _ELE_BM_OFFSET + len(self._ele_bm_map) + 1
+            ops.element(
+                "forceBeamColumn", ele_tag, ni, nj, transf, integ_tag,
+                "-iter", 50, 1.0e-8,
+            )
+        except Exception as exc:
+            print(f"[NLFrameOPSBuilder] {kind} acero {fid}: {exc}")
+            return
+
+        if kind == "column":
+            self._ele_col_map[fid] = ele_tag
+            self._valid_frame_joints.add(ni_lbl)
+            self._valid_frame_joints.add(nj_lbl)
+        else:
+            self._ele_bm_map[fid] = ele_tag
+
+        self._element_lines.append({
+            "fid":       str(fid),
+            "kind":      kind,
+            "story":     el.get("story", ""),
+            "ele_tag":   ele_tag,
+            "node_i":    ni, "node_j": nj,
+            "node_i_lbl": ni_lbl, "node_j_lbl": nj_lbl,
+            "material_kind": "steel",
+            "steel_shape": steel.get("shape", ""),
+            "steel_grade": steel.get("grade", ""),
+            "d_m": d,
+            "L_m": L,
+            "lp_m": round(lp, 4),
+        })
 
     # ── Distribución de barras ────────────────────────────────────────────────
 
@@ -1120,6 +1272,12 @@ class NLFrameOPSBuilder:
             ni_lbl = col["node_i"]; nj_lbl = col["node_j"]
             if ni_lbl not in self._valid_joints or nj_lbl not in self._valid_joints:
                 continue
+
+            # ── Branch acero estructural ────────────────────────────────
+            if col.get("material_kind") == "steel":
+                self._build_steel_frame_element(fid, col, kind="column")
+                continue
+
             geo    = col.get("geometry", {})
             b      = float(geo.get("b_m", 0.30))
             h      = float(geo.get("h_m", 0.30))
@@ -1198,6 +1356,12 @@ class NLFrameOPSBuilder:
             ni_lbl = bm["node_i"]; nj_lbl = bm["node_j"]
             if ni_lbl not in self._valid_joints or nj_lbl not in self._valid_joints:
                 continue
+
+            # ── Branch acero estructural ────────────────────────────────
+            if bm.get("material_kind") == "steel":
+                self._build_steel_frame_element(fid, bm, kind="beam")
+                continue
+
             geo    = bm.get("geometry", {})
             b      = float(geo.get("b_m", 0.30))
             h      = float(geo.get("h_m", 0.40))

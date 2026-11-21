@@ -35,6 +35,7 @@ import type {
   SectionReinforcementItem,
   ReinforcementNSR10Result,
   SaveSectionReinforcementPayload,
+  PerformanceCSMResult,
 } from "./structural-types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -83,6 +84,11 @@ export const structuralProjectsApi = {
 
   create: (payload: { name: string; description?: string }) =>
     req<StructuralProject>("", { method: "POST", body: JSON.stringify(payload) }),
+
+  /** Crea un proyecto DEMO pre-configurado (pórtico metálico 2×2×2) para
+   *  revisión inmediata de la plataforma. */
+  createDemoSteelPortal: () =>
+    req<StructuralProject>("/demo/steel-portal", { method: "POST" }),
 
   get: (id: string) =>
     req<StructuralProject>(`/${id}`),
@@ -566,6 +572,37 @@ export const structuralEditorApi = {
       { method: "DELETE" },
     ),
 
+  /** Catálogo AISC v15.0 (perfiles + grados ASTM). */
+  getSteelCatalog: () =>
+    req<{
+      shapes_by_type: Record<string, Array<{
+        name: string; A_mm2: number; d_mm: number; bf_mm: number;
+        weight_kgm: number; Ix_mm4: number; Iy_mm4: number;
+        Zx_mm3: number; Zy_mm3: number;
+      }>>;
+      grades: Array<{
+        name: string; fy_mpa: number; fu_mpa: number;
+        E_mpa: number; G_mpa: number; eps_y: number;
+      }>;
+      total_shapes: number;
+    }>(`/steel/catalog`),
+
+  /** Crea una sección metálica desde perfil AISC + grado ASTM. Auto-crea
+   *  el material de acero si no existe. */
+  createSteelSection: (
+    projectId: string,
+    payload: { name: string; shape_name: string; grade: string },
+  ) =>
+    req<{
+      ok: boolean;
+      name: string;
+      material_created: string;
+      data: Record<string, unknown>;
+    }>(
+      `/${projectId}/model/steel-sections`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
   // ── Materiales ────────────────────────────────────────────────────────────
 
   createMaterial: (projectId: string, name: string, data: Partial<MaterialData> & { type: string }) =>
@@ -695,6 +732,17 @@ export const structuralEditorApi = {
       { method: "DELETE" },
     ),
 
+  /** Actualiza posición (x, y, z) de un joint — frames y shells conectados
+   *  se mueven con él automáticamente. */
+  updateJoint: (
+    projectId: string, jointId: string,
+    patch: { x?: number; y?: number; z?: number; story?: string },
+  ) =>
+    req<{ ok: boolean; id: string; data: Record<string, unknown> }>(
+      `/${projectId}/model/joints/${encodeURIComponent(jointId)}`,
+      { method: "PATCH", body: JSON.stringify(patch) },
+    ),
+
   createFrame: (
     projectId: string,
     payload: { id: string; joint_i: string; joint_j: string; section: string;
@@ -709,6 +757,16 @@ export const structuralEditorApi = {
     req<{ ok: boolean; deleted: string }>(
       `/${projectId}/model/frames/${encodeURIComponent(frameId)}`,
       { method: "DELETE" },
+    ),
+
+  /** Actualiza sección, release y/o story de un frame. */
+  updateFrame: (
+    projectId: string, frameId: string,
+    patch: { section?: string; release?: "" | "i" | "j" | "ij"; story?: string },
+  ) =>
+    req<{ ok: boolean; id: string; data: Record<string, unknown> }>(
+      `/${projectId}/model/frames/${encodeURIComponent(frameId)}`,
+      { method: "PATCH", body: JSON.stringify(patch) },
     ),
 
   createShell: (
@@ -726,6 +784,100 @@ export const structuralEditorApi = {
     req<{ ok: boolean; deleted: string }>(
       `/${projectId}/model/shells/${encodeURIComponent(shellId)}`,
       { method: "DELETE" },
+    ),
+
+  /** Reemplaza la lista de pisos con diafragma rígido. */
+  upsertRigidDiaphragms: (projectId: string, rigidStories: string[]) =>
+    req<{ ok: boolean; rigid_diaphragms: string[] }>(
+      `/${projectId}/model/rigid-diaphragms`,
+      { method: "PUT", body: JSON.stringify({ rigid_stories: rigidStories }) },
+    ),
+
+  /** Reemplaza la lista de patrones de carga. Al eliminar un patrón, se
+   *  limpian en cascada line_loads y shell_loads asignados a él. */
+  upsertLoadPatterns: (projectId: string, patterns: string[]) =>
+    req<{
+      ok: boolean;
+      patterns: string[];
+      removed_patterns: string[];
+      line_loads_cleaned: number;
+      shell_loads_cleaned: number;
+    }>(
+      `/${projectId}/model/load-patterns`,
+      { method: "PUT", body: JSON.stringify({ patterns }) },
+    ),
+
+  /** Asigna cargas lineales (kN/m, gravedad Z) a una viga por patrón.
+   *  Patron con valor 0 limpia la asignación de ese patrón. */
+  upsertLineLoad: (projectId: string, frameId: string, loads: Record<string, number>) =>
+    req<{ ok: boolean; frame_id: string; loads: Record<string, number> }>(
+      `/${projectId}/model/line-loads/${encodeURIComponent(frameId)}`,
+      { method: "PUT", body: JSON.stringify({ loads }) },
+    ),
+
+  /** Asigna presión uniforme (kN/m², gravedad Z) a una losa por patrón.
+   *  Patron con valor 0 limpia la asignación de ese patrón. */
+  upsertShellLoad: (projectId: string, shellId: string, loads: Record<string, number>) =>
+    req<{ ok: boolean; shell_id: string; loads: Record<string, number> }>(
+      `/${projectId}/model/shell-loads/${encodeURIComponent(shellId)}`,
+      { method: "PUT", body: JSON.stringify({ loads }) },
+    ),
+
+  /** Refleja elementos seleccionados respecto a una línea paralela al eje X o Y. */
+  mirrorElements: (
+    projectId: string,
+    payload: {
+      elements: Array<{ kind: "column" | "beam" | "wall" | "slab"; id: string }>;
+      axis:  "x" | "y";
+      coord: number;
+      xy_tol_m?: number;
+    },
+  ) =>
+    req<{
+      ok: boolean;
+      frames_created: number;
+      shells_created: number;
+      warnings: string[];
+      new_ids: { frames: string[]; shells: string[] };
+    }>(
+      `/${projectId}/model/mirror`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  /** Replica un muro o losa N-1 veces en array lineal. */
+  replicateShell: (
+    projectId: string, shellId: string,
+    payload: { dx: number; dy: number; count: number; xy_tol_m?: number },
+  ) =>
+    req<{ ok: boolean; shells_created: number; new_ids: string[] }>(
+      `/${projectId}/model/shells/${encodeURIComponent(shellId)}/replicate`,
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+
+  /** Copia todos los elementos de un piso a otro (columnas + vigas + muros + losas). */
+  copyStory: (
+    projectId: string,
+    payload: {
+      source_story:   string;
+      target_story:   string;
+      include_frames?: boolean;
+      include_shells?: boolean;
+      xy_tol_m?:       number;
+    },
+  ) =>
+    req<{
+      ok: boolean;
+      source_story: string;
+      target_story: string;
+      joints_created: number;
+      joints_reused:  number;
+      frames_created: number;
+      shells_created: number;
+      warnings: string[];
+      new_ids: { joints: string[]; frames: string[]; shells: string[] };
+    }>(
+      `/${projectId}/model/stories/copy`,
+      { method: "POST", body: JSON.stringify(payload) },
     ),
 };
 
@@ -1154,5 +1306,37 @@ export const localCatalogApi = {
     localReq<import("./structural-types").FEMAScaleResult & { campaign: string }>(
       "/scale-factor",
       { method: "POST", body: JSON.stringify(body) },
+    ),
+};
+
+
+// ── Performance CSM (Capacity Spectrum Method ATC-40) ─────────────────────────
+
+export const structuralPerformanceApi = {
+  evaluateCSM: (payload: {
+    project_id:     string;
+    direction?:     "X" | "Y";
+    dtecho_pct:     number[];
+    vbasal_norm:    number[];
+    total_height_m: number;
+    T1_s:           number;
+    Aa?:            number;
+    Av?:            number;
+  }) =>
+    req<PerformanceCSMResult>("/performance/csm/evaluate", {
+      method: "POST",
+      body:   JSON.stringify(payload),
+    }),
+
+  /** Resultado NL pushover ya persistido (walls). */
+  getNLPushoverResult: (projectId: string) =>
+    req<import("./structural-types").NLPushoverResult>(
+      `/analysis/${projectId}/nl-pushover`,
+    ),
+
+  /** Resultado NL pushover de pórticos ya persistido. */
+  getNLFramePushoverResult: (projectId: string) =>
+    req<import("./structural-types").NLFramePushoverResult>(
+      `/analysis/${projectId}/nl-frame-pushover`,
     ),
 };

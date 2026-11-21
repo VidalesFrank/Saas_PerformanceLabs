@@ -228,7 +228,19 @@ export default function StructuralProjectsPage() {
   const [creating, setCreating] = useState(false);
   const [error, setError]       = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [demoLoading, setDemoLoading] = useState(false);
   const importRef = useRef<HTMLInputElement>(null);
+
+  async function handleCreateDemo() {
+    setDemoLoading(true); setError(null);
+    try {
+      const p = await structuralProjectsApi.createDemoSteelPortal();
+      router.push(`/projects/${p.id}`);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "No se pudo crear el proyecto demo");
+      setDemoLoading(false);
+    }
+  }
 
   async function handleImport(file: File) {
     setImporting(true);
@@ -302,6 +314,14 @@ export default function StructuralProjectsPage() {
               title="Importar un modelo .plabs.json exportado desde otra cuenta"
             >
               {importing ? "Importando…" : "↑ Importar modelo"}
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={handleCreateDemo}
+              disabled={demoLoading}
+              title="Crea un pórtico metálico 2×2 ejes × 2 pisos pre-configurado para revisión"
+            >
+              {demoLoading ? "Creando demo…" : "⚡ Demo acero 2×2×2"}
             </Button>
             <Button onClick={() => setShowNew(true)}>+ Nuevo proyecto</Button>
           </>

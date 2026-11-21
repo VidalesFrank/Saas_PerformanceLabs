@@ -1,8 +1,23 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { FullModelData, SectionData } from "@/lib/structural-types";
 import { structuralEditorApi } from "@/lib/structural-api";
+
+interface SteelCatalogShape {
+  name: string; A_mm2: number; d_mm: number; bf_mm: number;
+  weight_kgm: number; Ix_mm4: number; Iy_mm4: number;
+  Zx_mm3: number; Zy_mm3: number;
+}
+interface SteelCatalogGrade {
+  name: string; fy_mpa: number; fu_mpa: number;
+  E_mpa: number; G_mpa: number; eps_y: number;
+}
+interface SteelCatalog {
+  shapes_by_type: Record<string, SteelCatalogShape[]>;
+  grades: SteelCatalogGrade[];
+  total_shapes: number;
+}
 
 // ── Preview sección transversal SVG ──────────────────────────────────────────
 
@@ -91,7 +106,7 @@ function usesCount(sectionName: string, frames: FullModelData["frames"]): number
 }
 
 export default function ModelSectionsPanel({ projectId, modelData, onModelDataChange }: Props) {
-  const [mode, setMode] = useState<"list" | "create" | "edit">("list");
+  const [mode, setMode] = useState<"list" | "create" | "create-steel" | "edit">("list");
   const [editingName, setEditingName] = useState<string | null>(null);
   const [form, setForm] = useState<SectionForm>(DEFAULT_FORM);
   const [saving, setSaving] = useState(false);
@@ -99,6 +114,65 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+
+  // ── Catálogo de acero (lazy) ─────────────────────────────────────────────
+  const [steelCatalog, setSteelCatalog] = useState<SteelCatalog | null>(null);
+  const [steelForm, setSteelForm] = useState({
+    name:       "",
+    shape_type: "W" as "W" | "HSS_RECT" | "PIPE",
+    shape_name: "",
+    grade:      "A992",
+  });
+
+  // Carga lazy al entrar en modo create-steel
+  useEffect(() => {
+    if (mode !== "create-steel" || steelCatalog) return;
+    structuralEditorApi.getSteelCatalog()
+      .then((c) => {
+        setSteelCatalog(c);
+        // Default: primer shape W + grado A992
+        const firstW = c.shapes_by_type["W"]?.[0]?.name ?? "";
+        setSteelForm((f) => ({ ...f, shape_name: f.shape_name || firstW }));
+      })
+      .catch((e) => setError(e instanceof Error ? e.message : "No se pudo cargar el catálogo AISC"));
+  }, [mode, steelCatalog]);
+
+  const steelShapesForType = useMemo(
+    () => steelCatalog?.shapes_by_type[steelForm.shape_type] ?? [],
+    [steelCatalog, steelForm.shape_type],
+  );
+  const steelShape = steelShapesForType.find((s) => s.name === steelForm.shape_name);
+  const steelGrade = steelCatalog?.grades.find((g) => g.name === steelForm.grade);
+
+  function startCreateSteel() {
+    setSteelForm({ name: "", shape_type: "W", shape_name: "", grade: "A992" });
+    setMode("create-steel");
+    setError(null);
+    setSuccess(null);
+  }
+
+  async function handleSaveSteel() {
+    if (!steelForm.name.trim() || !steelForm.shape_name || !steelForm.grade) {
+      setError("Completa nombre, perfil y grado.");
+      return;
+    }
+    setSaving(true); setError(null);
+    try {
+      const r = await structuralEditorApi.createSteelSection(projectId, {
+        name:       steelForm.name.trim(),
+        shape_name: steelForm.shape_name,
+        grade:      steelForm.grade,
+      });
+      setSuccess(`Sección "${r.name}" creada (material ${r.material_created})`);
+      setMode("list");
+      await onModelDataChange();
+      setTimeout(() => setSuccess(null), 3000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Error al crear sección de acero");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   const { sections, materials, frames } = modelData;
   const matNames = Object.keys(materials);
@@ -208,12 +282,22 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
             <span className="text-xs font-semibold text-text">
               Secciones <span className="text-text-muted font-normal">({Object.keys(sections).length})</span>
             </span>
-            <button
-              onClick={startCreate}
-              className="text-[11px] px-2.5 py-1 rounded-lg bg-accent text-white hover:bg-accent/80 transition-colors font-medium"
-            >
-              + Nueva
-            </button>
+            <div className="flex gap-1">
+              <button
+                onClick={startCreate}
+                className="text-[11px] px-2.5 py-1 rounded-lg bg-accent text-white hover:bg-accent/80 transition-colors font-medium"
+                title="Crear sección RC (rectangular / circular / especial)"
+              >
+                + RC
+              </button>
+              <button
+                onClick={startCreateSteel}
+                className="text-[11px] px-2.5 py-1 rounded-lg bg-slate-600 text-white hover:bg-slate-700 transition-colors font-medium"
+                title="Crear sección metálica (perfil AISC)"
+              >
+                + Acero
+              </button>
+            </div>
           </div>
           <input
             type="text"
@@ -278,6 +362,138 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
               </div>
             );
           })}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Formulario crear sección de acero ──────────────────────────────────────
+  if (mode === "create-steel") {
+    return (
+      <div className="flex flex-col h-full">
+        <div className="px-4 py-3 border-b border-border bg-surface-2 flex-shrink-0 flex items-center justify-between">
+          <p className="text-xs font-semibold text-text">Nueva sección de acero (AISC v15.0)</p>
+          <button onClick={cancel} className="text-[10px] text-text-muted hover:text-text">Cancelar</button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-3">
+          {error && (
+            <div className="px-3 py-1.5 rounded-lg bg-danger/10 border border-danger/30">
+              <p className="text-[11px] text-danger">{error}</p>
+            </div>
+          )}
+
+          {!steelCatalog && (
+            <p className="text-xs text-text-muted">Cargando catálogo AISC…</p>
+          )}
+
+          {steelCatalog && (
+            <>
+              <div>
+                <label className="text-[10px] font-semibold uppercase tracking-widest text-text-muted block mb-1">
+                  Nombre de la sección *
+                </label>
+                <input
+                  type="text"
+                  placeholder="ej. COL-W14X90"
+                  value={steelForm.name}
+                  onChange={(e) => setSteelForm((f) => ({ ...f, name: e.target.value }))}
+                  className="w-full text-xs rounded-lg border border-border bg-surface px-2.5 py-1.5 text-text focus:outline-none focus:border-accent"
+                />
+              </div>
+
+              <div>
+                <label className="text-[10px] font-semibold uppercase tracking-widest text-text-muted block mb-1">
+                  Familia de perfil
+                </label>
+                <div className="flex gap-1">
+                  {(["W", "HSS_RECT", "PIPE"] as const).map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => {
+                        const first = steelCatalog.shapes_by_type[t]?.[0]?.name ?? "";
+                        setSteelForm((f) => ({ ...f, shape_type: t, shape_name: first }));
+                      }}
+                      className={[
+                        "flex-1 text-[11px] px-2.5 py-1.5 rounded-lg border transition-colors",
+                        steelForm.shape_type === t
+                          ? "bg-indigo-600 text-white border-indigo-600"
+                          : "bg-surface border-border text-text-muted hover:text-text",
+                      ].join(" ")}
+                    >
+                      {t === "W" ? "W (I)" : t === "HSS_RECT" ? "HSS rect" : "Pipe"}
+                      <span className="ml-1 opacity-60 text-[9px]">
+                        ({steelCatalog.shapes_by_type[t]?.length ?? 0})
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="text-[10px] font-semibold uppercase tracking-widest text-text-muted block mb-1">
+                  Perfil AISC
+                </label>
+                <select
+                  value={steelForm.shape_name}
+                  onChange={(e) => setSteelForm((f) => ({ ...f, shape_name: e.target.value }))}
+                  className="w-full text-xs rounded-lg border border-border bg-surface px-2.5 py-1.5 text-text font-mono focus:outline-none focus:border-accent"
+                >
+                  {steelShapesForType.map((s) => (
+                    <option key={s.name} value={s.name}>
+                      {s.name}  —  {s.weight_kgm.toFixed(1)} kg/m, d={s.d_mm.toFixed(0)} mm
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="text-[10px] font-semibold uppercase tracking-widest text-text-muted block mb-1">
+                  Grado ASTM
+                </label>
+                <select
+                  value={steelForm.grade}
+                  onChange={(e) => setSteelForm((f) => ({ ...f, grade: e.target.value }))}
+                  className="w-full text-xs rounded-lg border border-border bg-surface px-2.5 py-1.5 text-text font-mono focus:outline-none focus:border-accent"
+                >
+                  {steelCatalog.grades.map((g) => (
+                    <option key={g.name} value={g.name}>
+                      {g.name}  —  fy={g.fy_mpa} MPa, fu={g.fu_mpa} MPa
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Preview + propiedades */}
+              {steelShape && steelGrade && (
+                <div className="rounded-lg border border-border bg-surface-2 p-3 space-y-2">
+                  <p className="text-[10px] uppercase tracking-widest text-text-muted">Vista previa</p>
+                  <div className="flex items-center gap-4">
+                    <SteelShapePreviewSVG type={steelForm.shape_type} s={steelShape} />
+                    <div className="flex-1 text-[11px] space-y-0.5">
+                      <PropRow label="A"    value={`${(steelShape.A_mm2 * 1e-2).toFixed(2)} cm²`} />
+                      <PropRow label="Ix"   value={`${(steelShape.Ix_mm4 * 1e-6).toFixed(1)}×10⁶ mm⁴`} />
+                      <PropRow label="Iy"   value={`${(steelShape.Iy_mm4 * 1e-6).toFixed(1)}×10⁶ mm⁴`} />
+                      <PropRow label="Zx"   value={`${(steelShape.Zx_mm3 * 1e-3).toFixed(1)} cm³`} />
+                      <PropRow label="Mp,x" value={`${(steelShape.Zx_mm3 * steelGrade.fy_mpa * 1e-6).toFixed(0)} kN·m`} />
+                      <PropRow label="Py"   value={`${(steelShape.A_mm2 * steelGrade.fy_mpa * 1e-3).toFixed(0)} kN`} />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <button
+                onClick={handleSaveSteel}
+                disabled={saving || !steelForm.name.trim() || !steelForm.shape_name}
+                className="mt-2 text-xs px-3 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors font-medium disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {saving ? "Creando…" : "Crear sección metálica"}
+              </button>
+              <p className="text-[10px] italic text-text-muted">
+                Se auto-crea el material de acero <code className="font-mono">Steel_{steelForm.grade}</code> si aún no existe.
+              </p>
+            </>
+          )}
         </div>
       </div>
     );
@@ -413,6 +629,69 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
           {saving ? "Guardando…" : mode === "create" ? "Crear sección" : "Guardar cambios"}
         </button>
       </div>
+    </div>
+  );
+}
+
+// ── Preview SVG de perfil metálico (W, HSS rect, Pipe) ───────────────────────
+
+function SteelShapePreviewSVG({
+  type, s,
+}: { type: "W" | "HSS_RECT" | "PIPE"; s: SteelCatalogShape }) {
+  const SIZE = 90, PAD = 10;
+  const d  = s.d_mm;
+  const bf = s.bf_mm;
+  const maxDim = Math.max(d, bf);
+  const scale = (SIZE - 2 * PAD) / maxDim;
+  const cx = SIZE / 2;
+  const cy = SIZE / 2;
+
+  if (type === "W") {
+    // Simplificacion: no tenemos tw/tf aqui, aproximamos como fracción del d
+    const h = d * scale;
+    const w = bf * scale;
+    const tf = Math.max(2, h * 0.08);
+    const tw = Math.max(1.5, w * 0.06);
+    return (
+      <svg width={SIZE} height={SIZE} className="flex-shrink-0">
+        {/* Flange superior */}
+        <rect x={cx - w / 2} y={cy - h / 2}   width={w}  height={tf} fill="#64748b" opacity="0.8" />
+        {/* Flange inferior */}
+        <rect x={cx - w / 2} y={cy + h / 2 - tf} width={w} height={tf} fill="#64748b" opacity="0.8" />
+        {/* Alma */}
+        <rect x={cx - tw / 2} y={cy - h / 2 + tf} width={tw} height={h - 2 * tf} fill="#64748b" opacity="0.8" />
+      </svg>
+    );
+  }
+
+  if (type === "HSS_RECT") {
+    const h = d * scale;
+    const w = bf * scale;
+    const t = Math.max(1.5, Math.min(h, w) * 0.07);
+    return (
+      <svg width={SIZE} height={SIZE} className="flex-shrink-0">
+        <rect x={cx - w / 2} y={cy - h / 2} width={w} height={h}
+          fill="#64748b" fillOpacity="0.2" stroke="#64748b" strokeWidth={t} />
+      </svg>
+    );
+  }
+
+  // PIPE
+  const r = (d / 2) * scale;   // d = OD
+  const t = Math.max(1.5, r * 0.15);
+  return (
+    <svg width={SIZE} height={SIZE} className="flex-shrink-0">
+      <circle cx={cx} cy={cy} r={r}
+        fill="#64748b" fillOpacity="0.2" stroke="#64748b" strokeWidth={t} />
+    </svg>
+  );
+}
+
+function PropRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-text-muted">{label}</span>
+      <span className="font-mono text-text">{value}</span>
     </div>
   );
 }

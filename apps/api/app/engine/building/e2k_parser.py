@@ -35,6 +35,44 @@ def _kv_from(tokens: list, start: int) -> dict:
     return d
 
 
+_STEEL_SHAPE_KEYWORDS = (
+    "steel", "wide flange", "i/wide", "channel", "angle",
+    "hss", "pipe", "wt", "tube", "tee", "built-up",
+)
+
+
+def _is_steel_shape_keyword(shape: str) -> bool:
+    """Heuristica: shape name sugiere perfil metalico (fallback cuando no
+    hay material explicito de acero)."""
+    s = (shape or "").lower().strip()
+    return any(k in s for k in _STEEL_SHAPE_KEYWORDS)
+
+
+def _resolve_aisc_shape(shape: str, aisc_label: str):
+    """Intenta resolver un shape name a un `SteelShape` del catalogo AISC.
+    Busca primero por AISCSHAPE explicito, luego por el nombre del shape si
+    coincide con un perfil del catalogo (p.ej. `shape="W24X55"`).
+
+    Retorna None si no se puede resolver.
+    """
+    try:
+        from engine.sections.steel_shapes import get_shape
+    except ImportError:
+        return None
+
+    candidates = [aisc_label, shape]
+    for c in candidates:
+        if not c:
+            continue
+        # Normaliza: quita espacios, uppercase
+        key = str(c).upper().replace(" ", "").replace("X", "X")
+        try:
+            return get_shape(key)
+        except KeyError:
+            continue
+    return None
+
+
 def _write_sheet(wb: Workbook, sheet_name: str, table_key: str,
                  columns: list, units: list, df: pd.DataFrame) -> None:
     """Write one sheet with the 3-row header the engine expects."""
@@ -60,6 +98,7 @@ class E2KParser:
         self.story_order: list = []            # bottom → top
 
         self.mat_concrete: dict = {}           # mat_name → {Fc, Ec, G, Poisson}
+        self.mat_steel: dict = {}              # mat_name → {Fy, Fu, E, G, Poisson}
         self.frame_sec_defs: dict = {}         # sec_name → {Material, t3, t2, …}
         self.concrete_secs: dict = {}          # sec_name → {type, bars_3, bars_2, area, cover}
         self.slab_props: dict = {}             # prop_name → {Material, Thickness, OneWay}
@@ -332,6 +371,7 @@ class E2KParser:
     def _parse_materials(self) -> None:
         mat_data: dict = {}
         concrete_names: set = set()
+        steel_names:    set = set()
         for line in self._sections.get('MATERIAL PROPERTIES', []):
             t = _tok(line)
             if not t or t[0].upper() != 'MATERIAL':
@@ -340,8 +380,11 @@ class E2KParser:
             if name not in mat_data:
                 mat_data[name] = {}
             kv = _kv_from(t, 2)
-            if kv.get('TYPE', '').upper() == 'CONCRETE':
+            tp = kv.get('TYPE', '').upper()
+            if tp == 'CONCRETE':
                 concrete_names.add(name)
+            elif tp == 'STEEL':
+                steel_names.add(name)
             mat_data[name].update(kv)
 
         for name in concrete_names:
@@ -356,6 +399,24 @@ class E2KParser:
                 'Fc': round(fc_mpa, 4),
                 'Ec': round(e_mpa, 4),
                 'G': round(g_mpa, 4),
+                'Poisson': nu,
+            }
+
+        for name in steel_names:
+            kv = mat_data[name]
+            fy_kpa = abs(float(kv.get('FY', 0)))
+            fu_kpa = abs(float(kv.get('FU', 0)))
+            e_kpa  = abs(float(kv.get('E', 0)))
+            nu     = float(kv.get('U', 0.3))
+            fy_mpa = fy_kpa / 1000.0 if fy_kpa else 345.0   # default A992
+            fu_mpa = fu_kpa / 1000.0 if fu_kpa else 450.0
+            e_mpa  = e_kpa  / 1000.0 if e_kpa  else 200_000.0
+            g_mpa  = e_mpa / (2 * (1 + nu)) if e_mpa > 0 else 77_000.0
+            self.mat_steel[name] = {
+                'Fy': round(fy_mpa, 2),
+                'Fu': round(fu_mpa, 2),
+                'E':  round(e_mpa, 1),
+                'G':  round(g_mpa, 1),
                 'Poisson': nu,
             }
 
@@ -375,6 +436,35 @@ class E2KParser:
         for name, kv in sec_data.items():
             mat = kv.get('MATERIAL', '')
             shape = kv.get('SHAPE', 'Rectangular')
+
+            # ── Detectar perfil AISC conocido ────────────────────────────
+            # Si el shape es "Steel I/Wide Flange" o explicitamente un nombre
+            # AISC como "W24X55", intentamos resolver desde el catalogo para
+            # obtener propiedades geometricas reales.
+            is_steel = (mat in self.mat_steel) or _is_steel_shape_keyword(shape)
+            aisc_shape = _resolve_aisc_shape(shape, kv.get('AISCSHAPE', ''))
+            if is_steel and aisc_shape is not None:
+                # Propiedades reales del perfil (convertidas a m)
+                MM2_TO_M2 = 1e-6
+                MM4_TO_M4 = 1e-12
+                self.frame_sec_defs[name] = {
+                    'Material':    mat,
+                    'Shape':       'steel',
+                    'SteelShape':  aisc_shape.name,
+                    'AISCType':    aisc_shape.type.value,
+                    't3':          aisc_shape.d  * 1e-3,
+                    't2':          aisc_shape.bf * 1e-3,
+                    'Area':        aisc_shape.A  * MM2_TO_M2,
+                    'I33':         aisc_shape.Ix * MM4_TO_M4,
+                    'I22':         aisc_shape.Iy * MM4_TO_M4,
+                    'J':           aisc_shape.J  * MM4_TO_M4,
+                    'Zx':          aisc_shape.Zx * 1e-9,
+                    'Zy':          aisc_shape.Zy * 1e-9,
+                }
+                continue
+
+            # Fallback: sección rectangular genérica (puede ser concreto o
+            # acero con shape desconocido; propiedades aproximadas).
             t3 = float(kv.get('D', kv.get('T3', 0)))
             t2 = float(kv.get('B', kv.get('T2', t3)))
             area = t3 * t2
@@ -920,6 +1010,16 @@ class E2KParser:
              'Poisson': m['Poisson'], 'Lightweight?': 'No'}
             for n, m in self.mat_concrete.items()
         ]
+        # Acero estructural: lo exportamos con la convencion de la tabla de
+        # concretos reusada (Fc=0, Ec=E) para que downstream el canonical
+        # builder lo detecte via mat_steel flag en sections. Formato compatible.
+        for n, m in self.mat_steel.items():
+            rows.append({
+                'Name': n, 'Fc': 0.0, 'Ec': m['E'], 'G': m['G'],
+                'Poisson': m['Poisson'], 'Lightweight?': 'No',
+                # Campos acero especificos
+                '_IsSteel': True, 'Fy': m['Fy'], 'Fu': m['Fu'],
+            })
         return pd.DataFrame(rows)
 
     def _build_mass_summary(self, df_joints: pd.DataFrame,

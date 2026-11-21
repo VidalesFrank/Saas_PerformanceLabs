@@ -413,6 +413,14 @@ class NLSpecBuilder:
             sec_d = self._m.get("sections", {}).get(sec, {})
             mat  = str(sec_d.get("material", ""))
             mats = self._m.get("materials", {})
+
+            # ── Branch acero estructural ─────────────────────────────────
+            if _is_steel_section(sec_d):
+                result[str(fid)] = _steel_frame_entry(
+                    fd, sec_d, mats.get(mat, {}), ji_d, jj_d, L,
+                )
+                continue
+
             fpc  = _to_float(
                 (mats.get(mat) or {}).get("fpc_mpa") or
                 (mats.get(mat) or {}).get("fc_MPa"), 21.0
@@ -635,6 +643,14 @@ class NLSpecBuilder:
             sec_d = self._m.get("sections", {}).get(sec, {})
             mat  = str(sec_d.get("material", ""))
             mats = self._m.get("materials", {})
+
+            # ── Branch acero estructural ─────────────────────────────────
+            if _is_steel_section(sec_d):
+                result[str(fid)] = _steel_frame_entry(
+                    fd, sec_d, mats.get(mat, {}), ji_d, jj_d, L,
+                )
+                continue
+
             fpc  = _to_float(
                 (mats.get(mat) or {}).get("fpc_mpa") or
                 (mats.get(mat) or {}).get("fc_MPa"), 21.0
@@ -910,3 +926,64 @@ class NLSpecBuilder:
             "ready_for_analysis":   len(warnings) == 0,
             "warnings":             warnings,
         }
+
+
+# ── Helpers de acero estructural ─────────────────────────────────────────────
+
+def _is_steel_section(sec_d: dict) -> bool:
+    """True si la seccion es de acero (shape_type/shape == 'steel')."""
+    if not sec_d:
+        return False
+    if str(sec_d.get("shape_type", "")).lower() == "steel":
+        return True
+    if str(sec_d.get("shape", "")).lower() == "steel":
+        return True
+    return False
+
+
+def _steel_frame_entry(
+    fd: dict, sec_d: dict, mat_d: dict,
+    ji_d: dict, jj_d: dict, L: float,
+) -> dict:
+    """Entrada en el spec NL para un frame (columna o viga) de acero.
+
+    Se omite reinforcement + confinement (conceptos RC). En su lugar se
+    propaga el bloque `steel` con geometria y propiedades del perfil para
+    que el ops builder construya la seccion fiber directamente.
+    """
+    return {
+        "node_i":          str(fd.get("joint_i", "")),
+        "node_j":          str(fd.get("joint_j", "")),
+        "story":           str(fd.get("story", "")),
+        "section":         str(fd.get("section", "")),
+        "geom_transf_vec": _geom_transf_vec(ji_d, jj_d),
+        "material_kind":   "steel",
+        "geometry": {
+            "L_m":   round(L, 3),
+            "b_m":   _to_float(sec_d.get("b_m"), 0.20),   # para lp y damage index
+            "h_m":   _to_float(sec_d.get("h_m"), 0.40),
+        },
+        "steel": {
+            "shape":    str(sec_d.get("steel_shape", "")),
+            "grade":    str(sec_d.get("steel_grade", "A992")),
+            "aisc_type": str(sec_d.get("aisc_type", "W")),
+            # Dimensiones (m) directas para construir las fibras
+            "d_m":      _to_float(sec_d.get("h_m")),      # overall depth
+            "bf_m":     _to_float(sec_d.get("b_m")),      # flange width
+            "tw_m":     _to_float(sec_d.get("tw_m")),
+            "tf_m":     _to_float(sec_d.get("tf_m")),
+            "t_des_m":  _to_float(sec_d.get("t_des_m")),
+            "OD_m":     _to_float(sec_d.get("OD_m")),
+            # Propiedades geometricas
+            "A_m2":     _to_float(sec_d.get("A_m2")),
+            "Iz_m4":    _to_float(sec_d.get("I33_m4")),   # fuerte
+            "Iy_m4":    _to_float(sec_d.get("I22_m4")),   # debil
+            "J_m4":     _to_float(sec_d.get("J_m4")),
+            # Material
+            "fy_MPa":   _to_float(mat_d.get("fy_mpa"), 345.0),
+            "fu_MPa":   _to_float(mat_d.get("fu_mpa"), 450.0),
+            "E_MPa":    _to_float(mat_d.get("E_mpa"), 200_000.0),
+            "G_MPa":    _to_float(mat_d.get("G_mpa"), 77_000.0),
+        },
+        "has_design":    True,   # el perfil AISC es el "diseno"
+    }
