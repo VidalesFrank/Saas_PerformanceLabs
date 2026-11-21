@@ -190,6 +190,101 @@ def default_period_array(T_min: float = 0.01, T_max: float = 4.0, n_points: int 
     return np.logspace(np.log10(T_min), np.log10(T_max), n_points)
 
 
+# ── RotDnn — espectros rotacionalmente invariantes (Boore 2006/2010) ──────────
+
+def rotd_spectrum(
+    ag_h1: np.ndarray,
+    ag_h2: np.ndarray,
+    dt: float,
+    T_array: np.ndarray,
+    xi: float = 0.05,
+    n_angles: int = 180,
+    percentiles: tuple[float, ...] = (50.0, 100.0),
+) -> dict:
+    """Espectros RotDnn a partir de dos componentes horizontales ortogonales.
+
+    Boore (2010) RotDnn: para cada periodo T, computar el espectro de la señal
+    rotada ag_θ(t) = cos(θ)·ag_h1(t) + sin(θ)·ag_h2(t) a ángulos θ ∈ [0, 180°)
+    y tomar el percentil `nn` de Sa(T, θ) sobre los ángulos.
+
+    Por linealidad del SDOF, en vez de resolver el oscilador por cada (T, θ),
+    resolvemos sólo dos veces por T (una por componente) y rotamos la
+    aceleración absoluta analíticamente:
+        a_abs_θ(t, T) = cos(θ)·a_abs_h1(t, T) + sin(θ)·a_abs_h2(t, T)
+    De ahí Sa(T, θ) = max_t |a_abs_θ(t, T)|.
+
+    Args:
+        ag_h1   : componente horizontal 1 en m/s² (array 1D).
+        ag_h2   : componente horizontal 2 en m/s² (array 1D, misma longitud y dt).
+        dt      : Δt en segundos.
+        T_array : periodos a evaluar en segundos (array 1D).
+        xi      : amortiguamiento fraccional (default 5 %).
+        n_angles: número de ángulos en [0, 180°). Default 180 → 1° de resolución.
+        percentiles: percentiles a extraer. Default (50, 100) = RotD50 y RotD100.
+
+    Returns:
+        dict con:
+            T              : lista de periodos
+            Sa_h1, Sa_h2   : espectros Sa clásicos de cada componente individual (m/s²)
+            RotD{nn}       : espectros percentilares (m/s²) — una clave por nn
+            angle_RotD100  : ángulo (°) donde ocurre el máximo para cada T
+            xi, n_angles, percentiles
+
+    Ref: Boore, D.M. (2010). Orientation-Independent, Nongeometric-Mean Measures
+         of Seismic Intensity from Two Horizontal Components of Motion.
+         Bulletin of the Seismological Society of America, 100(4), 1830-1835.
+    """
+    if len(ag_h1) != len(ag_h2):
+        raise ValueError(
+            f"ag_h1 y ag_h2 deben tener la misma longitud (recibí {len(ag_h1)} y {len(ag_h2)})"
+        )
+    if n_angles < 2:
+        raise ValueError("n_angles debe ser >= 2")
+
+    n_T = len(T_array)
+    thetas = np.linspace(0.0, np.pi, n_angles, endpoint=False)
+    cos_t = np.cos(thetas)[:, None]  # (n_angles, 1) para broadcasting
+    sin_t = np.sin(thetas)[:, None]
+
+    Sa_h1 = np.zeros(n_T)
+    Sa_h2 = np.zeros(n_T)
+    percentile_arrays = {p: np.zeros(n_T) for p in percentiles}
+    angle_rotd100 = np.zeros(n_T)
+
+    for i, T in enumerate(T_array):
+        _, _, _, a1 = newmark_sdof(ag_h1, dt, T, xi)
+        _, _, _, a2 = newmark_sdof(ag_h2, dt, T, xi)
+
+        Sa_h1[i] = float(np.max(np.abs(a1)))
+        Sa_h2[i] = float(np.max(np.abs(a2)))
+
+        # Rotación: a_theta(t) de shape (n_angles, n_samples)
+        # a_theta = cos(θ) * a1[None, :] + sin(θ) * a2[None, :]
+        a_theta = cos_t * a1[None, :] + sin_t * a2[None, :]
+        Sa_theta = np.max(np.abs(a_theta), axis=1)  # (n_angles,)
+
+        for p in percentiles:
+            percentile_arrays[p][i] = float(np.percentile(Sa_theta, p))
+
+        # Ángulo del máximo (RotD100)
+        idx_max = int(np.argmax(Sa_theta))
+        angle_rotd100[i] = float(np.degrees(thetas[idx_max]))
+
+    out: dict = {
+        "T":      T_array.tolist(),
+        "Sa_h1":  Sa_h1.tolist(),
+        "Sa_h2":  Sa_h2.tolist(),
+        "angle_RotD100": angle_rotd100.tolist(),
+        "xi":     xi,
+        "n_angles": n_angles,
+        "percentiles": list(percentiles),
+    }
+    for p in percentiles:
+        key = f"RotD{int(p)}" if float(p).is_integer() else f"RotD{p:g}"
+        out[key] = percentile_arrays[p].tolist()
+    return out
+
+
 def spectrum_at_period(
     ag: np.ndarray,
     dt: float,

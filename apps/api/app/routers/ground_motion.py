@@ -58,6 +58,7 @@ from app.engine.ground_motion.analysis.frequency import compute_fft, compute_psd
 from app.engine.ground_motion.analysis.spectra import (
     response_spectrum,
     response_spectrum_multi_xi,
+    rotd_spectrum,
     default_period_array,
     spectrum_at_period,
 )
@@ -251,6 +252,22 @@ class SpectrumAtPeriodRequest(BaseModel):
     component: str = ""
     T: float
     xi: float = 0.05
+
+
+class RotDRequest(BaseModel):
+    """Par horizontal para espectros RotD50/RotD100 (Boore 2010).
+
+    Recibe los IDs de dos registros con componentes horizontales ortogonales
+    (típicamente NS y EW) de la misma estación y mismo dt.
+    """
+    id_h1: str
+    id_h2: str
+    xi: float = 0.05
+    T_min: float = 0.01
+    T_max: float = 4.0
+    n_points: int = 150
+    n_angles: int = 180
+    percentiles: list[float] = Field(default_factory=lambda: [50.0, 100.0])
 
 
 # ── Endpoint: detectar estructura del archivo ─────────────────────────────────
@@ -808,6 +825,83 @@ def spectrum_at_period_endpoint(
 
     acc_ms2 = acc_ch.effective_values_si()
     result  = spectrum_at_period(acc_ms2, gm_rec.dt, req.T, req.xi)
+    return result
+
+
+# ── Endpoint: RotD50 / RotD100 (par horizontal — Boore 2010) ────────────────
+
+@router.post("/rotd")
+def compute_rotd_endpoint(
+    req: RotDRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Espectros rotacionalmente invariantes a partir de dos componentes horizontales.
+
+    RotD50 (mediana) y RotD100 (máximo) sobre todas las orientaciones θ ∈ [0, 180°).
+    Standard en NGA-West2 y ASCE 7-22 como IM horizontal de referencia.
+
+    Requiere que ambos registros tengan el mismo Δt (tolerancia 1 %). La
+    longitud se trunca al mínimo de los dos para alinear la historia temporal.
+    """
+    if req.id_h1 == req.id_h2:
+        raise HTTPException(422, "id_h1 e id_h2 deben ser registros distintos.")
+
+    rec1_db = _get_record_or_404(req.id_h1, current_user.id, db)
+    rec2_db = _get_record_or_404(req.id_h2, current_user.id, db)
+    gm1 = _load_record_data(rec1_db)
+    gm2 = _load_record_data(rec2_db)
+
+    if gm1.dt is None or gm2.dt is None:
+        raise HTTPException(422, "Ambos registros deben tener dt definido.")
+    if abs(gm1.dt - gm2.dt) / gm1.dt > 0.01:
+        raise HTTPException(
+            422,
+            f"Δt incompatible entre registros: {gm1.dt:.6f}s vs {gm2.dt:.6f}s "
+            f"(diferencia > 1 %)."
+        )
+
+    ch1 = gm1.get_acceleration_channel()
+    ch2 = gm2.get_acceleration_channel()
+    if ch1 is None or ch2 is None:
+        raise HTTPException(404, "Canal de aceleración no encontrado en uno de los registros.")
+
+    a1 = ch1.effective_values_si()
+    a2 = ch2.effective_values_si()
+    n  = min(len(a1), len(a2))
+    a1 = np.asarray(a1[:n], dtype=float)
+    a2 = np.asarray(a2[:n], dtype=float)
+
+    T_array = default_period_array(req.T_min, req.T_max, req.n_points)
+    percentiles = tuple(float(p) for p in req.percentiles)
+
+    try:
+        result = rotd_spectrum(
+            a1, a2, gm1.dt, T_array,
+            xi=req.xi, n_angles=req.n_angles, percentiles=percentiles,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    # Metadata para el frontend — en DB es metadata_json, en engine es metadata
+    md1 = rec1_db.metadata_json or {}
+    md2 = rec2_db.metadata_json or {}
+    result["meta"] = {
+        "h1": {
+            "id": req.id_h1,
+            "name": rec1_db.name,
+            "component": (md1.get("component") or ch1.component or "").upper(),
+            "station": md1.get("station"),
+        },
+        "h2": {
+            "id": req.id_h2,
+            "name": rec2_db.name,
+            "component": (md2.get("component") or ch2.component or "").upper(),
+            "station": md2.get("station"),
+        },
+        "dt": gm1.dt,
+        "n_samples_used": n,
+    }
     return result
 
 

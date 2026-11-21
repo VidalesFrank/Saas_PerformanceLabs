@@ -198,6 +198,24 @@ export interface SpectrumMultiXiResult {
   record_name: string
 }
 
+export interface RotDResult {
+  T: number[]
+  Sa_h1: number[]
+  Sa_h2: number[]
+  RotD50: number[]
+  RotD100: number[]
+  angle_RotD100: number[]
+  xi: number
+  n_angles: number
+  percentiles: number[]
+  meta: {
+    h1: { id: string; name: string; component: string; station: string | null }
+    h2: { id: string; name: string; component: string; station: string | null }
+    dt: number
+    n_samples_used: number
+  }
+}
+
 export interface SpectrumAtPeriodResult {
   T: number
   xi: number

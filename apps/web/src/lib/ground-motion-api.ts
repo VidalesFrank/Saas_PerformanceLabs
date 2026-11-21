@@ -7,6 +7,7 @@ import {
   GMRecord,
   IntensityMeasures,
   ProcessResult,
+  RotDResult,
   SpectrumAtPeriodResult,
   SpectrumMultiXiResult,
   SpectrumResult,
@@ -201,6 +202,26 @@ export function triggerDownload(blob: Blob, filename: string): void {
   a.click()
   a.remove()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+export async function computeRotD(
+  id_h1: string,
+  id_h2: string,
+  params: {
+    xi?: number
+    T_min?: number
+    T_max?: number
+    n_points?: number
+    n_angles?: number
+    percentiles?: number[]
+  } = {},
+): Promise<RotDResult> {
+  const res = await fetch(`${BASE}/rotd`, {
+    method: 'POST',
+    headers: { ...authHeader(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id_h1, id_h2, ...params }),
+  })
+  return handleResponse<RotDResult>(res)
 }
 
 export async function spectrumAtPeriod(

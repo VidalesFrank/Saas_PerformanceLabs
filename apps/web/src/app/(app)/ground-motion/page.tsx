@@ -135,6 +135,9 @@ function groupRecords(records: GMRecord[]): CampaignGroup[] {
   return result
 }
 
+const MAX_COMPARE = 8
+const MIN_COMPARE = 2
+
 export default function GroundMotionListPage() {
   useRequireAuth()
   const router = useRouter()
@@ -148,6 +151,31 @@ export default function GroundMotionListPage() {
   const [activeRegion, setActiveRegion]     = useState<string | 'all'>('all')
   const [activeComponent, setActiveComponent] = useState<string | 'all'>('all')
   const [collapsedRegions, setCollapsedRegions] = useState<Set<string>>(new Set())
+
+  // Modo comparación — permite seleccionar 2-8 registros para abrir /ground-motion/compare
+  const [selectMode, setSelectMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+
+  const toggleSelected = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        if (next.size >= MAX_COMPARE) return prev
+        next.add(id)
+      }
+      return next
+    })
+  }
+  const clearSelection = () => setSelectedIds(new Set())
+  const exitSelectMode = () => { setSelectMode(false); clearSelection() }
+  const enterSelectMode = () => { setSelectMode(true) }
+  const goCompare = () => {
+    if (selectedIds.size < MIN_COMPARE) return
+    const ids = Array.from(selectedIds).join(',')
+    router.push(`/ground-motion/compare?ids=${encodeURIComponent(ids)}`)
+  }
 
   useEffect(() => { loadRecords() }, [])
 
@@ -270,14 +298,33 @@ export default function GroundMotionListPage() {
         tone="blue"
         icon="seismograph"
         actions={
-          <button
-            onClick={() => setShowWizard(true)}
-            className="pl-cta-primary"
-            style={{ background: "linear-gradient(135deg, #3b82f6 0%, #6366f1 100%)" }}
-          >
-            <span className="text-base leading-none">+</span>
-            Importar Registro
-          </button>
+          <div className="flex items-center gap-2">
+            {selectMode ? (
+              <button
+                onClick={exitSelectMode}
+                className="pl-cta-ghost"
+              >
+                Cancelar selección
+              </button>
+            ) : (
+              <button
+                onClick={enterSelectMode}
+                className="pl-cta-ghost"
+                title="Selecciona 2-8 registros para comparar sus espectros"
+              >
+                <span className="text-base leading-none">⇆</span>
+                Comparar registros
+              </button>
+            )}
+            <button
+              onClick={() => setShowWizard(true)}
+              className="pl-cta-primary"
+              style={{ background: "linear-gradient(135deg, #3b82f6 0%, #6366f1 100%)" }}
+            >
+              <span className="text-base leading-none">+</span>
+              Importar Registro
+            </button>
+          </div>
         }
       />
 
@@ -399,7 +446,10 @@ export default function GroundMotionListPage() {
                                 {r.stations.map((s) => (
                                   <StationCard key={`${r.region}/${s.station}`}
                                     station={s} regionColor={r.color}
-                                    onDelete={handleDelete} />
+                                    onDelete={handleDelete}
+                                    selectMode={selectMode}
+                                    selectedIds={selectedIds}
+                                    onToggleSelect={toggleSelected} />
                                 ))}
                               </div>
                             )}
@@ -414,6 +464,50 @@ export default function GroundMotionListPage() {
           )}
         </div>
       </div>
+
+      {/* Barra flotante de comparación */}
+      {selectMode && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 pl-glass rounded-xl border border-[var(--panel-muted)]/50 shadow-2xl px-4 py-3 flex items-center gap-4 min-w-[320px]">
+          <div className="flex flex-col leading-tight">
+            <span className="text-[10.5px] uppercase tracking-[0.14em] font-bold text-[var(--text-muted)]">
+              Comparación
+            </span>
+            <span className="text-sm font-bold text-[var(--text)] font-mono">
+              {selectedIds.size} / {MAX_COMPARE} registros
+              {selectedIds.size < MIN_COMPARE && (
+                <span className="ml-2 text-[11px] font-normal text-amber-500">
+                  mín. {MIN_COMPARE}
+                </span>
+              )}
+            </span>
+          </div>
+          <div className="flex items-center gap-2 ml-auto">
+            {selectedIds.size > 0 && (
+              <button
+                onClick={clearSelection}
+                className="text-xs text-[var(--text-muted)] hover:text-[var(--text)] px-2 py-1"
+              >
+                Limpiar
+              </button>
+            )}
+            <button
+              onClick={goCompare}
+              disabled={selectedIds.size < MIN_COMPARE}
+              className="pl-cta-primary disabled:opacity-40 disabled:cursor-not-allowed"
+              style={{
+                background: selectedIds.size >= MIN_COMPARE
+                  ? "linear-gradient(135deg, #22d3ee 0%, #3b82f6 100%)"
+                  : undefined,
+                padding: "8px 16px",
+                fontSize: "12.5px",
+              }}
+            >
+              Comparar ({selectedIds.size})
+              <span className="text-base leading-none">→</span>
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -482,11 +576,14 @@ const COMP_COLOR: Record<string, string> = {
 }
 
 function StationCard({
-  station, regionColor, onDelete,
+  station, regionColor, onDelete, selectMode, selectedIds, onToggleSelect,
 }: {
   station: StationGroup
   regionColor: string
   onDelete: (id: string, name: string) => void
+  selectMode: boolean
+  selectedIds: Set<string>
+  onToggleSelect: (id: string) => void
 }) {
   return (
     <div className="pl-glass rounded-lg p-3 border border-[var(--panel-muted)]/40 hover:border-[var(--color-accent)]/60 hover:shadow-[0_6px_20px_-8px_rgba(99,102,241,0.25)] hover:-translate-y-0.5 transition-all duration-150">
@@ -521,32 +618,67 @@ function StationCard({
           const dur = r.duration ? `${r.duration.toFixed(1)} s` : null
           const fs  = r.dt ? `${(1 / r.dt).toFixed(0)} Hz` : null
           const npts = r.n_samples?.toLocaleString() ?? null
+          const isSelected = selectedIds.has(r.id)
+          const badge = (
+            <>
+              <span
+                className="font-mono text-[11px] font-extrabold px-1.5 py-0.5 rounded flex-shrink-0 w-7 text-center border"
+                style={{
+                  background: `${color}1f`,
+                  color,
+                  borderColor: `${color}55`,
+                  boxShadow: `0 0 8px ${color}33, inset 0 1px 0 ${color}22`,
+                }}>
+                {compLabel}
+              </span>
+              <span className="text-xs text-[var(--text)] truncate font-mono">
+                {r.name}
+              </span>
+              <span className="text-[10px] text-[var(--text-muted)] font-mono ml-auto flex-shrink-0">
+                {[dur, fs, npts].filter(Boolean).join(' · ')}
+              </span>
+            </>
+          )
           return (
-            <div key={r.id} className="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-[var(--panel-muted)]/40 transition-colors">
-              <Link href={`/ground-motion/${r.id}`} className="flex items-center gap-2 flex-1 min-w-0">
+            <div
+              key={r.id}
+              className={`group flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors ${
+                selectMode
+                  ? isSelected
+                    ? 'bg-cyan-500/10 ring-1 ring-cyan-400/50'
+                    : 'hover:bg-[var(--panel-muted)]/40 cursor-pointer'
+                  : 'hover:bg-[var(--panel-muted)]/40'
+              }`}
+              onClick={selectMode ? () => onToggleSelect(r.id) : undefined}
+            >
+              {selectMode && (
                 <span
-                  className="font-mono text-[11px] font-extrabold px-1.5 py-0.5 rounded flex-shrink-0 w-7 text-center border"
-                  style={{
-                    background: `${color}1f`,
-                    color,
-                    borderColor: `${color}55`,
-                    boxShadow: `0 0 8px ${color}33, inset 0 1px 0 ${color}22`,
-                  }}>
-                  {compLabel}
+                  className={`inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded border transition-all ${
+                    isSelected
+                      ? 'bg-cyan-500 border-cyan-400 text-white shadow-[0_0_10px_rgba(34,211,238,0.55)]'
+                      : 'bg-transparent border-[var(--panel-muted)]/70'
+                  }`}
+                  aria-checked={isSelected}
+                  role="checkbox"
+                >
+                  {isSelected && <span className="text-[10px] font-bold leading-none">✓</span>}
                 </span>
-                <span className="text-xs text-[var(--text)] truncate font-mono">
-                  {r.name}
-                </span>
-                <span className="text-[10px] text-[var(--text-muted)] font-mono ml-auto flex-shrink-0">
-                  {[dur, fs, npts].filter(Boolean).join(' · ')}
-                </span>
-              </Link>
-              <button
-                onClick={(e) => { e.stopPropagation(); onDelete(r.id, r.name) }}
-                className="p-1 text-[var(--text-muted)] hover:text-rose-400 opacity-0 group-hover:opacity-100 transition-opacity text-xs"
-                title="Eliminar registro">
-                ✕
-              </button>
+              )}
+              {selectMode ? (
+                <div className="flex items-center gap-2 flex-1 min-w-0">{badge}</div>
+              ) : (
+                <Link href={`/ground-motion/${r.id}`} className="flex items-center gap-2 flex-1 min-w-0">
+                  {badge}
+                </Link>
+              )}
+              {!selectMode && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onDelete(r.id, r.name) }}
+                  className="p-1 text-[var(--text-muted)] hover:text-rose-400 opacity-0 group-hover:opacity-100 transition-opacity text-xs"
+                  title="Eliminar registro">
+                  ✕
+                </button>
+              )}
             </div>
           )
         })}

@@ -27,7 +27,7 @@ from app.engine.ground_motion.analysis.intensity import (
     compute_significant_duration, compute_all_intensity_measures,
 )
 from app.engine.ground_motion.analysis.frequency import compute_fft
-from app.engine.ground_motion.analysis.spectra import newmark_sdof, response_spectrum, default_period_array
+from app.engine.ground_motion.analysis.spectra import newmark_sdof, response_spectrum, rotd_spectrum, default_period_array
 from app.engine.ground_motion.units import acc_to_ms2, G_STD
 
 
@@ -525,6 +525,86 @@ class TestResponseSpectrum:
                 f"PSV[{i}] = ω·Sd[{i}]: {PSV[i]:.6f} vs {omega * Sd[i]:.6f}"
             assert abs(PSA[i] - omega**2 * Sd[i]) < 1e-8, \
                 f"PSA[{i}] = ω²·Sd[{i}]: {PSA[i]:.6f} vs {omega**2 * Sd[i]:.6f}"
+
+
+# ── Tests RotD50/RotD100 (Boore 2010) ─────────────────────────────────────────
+
+class TestRotDSpectrum:
+    """Validación de la implementación rotacionalmente invariante."""
+
+    def test_single_component_rotd_matches_h1(self):
+        """Si ag_h2 es cero, RotD100 debe igualar Sa_h1 en θ=0°."""
+        dt  = 0.01
+        t   = np.arange(0, 10.0, dt)
+        ag1 = 0.3 * G_STD * np.sin(2 * np.pi * 1.0 * t) * np.exp(-0.08 * t)
+        ag2 = np.zeros_like(ag1)
+        T_arr = np.array([0.2, 0.5, 1.0])
+
+        res = rotd_spectrum(ag1, ag2, dt, T_arr, xi=0.05, n_angles=180)
+
+        np.testing.assert_allclose(res["Sa_h1"], res["RotD100"], rtol=1e-6)
+        # RotD50 ≤ RotD100 siempre
+        assert all(r50 <= r100 + 1e-9
+                   for r50, r100 in zip(res["RotD50"], res["RotD100"]))
+        # Ángulo del máximo ≈ 0° cuando toda la energía está en H1
+        for ang in res["angle_RotD100"]:
+            assert ang < 1.5 or ang > 178.5, f"θ_max = {ang:.2f}° esperado ≈ 0°"
+
+    def test_rotd100_at_45_when_components_equal(self):
+        """Si ag_h1 == ag_h2, el máximo de la envolvente ocurre a θ=45°
+        y vale ≈ √2 · Sa_h1 (combinación coherente)."""
+        dt  = 0.01
+        t   = np.arange(0, 10.0, dt)
+        ag  = 0.25 * G_STD * np.sin(2 * np.pi * 1.5 * t) * np.exp(-0.05 * t)
+        T_arr = np.array([0.5, 1.0])
+
+        res = rotd_spectrum(ag, ag, dt, T_arr, xi=0.05, n_angles=180)
+
+        for i in range(len(T_arr)):
+            expected = np.sqrt(2.0) * res["Sa_h1"][i]
+            # Tolerancia 1 % por discretización angular (step 1°)
+            rel = abs(res["RotD100"][i] - expected) / expected
+            assert rel < 0.01, (
+                f"T={T_arr[i]}s: RotD100={res['RotD100'][i]:.4f} vs √2·Sa_h1={expected:.4f}"
+            )
+            # Ángulo del pico ≈ 45° con tolerancia de 1°
+            ang = res["angle_RotD100"][i]
+            assert 44.0 <= ang <= 46.0, f"θ_max={ang:.2f}° esperado ≈ 45°"
+
+    def test_rotd50_leq_rotd100_random(self):
+        """Para pares aleatorios, RotD50 ≤ RotD100 en todo T."""
+        rng = np.random.default_rng(42)
+        dt  = 0.01
+        n   = 2000
+        ag1 = rng.standard_normal(n) * 0.2
+        ag2 = rng.standard_normal(n) * 0.2
+        T_arr = default_period_array(0.1, 2.0, 15)
+
+        res = rotd_spectrum(ag1, ag2, dt, T_arr, xi=0.05, n_angles=90)
+        for r50, r100 in zip(res["RotD50"], res["RotD100"]):
+            assert r50 <= r100 + 1e-9
+
+    def test_length_mismatch_raises(self):
+        """Longitudes desiguales deben lanzar ValueError."""
+        with pytest.raises(ValueError, match="misma longitud"):
+            rotd_spectrum(
+                np.zeros(100), np.zeros(99), 0.01,
+                np.array([1.0]), xi=0.05,
+            )
+
+    def test_output_keys_consistency(self):
+        """La función devuelve claves esperadas: T, Sa_h1, Sa_h2, RotD50, RotD100, angle."""
+        dt  = 0.01
+        t   = np.arange(0, 5.0, dt)
+        ag1 = 0.1 * G_STD * np.sin(2 * np.pi * 2.0 * t)
+        ag2 = 0.1 * G_STD * np.cos(2 * np.pi * 2.0 * t)
+        T_arr = np.array([0.3, 0.6])
+
+        res = rotd_spectrum(ag1, ag2, dt, T_arr)
+        for k in ("T", "Sa_h1", "Sa_h2", "RotD50", "RotD100", "angle_RotD100"):
+            assert k in res, f"Clave faltante: {k}"
+        assert len(res["RotD50"]) == len(T_arr)
+        assert len(res["RotD100"]) == len(T_arr)
 
 
 # ── Tests de unidades ─────────────────────────────────────────────────────────
