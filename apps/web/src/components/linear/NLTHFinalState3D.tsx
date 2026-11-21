@@ -29,7 +29,60 @@ import type {
 } from "@/lib/structural-types";
 
 import { EVENT_STYLE } from "./LocalEventsPanel";
-import { makeBox } from "../building/ModelViewer3D";
+
+// ── Genera un prisma rectangular (mesh3d) para el modo extruido ───────────
+// Rescatado del antiguo ModelViewer3D eliminado en el rediseño del app shell.
+function makeBox(
+  x1: number, y1: number, z1: number,
+  x2: number, y2: number, z2: number,
+  b: number, h: number,
+  localY: [number, number, number],
+  color: string,
+  label: string,
+): object[] {
+  const ax = x2 - x1, ay = y2 - y1, az = z2 - z1;
+  const L  = Math.sqrt(ax * ax + ay * ay + az * az);
+  if (L < 1e-6) return [];
+
+  const ex: [number, number, number] = [ax / L, ay / L, az / L];
+  let ey: [number, number, number] = [...(localY ?? [0, 1, 0])];
+  const dot = ey[0] * ex[0] + ey[1] * ex[1] + ey[2] * ex[2];
+  ey = [ey[0] - dot * ex[0], ey[1] - dot * ex[1], ey[2] - dot * ex[2]];
+  const lyLen = Math.sqrt(ey[0] ** 2 + ey[1] ** 2 + ey[2] ** 2);
+  if (lyLen < 1e-6) {
+    ey = ex[2] < 0.9 ? [0, 0, 1] : [0, 1, 0];
+  } else {
+    ey = [ey[0] / lyLen, ey[1] / lyLen, ey[2] / lyLen];
+  }
+  const ez: [number, number, number] = [
+    ey[1] * ex[2] - ey[2] * ex[1],
+    ey[2] * ex[0] - ey[0] * ex[2],
+    ey[0] * ex[1] - ey[1] * ex[0],
+  ];
+  const hb = b / 2, hh = h / 2;
+  const corners: [number, number][] = [[-hb, -hh], [hb, -hh], [hb, hh], [-hb, hh]];
+  const pts = [
+    ...corners.map(([u, v]) => [x1 + u * ey[0] + v * ez[0], y1 + u * ey[1] + v * ez[1], z1 + u * ey[2] + v * ez[2]]),
+    ...corners.map(([u, v]) => [x2 + u * ey[0] + v * ez[0], y2 + u * ey[1] + v * ez[1], z2 + u * ey[2] + v * ez[2]]),
+  ];
+  const px = pts.map(p => p[0]), py = pts.map(p => p[1]), pz = pts.map(p => p[2]);
+  const i_ = [0, 0, 1, 1, 2, 2, 3, 3, 0, 0, 1, 2, 4, 4, 5, 6];
+  const j_ = [1, 2, 2, 5, 3, 6, 0, 7, 1, 4, 5, 3, 5, 6, 6, 7];
+  const k_ = [2, 5, 5, 6, 6, 7, 7, 4, 4, 5, 6, 7, 6, 7, 7, 4];
+  return [{
+    type: "mesh3d",
+    x: px, y: py, z: pz,
+    i: i_, j: j_, k: k_,
+    color,
+    opacity: 0.75,
+    flatshading: true,
+    hovertext: label,
+    hoverinfo: "text",
+    showlegend: false,
+    lighting:      { ambient: 0.7, diffuse: 0.8, roughness: 0.5, specular: 0.2 },
+    lightposition: { x: 1000, y: 1000, z: 2000 },
+  }];
+}
 
 type ViewMode = "lines" | "extruded";
 

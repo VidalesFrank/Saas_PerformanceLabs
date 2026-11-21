@@ -1211,20 +1211,10 @@ function normCdf(z: number): number {
   return z > 0 ? 1 - p : p;
 }
 
-/** P(X > x) para X ~ lognormal estimada desde P16/P50/P84:
- *  μ_ln = ln(P50), σ_ln = (ln(P84) − ln(P16)) / 2. Fallback binario si σ ≈ 0. */
-function lognormalProbExceeds(p16: number, p50: number, p84: number, x: number): number {
-  const FLOOR = 1e-4;
-  const p16s = Math.max(p16, FLOOR);
-  const p50s = Math.max(p50, FLOOR);
-  const p84s = Math.max(p84, FLOOR);
-  const sigma = (Math.log(p84s) - Math.log(p16s)) / 2;
-  if (!isFinite(sigma) || sigma <= 1e-6) {
-    return p50 >= x ? 1 : 0;
-  }
-  const z = (Math.log(x) - Math.log(p50s)) / sigma;
-  return 1 - normCdf(z);
-}
+// Paleta y nombres de los 4 estados de daño (DS1–DS4) — fuera del componente
+// para evitar que el useEffect de fragilidad vuelva a correr en cada render.
+const DS_COLORS = ["#10b981", "#f59e0b", "#f97316", "#dc2626"] as const;
+const DS_LABELS = ["DS1 · Leve", "DS2 · Moderado", "DS3 · Extenso", "DS4 · Completo"] as const;
 
 function ForensicAnalysisSection({
   result, catalog, T1, levelIdx, setLevelIdx,
@@ -1242,6 +1232,21 @@ function ForensicAnalysisSection({
   const cascadeRefs  = useRef<(HTMLDivElement | null)[]>([]);
   const fragilityRef = useRef<HTMLDivElement | null>(null);
   const spectrumRef  = useRef<HTMLDivElement | null>(null);
+
+  // Umbrales de deriva de entrepiso (%) para cada estado de daño.
+  // Defaults alineados con NSR-10 A.6.4 / ASCE 41-17: IO≈0.5, LS≈1.0, CP≈2.0,
+  // colapso ≈ 4.0. El usuario los puede editar en vivo; las curvas de
+  // fragilidad se recalculan por useMemo.
+  const [dsThresholds, setDsThresholds] = useState<[number, number, number, number]>(
+    [0.5, 1.0, 2.0, 4.0],
+  );
+  const setDS = (i: number, v: number) => {
+    setDsThresholds((prev) => {
+      const next = [...prev] as [number, number, number, number];
+      next[i] = Math.max(0.01, v);
+      return next;
+    });
+  };
 
   const stories_z = result.stories_z ?? [];
   const n_stories = result.n_stories ?? stories_z.length;
@@ -1396,69 +1401,153 @@ function ForensicAnalysisSection({
     });
   }, [plotlyReady, result.stats_per_level, n_stories, levelIdx, xMaxGlobal]);
 
-  // ── Plot 2: fragility heatmap — P(Δ > LS = 1 %) por piso × Sa ────────────
+  // ── Plot 2: curvas de fragilidad lognormal — P(Δmax > DS_i) vs Sa(T₁) ────
+  // Para cada DS_i:
+  //   1. Por cada par, buscar por interpolación lineal la Sa a la que su
+  //      deriva máxima cruza DS_i → "capacidad" del par para ese DS.
+  //   2. Ajuste lognormal sobre las capacidades (FEMA P-695 §7.3):
+  //      θ = exp(mean(ln C_j)),  β = std(ln C_j).
+  //   3. Curva P(Sa) = Φ((ln Sa − ln θ)/β).
+  // Además: puntos empíricos = fracción directa de pares que superan DS_i
+  // en cada Sa del grid.
+  const fragilityFits = useMemo(() => {
+    const pairIds = Object.keys(result.curves);
+    const nPairs = pairIds.length;
+
+    // Series por par (Sa, drift) ordenadas ascendentes
+    const seriesByPair: Record<string, { Sa: number; drift: number }[]> = {};
+    for (const pid of pairIds) {
+      seriesByPair[pid] = result.curves[pid]
+        .filter((p) => p.max_drift_pct != null && p.Sa_g > 0)
+        .map((p) => ({ Sa: p.Sa_g, drift: p.max_drift_pct as number }))
+        .sort((a, b) => a.Sa - b.Sa);
+    }
+
+    return dsThresholds.map((DS) => {
+      // 1. Capacidades por par (interpolación lineal al cruzar DS)
+      const capacities: number[] = [];
+      for (const pid of pairIds) {
+        const s = seriesByPair[pid];
+        let cap: number | null = null;
+        for (let i = 0; i < s.length; i++) {
+          if (s[i].drift >= DS) {
+            if (i === 0) {
+              cap = s[0].Sa;
+            } else {
+              const { Sa: Sa0, drift: d0 } = s[i - 1];
+              const { Sa: Sa1, drift: d1 } = s[i];
+              cap = d1 === d0 ? Sa1 : Sa0 + (Sa1 - Sa0) * (DS - d0) / (d1 - d0);
+            }
+            break;
+          }
+        }
+        if (cap != null && isFinite(cap) && cap > 0) capacities.push(cap);
+      }
+
+      // 2. Fracción empírica por nivel Sa
+      const empirical = result.stats_per_level.map((lvl) => {
+        let nExc = 0, nTot = 0;
+        for (const pid of pairIds) {
+          const pt = result.curves[pid].find((x) => x.level_index === lvl.level_index);
+          if (!pt || pt.max_drift_pct == null) continue;
+          nTot++;
+          if (pt.max_drift_pct >= DS) nExc++;
+        }
+        return { Sa: lvl.Sa_g, frac: nTot ? nExc / nTot : 0 };
+      });
+
+      // 3. Ajuste lognormal (log-moment matching)
+      let theta: number | null = null;
+      let beta: number | null = null;
+      if (capacities.length >= 2) {
+        const lnC = capacities.map((c) => Math.log(c));
+        const mean = lnC.reduce((a, b) => a + b, 0) / lnC.length;
+        const varLn = lnC.reduce((a, b) => a + (b - mean) ** 2, 0) / (lnC.length - 1);
+        theta = Math.exp(mean);
+        beta  = Math.max(Math.sqrt(varLn), 0.05);  // piso para evitar escalón
+      }
+      return { DS, theta, beta, empirical, nExceeded: capacities.length, nTotal: nPairs };
+    });
+  }, [result.curves, result.stats_per_level, dsThresholds]);
+
   useEffect(() => {
-    if (!plotlyReady || !fragilityRef.current || n_stories === 0) return;
+    if (!plotlyReady || !fragilityRef.current) return;
     const Plotly = (window as unknown as { Plotly: {
       newPlot: (el: HTMLElement, traces: unknown[], layout: unknown, config: unknown) => void;
     } }).Plotly;
 
-    const LS = 1.0;
-    const zFrag: (number | null)[][] = [];
-    for (let s = 0; s < n_stories; s++) {
-      const row: (number | null)[] = [];
-      for (const lvl of result.stats_per_level) {
-        const p: IDAProfilePercentiles | undefined = lvl.drift_profile;
-        if (!p || p.p50.length <= s) { row.push(null); continue; }
-        row.push(lognormalProbExceeds(p.p16[s], p.p50[s], p.p84[s], LS));
-      }
-      zFrag.push(row);
-    }
+    const saGrid = result.stats_per_level.map((s) => s.Sa_g);
+    const saMin = Math.max(1e-3, Math.min(...saGrid));
+    const saMax = Math.max(...saGrid);
+    const dense: number[] = [];
+    for (let i = 0; i <= 120; i++) dense.push(saMin + (saMax - saMin) * (i / 120));
 
-    const sa = result.stats_per_level.map((s) => s.Sa_g);
-    const selSa = level?.Sa_g;
+    const traces: unknown[] = [];
+    const annotations: unknown[] = [];
+
+    fragilityFits.forEach((fit, i) => {
+      const color = DS_COLORS[i];
+      // Curva lognormal (si hay ajuste)
+      if (fit.theta != null && fit.beta != null) {
+        const y = dense.map((Sa) => normCdf((Math.log(Sa) - Math.log(fit.theta!)) / fit.beta!));
+        traces.push({
+          type: "scatter", mode: "lines",
+          x: dense, y,
+          name: `${DS_LABELS[i]} (${fit.DS.toFixed(2)} %)`,
+          line: { color, width: 2.5 },
+          hovertemplate: `<b>${DS_LABELS[i]}</b><br>Sa=%{x:.2f}g<br>P(Δ > ${fit.DS}%) = %{y:.0%}<extra></extra>`,
+        });
+        // Anotación de θ en y=0.5
+        if (fit.theta >= saMin && fit.theta <= saMax) {
+          annotations.push({
+            x: fit.theta, y: 0.5, xref: "x", yref: "y",
+            text: `θ=${fit.theta.toFixed(2)}g`,
+            showarrow: true, arrowhead: 2, arrowcolor: color, arrowsize: 0.8,
+            ax: 0, ay: -20 - i * 14,
+            font: { size: 10, color },
+            bgcolor: "rgba(15,23,42,0.85)", bordercolor: color, borderwidth: 1, borderpad: 3,
+          });
+        }
+      }
+      // Puntos empíricos
+      traces.push({
+        type: "scatter", mode: "markers",
+        x: fit.empirical.map((e) => e.Sa),
+        y: fit.empirical.map((e) => e.frac),
+        name: `${DS_LABELS[i]} · empírico`,
+        marker: { color, size: 7, symbol: "circle-open", line: { color, width: 1.5 } },
+        showlegend: false,
+        hovertemplate: `<b>${DS_LABELS[i]}</b> empírico<br>Sa=%{x:.2f}g<br>%{y:.0%} de pares<extra></extra>`,
+      });
+    });
+
     const shapes: unknown[] = [];
+    const selSa = level?.Sa_g;
     if (selSa != null) {
       shapes.push({
         type: "line", xref: "x", yref: "paper",
         x0: selSa, x1: selSa, y0: 0, y1: 1,
-        line: { color: "#6366f1", width: 3 },
+        line: { color: "#6366f1", width: 2, dash: "dash" },
       });
     }
+    // Línea horizontal en 50 % (referencia visual para leer θ)
+    shapes.push({
+      type: "line", xref: "paper", yref: "y",
+      x0: 0, x1: 1, y0: 0.5, y1: 0.5,
+      line: { color: "rgba(148,163,184,0.35)", width: 1, dash: "dot" },
+    });
 
-    Plotly.newPlot(fragilityRef.current, [
-      {
-        type: "heatmap",
-        z: zFrag, x: sa, y: storyLabels,
-        zmin: 0, zmax: 1,
-        colorscale: [
-          [0.00, "#065f46"],
-          [0.10, "#10b981"],
-          [0.30, "#eab308"],
-          [0.60, "#f97316"],
-          [1.00, "#7f1d1d"],
-        ],
-        colorbar: { title: { text: "P(Δ > LS)" }, thickness: 14, len: 0.85, x: 1.02, tickformat: ".0%" },
-        hovertemplate: "<b>%{y}</b> · Sa=%{x:.2f}g<br>P(Δ > 1%) = %{z:.0%}<extra></extra>",
+    Plotly.newPlot(fragilityRef.current, traces, {
+      ...plotlyLayoutPremium({ showLegend: true, legendTop: false }),
+      xaxis: plotlyAxisPremium({ title: "Sa(T₁) [g]", range: [saMin, saMax] }),
+      yaxis: {
+        ...plotlyAxisPremium({ title: "P(Δmax ≥ DS_i)", range: [0, 1.02] }),
+        tickformat: ".0%",
       },
-      {
-        type: "contour",
-        z: zFrag, x: sa, y: storyLabels,
-        contours: {
-          showlabels: true, labelfont: { color: "#ffffff", size: 10 },
-          start: 0.1, end: 0.9, size: 0.4, coloring: "none",
-        },
-        line: { color: "#ffffff", width: 1.5, dash: "dot" },
-        showscale: false, hoverinfo: "skip",
-      },
-    ], {
-      ...plotlyLayoutPremium({ showLegend: false }),
-      xaxis: plotlyAxisPremium({ title: "Sa(T₁) [g]" }),
-      yaxis: plotlyAxisPremium({ title: "Piso" }),
-      shapes,
-      margin: { l: 70, r: 100, t: 20, b: 55 },
+      shapes, annotations,
+      margin: { l: 70, r: 20, t: 20, b: 55 },
     }, plotlyConfigPremium);
-  }, [plotlyReady, result.stats_per_level, n_stories, level, storyLabels]);
+  }, [plotlyReady, fragilityFits, result.stats_per_level, level]);
 
   // ── Plot mini-espectro par seleccionado ──────────────────────────────────
   useEffect(() => {
@@ -1649,17 +1738,79 @@ function ForensicAnalysisSection({
         </div>
       </div>
 
-      {/* ── 2. Fragility heatmap — P(Δ > LS) ──────────────────────────── */}
-      <div className="space-y-1">
-        <h4 className="text-xs uppercase tracking-wider font-semibold text-[var(--text-muted)]">
-          Mapa de probabilidad de excedencia — P(Δ &gt; LS = 1 %)
-        </h4>
-        <div ref={fragilityRef} style={{ width: "100%", height: 300 }} />
+      {/* ── 2. Curvas de fragilidad — P(Δmax ≥ DS_i) vs Sa(T₁) ────────── */}
+      <div className="space-y-2">
+        <div className="flex items-baseline justify-between gap-3 flex-wrap">
+          <h4 className="text-xs uppercase tracking-wider font-semibold text-[var(--text-muted)]">
+            Curvas de fragilidad — P(Δmax ≥ DS<sub>i</sub>) vs Sa(T₁)
+          </h4>
+          <button
+            onClick={() => setDsThresholds([0.5, 1.0, 2.0, 4.0])}
+            className="text-[10px] text-indigo-400 hover:text-indigo-300 transition"
+            title="Restaurar defaults NSR-10 / ASCE 41"
+          >
+            restaurar defaults
+          </button>
+        </div>
+
+        {/* 4 umbrales editables */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          {DS_LABELS.map((label, i) => (
+            <div key={i}
+              className="rounded-md border border-[var(--panel-muted)]/40 bg-[var(--panel-muted)]/20 p-2"
+              style={{ borderLeftWidth: 3, borderLeftColor: DS_COLORS[i] }}
+            >
+              <label className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] block mb-1">
+                {label}
+              </label>
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0.01"
+                  value={dsThresholds[i]}
+                  onChange={(e) => setDS(i, Number(e.target.value) || 0)}
+                  className="w-full rounded bg-[var(--panel-muted)] px-2 py-1 text-xs font-mono text-[var(--text)]"
+                />
+                <span className="text-[10px] text-[var(--text-muted)]">%</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div ref={fragilityRef} style={{ width: "100%", height: 340 }} />
+
+        {/* Chips resumen con θ y β por DS */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">
+          {fragilityFits.map((fit, i) => (
+            <div key={i}
+              className="rounded-md bg-[var(--panel-muted)]/30 px-2.5 py-1.5"
+              style={{ borderLeft: `3px solid ${DS_COLORS[i]}` }}
+            >
+              <div className="text-[10px] uppercase tracking-wider text-[var(--text-muted)]">
+                {DS_LABELS[i]}
+              </div>
+              {fit.theta != null && fit.beta != null ? (
+                <div className="font-mono text-[var(--text)]">
+                  Sa<sub>50 %</sub> = <span style={{ color: DS_COLORS[i] }}>{fit.theta.toFixed(2)} g</span>
+                  <span className="text-[var(--text-muted)]"> · β={fit.beta.toFixed(2)} · {fit.nExceeded}/{fit.nTotal}</span>
+                </div>
+              ) : (
+                <div className="font-mono text-[var(--text-muted)]">
+                  sin ajuste ({fit.nExceeded}/{fit.nTotal} pares)
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
         <div className="text-[10px] italic text-[var(--text-muted)]">
-          Calculado desde los percentiles P16/P50/P84 asumiendo distribución
-          lognormal de la deriva entre pares (β = [ln(P84) − ln(P16)] / 2).
-          Isolíneas blancas en 10 %, 50 %, 90 % delimitan zonas de riesgo. La
-          vertical índigo marca el nivel Sa seleccionado.
+          Curva: ajuste lognormal P(Sa) = Φ((ln Sa − ln θ)/β) sobre las
+          capacidades Sa<sub>cap</sub> de cada par (Sa a la que la deriva máxima
+          cruza DS<sub>i</sub>, por interpolación lineal). θ = mediana de las
+          capacidades = <b>Sa a la que el 50 % de registros llevan al
+          edificio al DS<sub>i</sub></b>. Círculos abiertos = fracción empírica
+          directa por nivel. Línea índigo punteada = Sa seleccionado arriba.
         </div>
       </div>
 
