@@ -34,15 +34,14 @@ export interface TriagePayload {
 
 export const fieldAssessmentApi = {
   list: () => api.get<FieldAssessmentDTO[]>(BASE),
-  create: (title: string, linkedBuildingProjectId?: string) =>
+  create: (title: string) =>
     api.post<FieldAssessmentDTO>(BASE, {
       title,
       client_uuid: (globalThis.crypto?.randomUUID?.() ?? undefined),
       client_created_at: new Date().toISOString(),
-      linked_building_project_id: linkedBuildingProjectId ?? null,
     }),
   get: (id: string) => api.get<FieldAssessmentDTO>(`${BASE}/${id}`),
-  update: (id: string, patch: { title?: string; stage?: string; linked_building_project_id?: string | null }) =>
+  update: (id: string, patch: { title?: string; stage?: string }) =>
     api.patch<FieldAssessmentDTO>(`${BASE}/${id}`, patch),
   remove: (id: string) => api.del<void>(`${BASE}/${id}`),
 

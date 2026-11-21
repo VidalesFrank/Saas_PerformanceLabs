@@ -29,19 +29,11 @@ CATALOG = [
             {
                 "id": "constructor-modelos",
                 "name": "Constructor de Modelos",
-                "subtitle": "Importa ETABS (XLSX/E2K), genera modelo OpenSees, corre modal y espectral NSR-10",
+                "subtitle": "Importa ETABS o modela desde cero. Análisis lineal y no lineal (pushover, NLTHA, IDA, desempeño CSM) en un solo módulo",
                 "nivel": "pro",
                 "estado": "en_desarrollo",
                 "route": "/projects",
                 "featured": True,
-            },
-            {
-                "id": "analisis-no-lineal-3d",
-                "name": "Análisis No Lineal 3D",
-                "subtitle": "Pushover ±X/±Y, NLTHA con registros FEMA P-695 e IDA multi-registro",
-                "nivel": "premium",
-                "estado": "en_desarrollo",
-                "route": "/building",
             },
             {
                 "id": "muros-rc-3d",

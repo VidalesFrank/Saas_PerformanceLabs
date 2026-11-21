@@ -128,12 +128,18 @@ independent of the API.
 
 `apps/api`:
 - `app/engine_adapter.py` — única frontera entre esquemas HTTP y tipos del engine.
-- `app/tasks/` — tareas Celery: archetype, modal, pushover (os.fork para X+Y en paralelo),
-  dynamic (IDA). `os.fork()` en pushover porque OpenSees no es thread-safe.
-- `app/engine/building/` — scripts propietarios de Frank: `archetype_1.py` (E2K → OpenSees),
-  `pushover.py`, `dynamic.py`. `archetype_1.py` tiene f-strings corregidas a Python 3.11
-  (comillas dobles dentro de la expresión).
-- `app/routers/building_projects.py` + `building_analysis.py` — CRUD de proyectos y jobs.
+- `app/tasks/` — tareas Celery del Constructor de Modelos: `structural_import_task`,
+  `structural_modal_task`, `structural_spectral_task`, `structural_nl_pushover_task`,
+  `structural_frame_pushover_task`, `structural_nlth_task`, `structural_ida_task`,
+  `structural_wall_demands_task`, `structural_wall_design_task`, `structural_variant_pushover_task`,
+  `structural_design_task`, `structural_beam_task`, `wall_analysis_task`.
+- `app/engine/building/` — biblioteca Python compartida (NO web): E2K parser, FEMA/Colombia
+  catalogs, linear + nonlinear builders, walls engine, masonry. También conserva `dynamic.py`
+  (usado por `nlth_runner.py`) y los legacy `archetype_1.py` + `pushover.py` (sin consumidor pero
+  son código propietario de Frank, no eliminar).
+- `app/routers/structural_projects.py` + `structural_analysis.py` + `structural_editor.py` +
+  `structural_design.py` + `structural_nonlinear.py` + `structural_performance.py` —
+  toda la API del Constructor.
 - `entrypoint.sh` — corre `alembic upgrade head` antes de uvicorn/celery.
 - `patch_opstool.py` — se ejecuta en Docker build; parchea opstool para operación headless:
   wrap try/except en `__init__.py` (root + pre + anlys + vis). Necesario porque `anlys/_smart_analyze.py`
@@ -157,48 +163,38 @@ independent of the API.
 - **numpy==1.26.4** — no usar `np.trapezoid` ni otras APIs numpy 2.x.
 - **bcrypt==4.0.1** + **passlib==1.7.4** — no actualizar bcrypt sin cambiar el backend de passlib.
 
-## Current state — 2026-07-28
+## Current state — 2026-11-20
 
 ### Módulos funcionales y en producción
 
 | Ruta | Descripción | Estado |
 |------|-------------|--------|
-| `/seismic` | Generador de espectros NSR-10 | ✅ Listo |
+| `/projects` + `/projects/[id]` | **Constructor de Modelos — plataforma completa** (modelo, modal, espectral, pushover NL, NLTH, IDA, NLRHA, muros, performance CSM ATC-40, verificación por desempeño, evaluación por elemento) | ✅ Producción |
+| `/seismic` | Generador de espectros NSR-10 (1117 municipios + factor I) | ✅ Listo |
 | `/analysis/interaction` | Diagrama P-M (rect/circ/especial) | ✅ Listo |
-| `/analysis/moment-curvature` | Curva M-φ con confinamiento | ✅ Listo |
+| `/analysis/moment-curvature` | Curva M-φ con confinamiento Mander | ✅ Listo |
 | `/analysis/pmm` | Superficie P-M-M biaxial | ✅ Listo |
-| `/building` | Análisis no lineal 3D (Módulo 3) | 🔄 Engine completo, probando |
+| `/sections` | Editor gráfico de secciones RC | ✅ Listo |
+| `/field-assessment` | Triaje post-sismo ATC-20 + FEMA P-2018 | ✅ Listo |
+| `/ground-motion` | Procesamiento de acelerogramas (IM, Arias, espectros) | ✅ Listo |
+| `/wall-projects` | Muros RC 3D con E-SFI-MVLEM-3D | ✅ Listo |
 
-### Componentes frontend clave
-
-**Dashboard** (`/dashboard`):
-- Hero con saludo + plan del usuario (GET `/api/v1/auth/me`) + stats de catálogo.
-- Módulos con color propio por índice (0=azul, 1=verde, 2=morado, 3=ámbar, 4=rojo, 5=teal).
-- Tarjetas activas: borde izquierdo 3px coloreado + hover lift. Inactivas: borde punteado + 55% opacidad.
-- Animaciones CSS `pl-fade-up` escalonadas, skeleton shimmer `pl-skeleton`.
-
-**ModelViewer3D** (`src/components/building/ModelViewer3D.tsx`):
-- Modo Líneas / Extruido. Extruido usa `makeBox()` que genera `mesh3d` Plotly (prisma rectangular).
-- Dimensiones vienen de `col.geometry.base` / `col.geometry.height` del JSON del arquetipo (metros).
-  Defaults: columnas 0.3×0.3m, vigas 0.3×0.4m.
-- Colores: columnas `#54643a`, vigas `#75b72a`, losas `#b7d38a`.
-- Props: solo `archetypeData`. La prop `modalData` fue eliminada — modal va en `ModeShapeViewer`.
-
-**ModeShapeViewer** (`src/components/building/ModeShapeViewer.tsx`):
-- 3 paneles Plotly con refs independientes (no IDs string).
-- Autoescala: `targetAmp = max(altura, extensión) × 12%`.
-- Animación `requestAnimationFrame` + `sin(phase)` + `Plotly.restyle` (solo traza deformada).
-- Incluido internamente dentro de `ModalResultsTable` — no llamar por separado.
-
-**PushoverChart**: `dtecho` del engine ya viene en porcentaje (`displacement_m × 100 / height_m`).
-No multiplicar ×100 en el frontend. El resumen también usa `drift_techo_max` directo (ya en %).
+**Eliminado 2026-11-20** (unificación): el antiguo `/building` (Módulo 3) y su backend
+(`building_projects`, `building_jobs`, routers y 4 tasks Celery). Toda la funcionalidad
+vive ahora dentro del **Constructor de Modelos** como tabs del sidebar en `/projects/[id]`
+(grupo "Modelo no lineal"). El CSM (ATC-40) se portó a
+`apps/api/app/routers/structural_performance.py` + `components/linear/PerformanceCSMPanel.tsx`.
+Migración Alembic `f3a4b5c6d7e8_drop_building_projects_module3.py`.
 
 ### Pendientes inmediatos
 
-1. Rebuild Docker `web` + `worker` para aplicar todos los cambios de 2026-07-28 en producción.
-2. Probar flujo completo Módulo 3: arquetipo → modal → pushover → dinámico.
-3. Ampliar `nsr10_data.py` con Tabla A.2.3-1 completa del NSR-10 (~1100 municipios).
-4. Frank quiere dar feedback adicional sobre el diseño del dashboard antes de más cambios.
+1. Rebuild Docker completo tras cleanup `/building` + merge de acero estructural.
+2. Validar end-to-end el flujo Constructor: import → grid → secciones → modal → spectral →
+   pushover → performance CSM → NLTH → IDA.
+3. Portar acero estructural (packages/engine — foundations ya existen):
+   patches fibras W/HSS → parser E2K con `MATERIAL PROPERTIES - STEEL` → builder OpenSees pórticos
+   metálicos → UI tab "Acero" en /sections → verificación AISC 360-16 Cap. F+H.
+4. Mixto/compuesto (CFT, vigas con losa, SRC) — Fase 2 de acero.
 
 ## Verification reference
 

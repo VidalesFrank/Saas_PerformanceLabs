@@ -311,7 +311,7 @@ export function NonlinearSpecPanel({ projectId, isValidated }: Props) {
       >
         <p className="font-semibold text-indigo-400 mb-2">¿Qué puedo hacer con este JSON?</p>
         <ul className="space-y-1 text-[var(--text-muted)] list-disc list-inside">
-          <li>Cargarlo en el Módulo 3 para análisis pushover e IDA en OpenSees</li>
+          <li>Es la entrada de los análisis Pushover NL, NLTHA, IDA y NLRHA de este mismo proyecto</li>
           <li>Guardarlo localmente como respaldo del modelo estructural no lineal</li>
           <li>Cargarlo de vuelta en este módulo si necesitas continuar más tarde</li>
           <li>Compartirlo con otro ingeniero para revisión o continuación del trabajo</li>

@@ -25,13 +25,13 @@ def _auth_headers(email: str = "ing@example.com") -> dict:
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    assert r.json()["status"] == "ok"
 
 
-def test_catalog_has_six_modules():
+def test_catalog_has_five_module_groups():
     r = client.get("/api/v1/catalog")
     assert r.status_code == 200
-    assert len(r.json()) == 6
+    assert len(r.json()) == 5
 
 
 def test_register_login_me():

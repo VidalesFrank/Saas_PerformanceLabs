@@ -53,13 +53,11 @@ class AssessmentCreate(BaseModel):
     title: str
     client_uuid: str | None = None
     client_created_at: datetime | None = None
-    linked_building_project_id: str | None = None
 
 
 class AssessmentUpdate(BaseModel):
     title: str | None = None
     stage: str | None = None
-    linked_building_project_id: str | None = None
 
 
 class SnapshotIn(BaseModel):
@@ -144,7 +142,6 @@ class AssessmentOut(BaseModel):
     title: str
     stage: str
     sync_status: str
-    linked_building_project_id: str | None
     client_created_at: str | None
     created_at: str
     updated_at: str
@@ -221,7 +218,6 @@ def _serialize_assessment(a: FieldAssessment) -> AssessmentOut:
     return AssessmentOut(
         id=a.id, client_uuid=a.client_uuid, title=a.title,
         stage=a.stage.value, sync_status=a.sync_status.value,
-        linked_building_project_id=a.linked_building_project_id,
         client_created_at=a.client_created_at.isoformat() if a.client_created_at else None,
         created_at=a.created_at.isoformat(),
         updated_at=a.updated_at.isoformat(),
@@ -262,7 +258,6 @@ def create_assessment(payload: AssessmentCreate, user: CurrentUser, db: DB):
         title=payload.title,
         client_uuid=payload.client_uuid or str(uuid.uuid4()),
         client_created_at=payload.client_created_at,
-        linked_building_project_id=payload.linked_building_project_id,
     )
     db.add(a)
     db.commit()
@@ -282,8 +277,6 @@ def update_assessment(assessment_id: str, payload: AssessmentUpdate, user: Curre
         a.title = payload.title
     if payload.stage is not None:
         a.stage = AssessmentStage(payload.stage)
-    if payload.linked_building_project_id is not None:
-        a.linked_building_project_id = payload.linked_building_project_id
     db.commit()
     db.refresh(a)
     return _serialize_assessment(a)

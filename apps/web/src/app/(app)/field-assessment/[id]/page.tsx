@@ -138,7 +138,7 @@ export default function AssessmentDetailPage({ params }: { params: Promise<{ id:
                   </div>
                   {triage.decision !== "not_applicable" && (
                     <div className="mt-3 rounded-md bg-amber-50 p-3 text-xs text-amber-900">
-                      ⚠ No se crea automáticamente un proyecto en el Módulo 3. Ábrelo manualmente desde /building si decides el estudio de vulnerabilidad.
+                      ⚠ No se crea automáticamente un proyecto estructural. Créalo manualmente desde Constructor de Modelos si decides el estudio de vulnerabilidad.
                     </div>
                   )}
                   <div className="mt-3 flex gap-2">

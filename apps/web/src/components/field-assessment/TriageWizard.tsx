@@ -308,7 +308,7 @@ export function TriageWizard({ assessment }: Props) {
               </div>
               <p className="text-sm text-text">{tr.decision_reason}</p>
               <div className="mt-4 rounded bg-amber-50 p-3 text-xs text-amber-900">
-                ⚠ Este resultado NO crea automáticamente un proyecto en el Módulo 3. Si decides iniciar el estudio de vulnerabilidad, ábrelo manualmente desde /building.
+                ⚠ Este resultado NO crea automáticamente un proyecto estructural. Si decides iniciar el estudio de vulnerabilidad, créalo manualmente desde Constructor de Modelos.
               </div>
             </div>
 

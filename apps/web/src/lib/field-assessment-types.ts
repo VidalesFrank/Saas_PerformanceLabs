@@ -178,7 +178,6 @@ export interface FieldAssessmentDTO {
   title: string;
   stage: AssessmentStage;
   sync_status: SyncStatus;
-  linked_building_project_id?: string | null;
   client_created_at?: string | null;
   created_at: string;
   updated_at: string;
