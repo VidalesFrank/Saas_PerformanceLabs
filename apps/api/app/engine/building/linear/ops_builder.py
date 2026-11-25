@@ -52,6 +52,52 @@ def _joint_tag(label: str) -> int:
         return abs(hash(label)) % (_CM_TAG_OFFSET - 1000) + 1000
 
 
+def _release_codes(release: str) -> tuple[int, int]:
+    """Convierte el string `release` del canónico a los codes (release_z, release_y)
+    del elasticBeamColumn 3D en OpenSees.
+
+    Convención OpenSees:
+        0 = sin release,  1 = release en extremo i,
+        2 = release en extremo j,  3 = release en ambos extremos.
+
+    Convención ETABS E2K que respetamos tal cual:
+        ""        → (0, 0)        continuidad total
+        "i"/"I"   → (1, 1)        hinge en i (libera M2 y M3 en i)
+        "j"/"J"   → (2, 2)        hinge en j
+        "ij"/"IJ" → (3, 3)        hinge en ambos extremos (biela/truss)
+        "PINNED"  → (3, 3)        sinónimo ETABS de "ij"
+
+    Para variantes más finas de ETABS (ej. "M2I", "M3J"), se interpretan
+    liberando sólo el eje afectado; el resto queda en 0.
+    """
+    r = (release or "").strip().upper()
+    if not r:
+        return 0, 0
+    if r == "PINNED":
+        return 3, 3
+    # Códigos tipo "I" / "J" / "IJ"
+    if r in {"I", "J", "IJ", "JI"}:
+        if r == "I":
+            return 1, 1
+        if r == "J":
+            return 2, 2
+        return 3, 3
+    # Códigos ETABS granulares: M2 y/o M3 en extremo I y/o J.
+    rz = 0  # momento alrededor de eje local z (M33/Mz = flexión fuerte)
+    ry = 0  # momento alrededor de eje local y (M22/My = flexión débil)
+    has_m3i = "M3I" in r
+    has_m3j = "M3J" in r
+    has_m2i = "M2I" in r
+    has_m2j = "M2J" in r
+    if has_m3i and has_m3j: rz = 3
+    elif has_m3i:            rz = 1
+    elif has_m3j:            rz = 2
+    if has_m2i and has_m2j: ry = 3
+    elif has_m2i:            ry = 1
+    elif has_m2j:            ry = 2
+    return rz, ry
+
+
 def _element_len(joints: dict, label_i: str, label_j: str) -> tuple[float, float, float, float]:
     """Retorna (dx, dy, dz, L) del elemento."""
     ji = joints.get(label_i, {})
@@ -229,18 +275,28 @@ class LinearOPSBuilder:
             if A <= 0 or E <= 0:
                 continue
 
-            # Vigas / columnas articuladas explícitamente (RELEASE=PINNED en ETABS):
-            # no se crean como elementos de barra porque no transmiten momento.
-            # NO articular por element_type=beam: por default las vigas en ETABS
-            # tienen continuidad de momento (moment frame) y son las que aportan
-            # rigidez lateral por efecto pórtico. Articularlas produce un modelo
-            # de columnas cantiléver con T1 gigante.
-            release = fd.get("release", "")
-            if release.upper() == "PINNED":
-                continue
+            # Interpretación del campo `release` (compatible con ETABS E2K):
+            #   ""          → continuidad total en ambos extremos (default)
+            #   "i" | "I"   → hinge en extremo i  (release M2 + M3 en i)
+            #   "j" | "J"   → hinge en extremo j
+            #   "ij" | "IJ" | "PINNED" → hinge en ambos extremos → el elemento
+            #                 se comporta como biela (truss): sólo transmite
+            #                 axial y cortante, no momento.
+            #
+            # Usamos `-releasez` / `-releasey` del elasticBeamColumn (ndm=3) que
+            # condensa la matriz de rigidez y SÍ conserva la transferencia axial.
+            # Esto es correcto para:
+            #   - viguetas secundarias RC apoyadas en vigas principales,
+            #   - cerchas / rafters metálicos sobre columnas RC (cubierta mixta),
+            #   - bielas de arriostramiento diagonal.
+            # Convención OpenSees: 0=ninguno, 1=i-end, 2=j-end, 3=ambos.
+            release_z, release_y = _release_codes(fd.get("release", ""))
 
             ele_tag = ele_idx + 1
-            ops.element("elasticBeamColumn", ele_tag, ni, nj, A, E, G, J, Iy, Iz, transf)
+            ops.element(
+                "elasticBeamColumn", ele_tag, ni, nj, A, E, G, J, Iy, Iz, transf,
+                "-releasez", release_z, "-releasey", release_y,
+            )
 
             # Track joints connected to a VERTICAL frame element (columna). Estos
             # joints reciben K axial en Uz + K flexional en Rx/Ry → no son

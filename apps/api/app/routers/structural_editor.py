@@ -288,11 +288,42 @@ class ShellReplicateRequest(BaseModel):
 
 class SteelSectionCreate(BaseModel):
     name:       str                # nombre user-facing de la seccion
-    shape_name: str                # nombre AISC: "W24X55", "HSS8X8X1/2", "PIPE8STD"
-    grade:      str = "A992"       # grado ASTM: "A36", "A572Gr50", "A992", "A500GrB-Round", "A500GrC-Rect", "A913Gr65"
+    shape_name: str                # Nombre del perfil. Soporta:
+                                   #   AISC:     "W24X55", "HSS8X8X1/2", "PIPE8STD"
+                                   #   europeo:  "IPE-300", "HEA-200", "HEB-100", "HEM-240"
+                                   #   PTE:      "PTE-200x100" (sin t; t se envia en thickness_mm)
+                                   #   PHR:      "PHR-100"     (sin t; t se envia en thickness_mm)
+    grade:      str = "A992"       # grado ASTM / DIN: "A36", "A572Gr50", "A992",
+                                   # "A500GrB-Round", "A500GrC-Rect", "A913Gr65"
+    thickness_mm: float | None = None   # espesor t del perfil tubular (PTE/PHR solamente)
 
 
 # ── Lectura del modelo ────────────────────────────────────────────────────────
+
+@router.get("/{project_id}/model/mixed-interfaces")
+async def get_mixed_interfaces(project_id: str, user: CurrentUser, db: DB):
+    """Lista de joints donde convergen elementos de concreto y de acero
+    (apoyos de cubierta metálica sobre estructura RC, zonas de transición
+    de material, bases de columnas metálicas sobre dados RC).
+
+    Usado por la UI para:
+        - Dibujar marcadores en el 3D viewer.
+        - Avisar que el modelo tiene conexiones mixtas que deben verificarse
+          (pinned para cerchas, rigid para columnas continuas, semi-rigid).
+        - Pre-seleccionar `release` de los elementos de acero cuyo extremo
+          cae en una interfaz de apoyo (default: pinned para roof_supports).
+    """
+    from app.engine.building.mixed_interface import (
+        detect_mixed_interfaces, summarize_interfaces,
+    )
+    project = _get_project(project_id, user, db)
+    model = _load_canonical(project)
+    interfaces = detect_mixed_interfaces(model)
+    return {
+        "interfaces": interfaces,
+        "summary":    summarize_interfaces(interfaces),
+    }
+
 
 @router.get("/{project_id}/model-data")
 async def get_model_data(project_id: str, user: CurrentUser, db: DB):
@@ -1844,14 +1875,26 @@ async def replicate_shell(
 
 @router.get("/steel/catalog")
 async def get_steel_catalog(user: CurrentUser):
-    """Devuelve el catalogo AISC v15.0 (perfiles + grados ASTM). Usado por
-    la UI para poblar los dropdowns del tab "Acero" en /sections."""
-    from engine.materials.structural_steel import GRADE_PRESETS
-    from engine.sections.steel_shapes import AISC_V15_SHAPES
+    """Devuelve el catalogo de perfiles metalicos (AISC + europeos + colombianos
+    tubulares) + grados ASTM/DIN. Usado por la UI para poblar los dropdowns
+    del tab "Acero" en /sections.
 
-    # Agrupar por tipo para UI
+    Estructura:
+        - shapes_by_type: { "W": [...], "IPE": [...], "HEA": [...], "HEB": [...],
+                             "HEM": [...], "HSS_RECT": [...], "PIPE": [...], ... }
+        - parametric_shapes: { "PTE": {sizes, default_thicknesses}, "PHR": {...} }
+          — perfiles cuyo espesor lo define el usuario al crear la seccion.
+    """
+    from engine.materials.structural_steel import GRADE_PRESETS
+    from engine.sections.steel_shapes import (
+        ALL_SHAPES,
+        PTE_NOMINAL_SIZES, PTE_DEFAULT_THICKNESSES,
+        PHR_NOMINAL_OD,    PHR_DEFAULT_THICKNESSES,
+    )
+
+    # Catalogo tabulado (AISC + europeos DIN). PTE/PHR NO aparecen aqui.
     shapes_by_type: dict[str, list[dict]] = {}
-    for name, s in AISC_V15_SHAPES.items():
+    for name, s in ALL_SHAPES.items():
         key = s.type.value
         shapes_by_type.setdefault(key, []).append({
             "name": name,
@@ -1865,7 +1908,30 @@ async def get_steel_catalog(user: CurrentUser):
             "Zy_mm3": round(s.Zy, 1),
         })
     for key in shapes_by_type:
-        shapes_by_type[key].sort(key=lambda d: d["name"])
+        # Ordenar por peralte para europeos/AISC; mantener orden alfabetico si no.
+        shapes_by_type[key].sort(key=lambda d: (d["d_mm"], d["name"]))
+
+    parametric_shapes = {
+        "PTE": {
+            "label": "PTE — Perfil Tubular Estructural rectangular",
+            "sizes": [
+                {"name": f"PTE-{int(d) if d == int(d) else d}x{int(b) if b == int(b) else b}",
+                 "d_mm": d, "b_mm": b}
+                for (d, b) in PTE_NOMINAL_SIZES
+            ],
+            "default_thicknesses_mm": PTE_DEFAULT_THICKNESSES,
+            "user_adjustable_thickness": True,
+        },
+        "PHR": {
+            "label": "PHR — Perfil Hueco Redondo",
+            "sizes": [
+                {"name": f"PHR-{int(od) if od == int(od) else od}", "OD_mm": od}
+                for od in PHR_NOMINAL_OD
+            ],
+            "default_thicknesses_mm": PHR_DEFAULT_THICKNESSES,
+            "user_adjustable_thickness": True,
+        },
+    }
 
     grades = [
         {
@@ -1881,8 +1947,9 @@ async def get_steel_catalog(user: CurrentUser):
 
     return {
         "shapes_by_type": shapes_by_type,
+        "parametric_shapes": parametric_shapes,
         "grades": grades,
-        "total_shapes": len(AISC_V15_SHAPES),
+        "total_shapes": len(ALL_SHAPES),
     }
 
 
@@ -1891,11 +1958,19 @@ async def create_steel_section(
     project_id: str, body: SteelSectionCreate,
     user: CurrentUser, db: DB,
 ):
-    """Crea una seccion metalica usando un perfil AISC + grado ASTM. Auto-crea
-    el material de acero si no existe. Computa A/Iy/Iz/J en SI (m²/m⁴) desde
-    el SteelFrameSection y los almacena en el schema estandar de `sections`
-    para que el `ops_builder` los consuma transparente."""
-    from engine.sections.steel_section import make_steel_section
+    """Crea una seccion metalica usando un perfil (AISC/DIN/colombiano) + grado
+    ASTM o DIN. Auto-crea el material de acero si no existe. Computa A/Iy/Iz/J
+    en SI (m²/m⁴) desde el SteelFrameSection y los almacena en el schema
+    estandar de `sections` para que el `ops_builder` los consuma transparente.
+
+    Para PTE/PHR, el campo `thickness_mm` del body define el espesor t del
+    tubo. En ese caso el `shape_name` debe ser una dimension nominal:
+    `PTE-200x100` (sin t) o `PHR-100` (sin t). Se forma el nombre final
+    agregando el espesor: `PTE-200x100x5` / `PHR-100x3`.
+    """
+    from engine.sections.steel_section import (
+        make_steel_section, make_pte_section, make_phr_section,
+    )
 
     project = _get_project(project_id, user, db)
     model = _load_canonical(project)
@@ -1903,9 +1978,28 @@ async def create_steel_section(
     if body.name in model.get("sections", {}):
         raise HTTPException(status_code=409, detail=f"Ya existe una seccion '{body.name}'")
 
+    # Dispatch PTE/PHR (parametricos) vs catalogo tabulado.
+    shape_upper = body.shape_name.upper().replace(" ", "")
     try:
-        sf = make_steel_section(body.shape_name, body.grade)
+        if shape_upper.startswith("PTE-") and body.thickness_mm:
+            # "PTE-200x100" -> parse dims
+            dims = shape_upper.removeprefix("PTE-").split("X")
+            if len(dims) not in (2, 3):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"PTE: formato invalido '{body.shape_name}'. Esperado 'PTE-<d>x<b>'.",
+                )
+            d_mm, b_mm = float(dims[0]), float(dims[1])
+            sf = make_pte_section(d_mm, b_mm, float(body.thickness_mm), body.grade)
+        elif shape_upper.startswith("PHR-") and body.thickness_mm:
+            dims = shape_upper.removeprefix("PHR-").split("X")
+            OD_mm = float(dims[0])
+            sf = make_phr_section(OD_mm, float(body.thickness_mm), body.grade)
+        else:
+            sf = make_steel_section(body.shape_name, body.grade)
     except KeyError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
     # Auto-crear material de acero si no existe. Nombre canonico: "Steel_<grade>".
@@ -1926,13 +2020,16 @@ async def create_steel_section(
     MM2_TO_M2 = 1e-6
     MM4_TO_M4 = 1e-12
 
+    # Para PTE/PHR, usar el nombre final (con espesor) en lugar del nominal.
+    final_shape_label = sf.shape.name if sf.type.value in ("PTE", "PHR") else body.shape_name
+
     sec = {
         "material":    mat_name,
         "shape":       "steel",                   # tipo logico — ops_builder y UI
         "shape_type":  "steel",                   # redundante pero explicito
         "steel_grade": body.grade,
-        "steel_shape": body.shape_name,           # etiqueta AISC para preview
-        "aisc_type":   sf.type.value,             # W | HSS_RECT | PIPE | ...
+        "steel_shape": final_shape_label,         # etiqueta AISC/DIN para preview
+        "aisc_type":   sf.type.value,             # W | HSS_RECT | PIPE | IPE | HEA | PTE | PHR | ...
         # Dimensiones en m (algunas para preview, no todas aplican a todos los shapes)
         "h_m":         round(sf.shape.d  * 1e-3, 4),
         "b_m":         round(sf.shape.bf * 1e-3, 4),

@@ -32,6 +32,13 @@ interface Props {
   selected:  SelectedElement[];
   onClose:   () => void;
   onChanged: () => void | Promise<void>;
+  /** Joints de interfaz concreto↔acero. Si el frame seleccionado tiene un
+   *  extremo en una interfaz, se muestra un badge y se sugiere PINNED
+   *  (apoyo articulado de cercha metálica sobre columna RC). */
+  mixedInterfaces?: Array<{
+    joint_id: string;
+    is_roof_support: boolean;
+  }>;
 }
 
 const KIND_LABEL: Record<SelectedElement["kind"], string> = {
@@ -63,7 +70,7 @@ const RELEASE_LABEL: Record<string, string> = {
 };
 
 export function ElementPropertiesPanel({
-  projectId, geometry, sections, selected, onClose, onChanged,
+  projectId, geometry, sections, selected, onClose, onChanged, mixedInterfaces,
 }: Props) {
   const [busy,  setBusy]  = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -165,6 +172,7 @@ export function ElementPropertiesPanel({
           geometry={geometry}
           availableSections={availableSections}
           selected={selected[0]}
+          mixedInterfaces={mixedInterfaces}
           onChanged={onChanged}
           busy={busy} setBusy={setBusy}
           setError={setError}
@@ -230,13 +238,14 @@ function MultiHeader({ selected }: { selected: SelectedElement[] }) {
 
 // ── Panel single: Fase 1 + release + replicar (columnas) ─────────────────────
 function SinglePanel({
-  projectId, geometry, availableSections, selected, onChanged,
+  projectId, geometry, availableSections, selected, mixedInterfaces, onChanged,
   busy, setBusy, setError,
 }: {
   projectId: string;
   geometry:  ModelGeometry;
   availableSections: string[];
   selected:  SelectedElement;
+  mixedInterfaces?: Array<{ joint_id: string; is_roof_support: boolean }>;
   onChanged: () => void | Promise<void>;
   busy:      boolean;
   setBusy:   (v: boolean) => void;
@@ -392,32 +401,74 @@ function SinglePanel({
       )}
 
       {/* Release (frames) */}
-      {isFrame && (
-        <div>
-          <label className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] block mb-1">
-            Release / tipo conexión
-          </label>
-          <div className="flex gap-2">
-            <select
-              value={draftRelease}
-              onChange={(e) => setDraftRelease(e.target.value)}
-              disabled={busy}
-              className="flex-1 rounded-md bg-[var(--panel-muted)] px-2 py-1.5 text-xs text-[var(--text)] disabled:opacity-50"
-            >
-              {Object.entries(RELEASE_LABEL).map(([val, label]) => (
-                <option key={val} value={val}>{label}</option>
-              ))}
-            </select>
-            <button
-              onClick={() => handlePatchFrame({ release: draftRelease as "" | "i" | "j" | "ij" })}
-              disabled={busy || draftRelease === (frame?.release ?? "")}
-              className="px-3 py-1.5 rounded-md bg-indigo-600 text-white text-[11px] font-semibold disabled:opacity-40 disabled:cursor-not-allowed hover:bg-indigo-700 transition"
-            >
-              Aplicar
-            </button>
+      {isFrame && (() => {
+        // Detectar si algún extremo del frame es interfaz concreto↔acero.
+        const ifaceMap = new Map(
+          (mixedInterfaces ?? []).map((i) => [i.joint_id, i]),
+        );
+        const iIface = frame ? ifaceMap.get(frame.joint_i) : undefined;
+        const jIface = frame ? ifaceMap.get(frame.joint_j) : undefined;
+        const onInterface = !!(iIface || jIface);
+        const isRoofSupport = !!(iIface?.is_roof_support || jIface?.is_roof_support);
+        return (
+          <div className="space-y-1.5">
+            {onInterface && (
+              <div className={[
+                "rounded-md px-2.5 py-1.5 text-[11px] border",
+                isRoofSupport
+                  ? "bg-orange-500/10 border-orange-500/40 text-orange-600 dark:text-orange-300"
+                  : "bg-yellow-500/10 border-yellow-500/40 text-yellow-600 dark:text-yellow-300",
+              ].join(" ")}>
+                <span className="font-semibold">
+                  {isRoofSupport ? "⚠️ Apoyo cubierta metálica" : "⚠️ Transición concreto↔acero"}
+                </span>
+                <span className="block text-[10px] opacity-80 mt-0.5">
+                  {iIface && jIface
+                    ? `Ambos extremos sobre interfaz mixta.`
+                    : iIface
+                      ? `Extremo i (${frame?.joint_i}) sobre interfaz.`
+                      : `Extremo j (${frame?.joint_j}) sobre interfaz.`}
+                  {" "}Verificar que el release coincida con el detalle real.
+                </span>
+                {draftRelease !== "ij" && (
+                  <button
+                    onClick={() => {
+                      setDraftRelease("ij");
+                      handlePatchFrame({ release: "ij" });
+                    }}
+                    disabled={busy}
+                    className="mt-1.5 text-[10px] px-2 py-0.5 rounded border border-current hover:bg-current/10 transition disabled:opacity-40"
+                  >
+                    Articular ambos extremos (cercha/biela)
+                  </button>
+                )}
+              </div>
+            )}
+            <label className="text-[10px] uppercase tracking-wider text-[var(--text-muted)] block mb-1">
+              Release / tipo conexión
+            </label>
+            <div className="flex gap-2">
+              <select
+                value={draftRelease}
+                onChange={(e) => setDraftRelease(e.target.value)}
+                disabled={busy}
+                className="flex-1 rounded-md bg-[var(--panel-muted)] px-2 py-1.5 text-xs text-[var(--text)] disabled:opacity-50"
+              >
+                {Object.entries(RELEASE_LABEL).map(([val, label]) => (
+                  <option key={val} value={val}>{label}</option>
+                ))}
+              </select>
+              <button
+                onClick={() => handlePatchFrame({ release: draftRelease as "" | "i" | "j" | "ij" })}
+                disabled={busy || draftRelease === (frame?.release ?? "")}
+                className="px-3 py-1.5 rounded-md bg-indigo-600 text-white text-[11px] font-semibold disabled:opacity-40 disabled:cursor-not-allowed hover:bg-indigo-700 transition"
+              >
+                Aplicar
+              </button>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Replicar lineal (columnas, vigas, muros, losas) */}
       {(isFrame || isShell) && (

@@ -784,6 +784,43 @@ function buildSupports3D(geometry: ModelGeometry): object {
     marker:{ color:C_SUPPORT, size:6, symbol:"diamond" }, hoverinfo:"skip", showlegend:true };
 }
 
+function buildMixedInterfaces3D(
+  interfaces: Array<{ joint_id: string; x: number; y: number; z: number; is_roof_support: boolean }>,
+): object[] {
+  if (!interfaces || interfaces.length === 0) return [];
+  // Separar apoyos de cubierta (naranja) de otras interfaces (amarillo).
+  const roof_x:number[] = [], roof_y:number[] = [], roof_z:number[] = [], roof_t:string[] = [];
+  const mid_x:number[]  = [], mid_y:number[]  = [], mid_z:number[]  = [], mid_t:string[]  = [];
+  for (const i of interfaces) {
+    const hover = `<b>Interfaz ${i.is_roof_support ? "apoyo cubierta" : "concreto↔acero"}</b><br>`
+      + `Joint ${i.joint_id} · z=${i.z.toFixed(2)} m`
+      + "<extra></extra>";
+    if (i.is_roof_support) {
+      roof_x.push(i.x); roof_y.push(i.y); roof_z.push(i.z); roof_t.push(hover);
+    } else {
+      mid_x.push(i.x);  mid_y.push(i.y);  mid_z.push(i.z);  mid_t.push(hover);
+    }
+  }
+  const out: object[] = [];
+  if (roof_x.length) out.push({
+    type: "scatter3d", mode: "markers",
+    x: roof_x, y: roof_y, z: roof_z, text: roof_t,
+    name: "Apoyo cubierta metálica",
+    marker: { color: "#F97316", size: 9, symbol: "diamond",
+              line: { color: "#C2410C", width: 1.5 } },
+    hovertemplate: "%{text}", showlegend: true,
+  });
+  if (mid_x.length) out.push({
+    type: "scatter3d", mode: "markers",
+    x: mid_x, y: mid_y, z: mid_z, text: mid_t,
+    name: "Transición concreto↔acero",
+    marker: { color: "#EAB308", size: 7, symbol: "diamond-open",
+              line: { color: "#A16207", width: 1.5 } },
+    hovertemplate: "%{text}", showlegend: true,
+  });
+  return out;
+}
+
 function buildNodes3D(geometry: ModelGeometry): object {
   const nx:number[]=[], ny:number[]=[], nz:number[]=[], txt:string[]=[];
   for (const [lbl,jd] of Object.entries(geometry.joints)) if (!jd.is_restrained) {
@@ -1092,6 +1129,13 @@ interface Props {
   grid?: import("@/lib/structural-types").GridDefinition;
   showGrid?: boolean;
   onToggleGrid?: (v: boolean) => void;
+  /** Joints donde convergen concreto y acero (apoyos de cubierta metálica).
+   *  Se pintan con diamantes naranja en el 3D para resaltar las conexiones
+   *  que deben verificarse (pinned vs rigid). Opcional. */
+  mixedInterfaces?: Array<{
+    joint_id: string; x: number; y: number; z: number;
+    is_roof_support: boolean;
+  }>;
 }
 
 // ── Componente ────────────────────────────────────────────────────────────────
@@ -1127,6 +1171,7 @@ export function LinearModelViewer3D({
   grid,
   showGrid: showGridProp,
   onToggleGrid,
+  mixedInterfaces,
 }: Props) {
   const containerRef     = useRef<HTMLDivElement>(null);
   const prevRenderKeyRef = useRef<string>("");   // "3d-lines" | "3d-extruded" | "2d-xy" | "2d-xz" | "2d-yz"
@@ -1211,12 +1256,13 @@ export function LinearModelViewer3D({
       buildSupports3D(geometry),
       ...(showNodes ? [buildNodes3D(geometry)] : []),
       ...(showLoads ? buildLoadArrows(geometry, totalHeight) : []),
+      ...buildMixedInterfaces3D(mixedInterfaces ?? []),
     ];
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geometry, viewMode, showNodes, showLoads, colorMode, storyFilter, pierFilter, typeFilter,
       isolationMode, selectedIds, sectionFilter, materialFilter, modelSections, wallColor, slabColor,
       shellLoads, shellLoadPattern, totalHeight, is2D, projection, infills, showInfills,
-      grid, showGrid]);
+      grid, showGrid, mixedInterfaces]);
 
   // ── Render Plotly ─────────────────────────────────────────────────────────
   useEffect(() => {

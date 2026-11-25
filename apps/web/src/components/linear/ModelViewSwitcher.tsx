@@ -8,7 +8,7 @@
  * también aparece el panel lateral de propiedades al seleccionar un elemento
  * en cualquiera de las tres vistas (planta, elevación o 3D).
  */
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type {
   ModelGeometry,
   SectionData,
@@ -21,6 +21,16 @@ import { LinearModelViewer3D } from "./LinearModelViewer3D";
 import Building2DPlanView from "./Building2DPlanView";
 import BuildingElevationView from "./BuildingElevationView";
 import { ElementPropertiesPanel, type SelectedElement } from "./ElementPropertiesPanel";
+import { structuralEditorApi } from "@/lib/structural-api";
+
+export interface MixedInterface {
+  joint_id: string;
+  x: number; y: number; z: number;
+  elev_m: number;
+  concrete_frames: string[];
+  steel_frames: string[];
+  is_roof_support: boolean;
+}
 
 type ViewMode = "3d" | "plan" | "elevation";
 
@@ -44,6 +54,19 @@ export default function ModelViewSwitcher({
 }: Props) {
   const [mode, setMode]         = useState<ViewMode>(initial);
   const [selected, setSelected] = useState<SelectedElement[]>([]);
+  const [mixedInterfaces, setMixedInterfaces] = useState<MixedInterface[]>([]);
+
+  // Carga lazy de interfaces concreto↔acero (apoyos de cubierta metálica).
+  // Se refresca cuando el modelo cambia para capturar nuevas transiciones.
+  useEffect(() => {
+    if (!projectId) { setMixedInterfaces([]); return; }
+    let cancel = false;
+    structuralEditorApi.getMixedInterfaces(projectId)
+      .then((r) => { if (!cancel) setMixedInterfaces(r.interfaces); })
+      .catch(() => { if (!cancel) setMixedInterfaces([]); });
+    return () => { cancel = true; };
+    // Dependencia en `geometry` para re-fetch tras edits del modelo.
+  }, [projectId, geometry]);
 
   const handleSwitch = (m: ViewMode) => {
     setMode(m);
@@ -107,6 +130,7 @@ export default function ModelViewSwitcher({
             infills={infills}
             showInfills={true}
             grid={grid}
+            mixedInterfaces={mixedInterfaces}
             onClickElement={editable ? handle3DClick : undefined}
           />
         )}
@@ -143,6 +167,7 @@ export default function ModelViewSwitcher({
           geometry={geometry}
           sections={sections}
           selected={selected}
+          mixedInterfaces={mixedInterfaces}
           onClose={() => setSelected([])}
           onChanged={async () => {
             await onModelChanged?.();
