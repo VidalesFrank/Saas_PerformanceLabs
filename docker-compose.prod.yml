@@ -38,7 +38,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-plabs}:${POSTGRES_PASSWORD}@postgres:5432/performancelabs
       JWT_SECRET: ${JWT_SECRET:?Debes definir JWT_SECRET en .env}
       REDIS_URL: redis://redis:6379/0
-      CORS_ORIGINS: '["http://${SERVER_HOST:-localhost}:7000"]'
+      CORS_ORIGINS: '["http://localhost:7000","http://localhost:3000","https://${SERVER_HOST:-localhost}"]'
       BASE_DATA_DIR: /app/data
       RUN_MIGRATIONS: "true"
     volumes:
