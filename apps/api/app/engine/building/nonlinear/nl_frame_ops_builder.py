@@ -972,6 +972,14 @@ class NLFrameOPSBuilder:
         fy = float(steel.get("fy_MPa", 345.0))
         aisc_type = str(steel.get("aisc_type", "W")).upper()
 
+        # Familias geometricas (ver `engine.sections.steel_shapes`):
+        # - I-shapes:   W/S/M/HP + IPE/HEA/HEB/HEM  -> 3 patches (flanges + alma)
+        # - Box (HSS):  HSS_RECT + PTE              -> 4 strips perimetrales
+        # - Round tube: PIPE/HSS_ROUND + PHR        -> patch circular anular
+        _I_FAM   = {"W", "S", "M", "HP", "IPE", "HEA", "HEB", "HEM"}
+        _BOX_FAM = {"HSS_RECT", "PTE"}
+        _RND_FAM = {"PIPE", "HSS_ROUND", "PHR"}
+
         # Material acero estructural: b=0.003, eps_su=0.20 (ductil A992/A500)
         mat_tag = self._get_steel(fy, eps_su=0.20, b_hard=0.003)
 
@@ -982,7 +990,7 @@ class NLFrameOPSBuilder:
         torsion_tag = self._get_torsion(G * J)
         ops.section("Fiber", sec_tag, "-torsion", torsion_tag)
 
-        if aisc_type == "W":
+        if aisc_type in _I_FAM:
             d  = float(steel.get("d_m", 0.3))
             bf = float(steel.get("bf_m", 0.2))
             tw = float(steel.get("tw_m", 0.01))
@@ -1003,7 +1011,7 @@ class NLFrameOPSBuilder:
             ops.patch("rect", mat_tag, nf_web_d, nf_web_t,
                       -hw_core, -htw, hw_core, htw)
 
-        elif aisc_type == "HSS_RECT":
+        elif aisc_type in _BOX_FAM:
             d  = float(steel.get("d_m", 0.2))
             bf = float(steel.get("bf_m", 0.2))
             t  = float(steel.get("t_des_m", 0.012))
@@ -1021,7 +1029,7 @@ class NLFrameOPSBuilder:
             # Strip derecho
             ops.patch("rect", mat_tag, nfl, nft, -hd_in, hb_in,  hd_in,  hb)
 
-        elif aisc_type in ("PIPE", "HSS_ROUND"):
+        elif aisc_type in _RND_FAM:
             OD = float(steel.get("OD_m", 0.2))
             t  = float(steel.get("t_des_m", 0.008))
             r_ext = OD / 2.0

@@ -38,6 +38,10 @@ def _kv_from(tokens: list, start: int) -> dict:
 _STEEL_SHAPE_KEYWORDS = (
     "steel", "wide flange", "i/wide", "channel", "angle",
     "hss", "pipe", "wt", "tube", "tee", "built-up",
+    # Europeos DIN 1025 / EN 10034 (como aparecen en ETABS para proyectos LATAM):
+    "ipe", "hea", "heb", "hem",
+    # Tubulares estructurales colombianos (NSR-10 F.2):
+    "pte", "phr",
 )
 
 

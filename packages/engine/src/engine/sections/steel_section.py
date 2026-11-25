@@ -18,7 +18,9 @@ from dataclasses import dataclass
 from engine.materials.structural_steel import StructuralSteelParams, get_grade
 from engine.sections.geometry import CircPatchSpec, RectPatchSpec
 from engine.sections.steel_shapes import (
-    AISC_V15_SHAPES, SteelShape, ShapeType, get_shape,
+    AISC_V15_SHAPES, ALL_SHAPES, SteelShape, ShapeType, get_shape,
+    make_pte, make_phr,
+    I_SHAPE_TYPES, BOX_SHAPE_TYPES, ROUND_TUBE_TYPES,
 )
 
 
@@ -144,12 +146,15 @@ class SteelFrameSection:
         Para L, C, WT, S/M/HP, 2L: no soportado todavia — falla con ValueError.
         """
         s = self.shape
-        if s.type == ShapeType.W:
+        if s.type in I_SHAPE_TYPES:
+            # W / IPE / HEA / HEB / HEM / S / M / HP — todas forma I con 3 patches
             return self._w_patches(mat_tag, nf_flange_width, nf_flange_thick,
                                    nf_web_depth, nf_web_thick)
-        if s.type == ShapeType.HSS_RECT:
+        if s.type in BOX_SHAPE_TYPES:
+            # HSS_RECT / PTE — tubular rectangular con 4 strips
             return self._hss_rect_patches(mat_tag, nf_hss_long, nf_hss_thick)
-        if s.type in (ShapeType.HSS_ROUND, ShapeType.PIPE):
+        if s.type in ROUND_TUBE_TYPES:
+            # HSS_ROUND / PIPE / PHR — tubular circular (patch anular)
             return self._pipe_patches(mat_tag, nf_circ, nf_rad)
         raise ValueError(
             f"Discretizacion en fibras no soportada para tipo '{s.type.value}'"
@@ -209,17 +214,42 @@ class SteelFrameSection:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_steel_section(shape_name: str, grade: str = "A992") -> SteelFrameSection:
-    """Combina un perfil del catalogo AISC con un grado de acero.
+    """Combina un perfil del catalogo (AISC o europeo DIN) con un grado de acero.
 
     Ejemplos:
         make_steel_section("W24X55")               # W24x55 en A992
         make_steel_section("HSS8X8X1/2", "A500GrC-Rect")
+        make_steel_section("IPE-300", "A572Gr50")
+        make_steel_section("HEA-200")              # grade default A992
     """
     return SteelFrameSection(shape=get_shape(shape_name), material=get_grade(grade))
 
 
+def make_pte_section(
+    d_mm: float, b_mm: float, t_mm: float, grade: str = "A500GrC-Rect",
+) -> SteelFrameSection:
+    """Perfil Tubular Estructural rectangular con espesor libre.
+
+    El grado por defecto ('A500GrC-Rect') aplica al acero colombiano importado;
+    el usuario puede especificar cualquier grado registrado en `GRADE_PRESETS`.
+    """
+    return SteelFrameSection(shape=make_pte(d_mm, b_mm, t_mm), material=get_grade(grade))
+
+
+def make_phr_section(
+    OD_mm: float, t_mm: float, grade: str = "A500GrB-Round",
+) -> SteelFrameSection:
+    """Perfil Hueco Redondo con espesor libre (tuberia estructural circular)."""
+    return SteelFrameSection(shape=make_phr(OD_mm, t_mm), material=get_grade(grade))
+
+
 def available_shapes(shape_type: ShapeType | None = None) -> list[str]:
-    """Pass-through conveniente para la UI."""
+    """Pass-through conveniente para la UI (catalogo completo AISC + europeos).
+
+    PTE/PHR NO aparecen en esta lista porque son parametricos en espesor. Usa
+    `PTE_NOMINAL_SIZES` y `PHR_NOMINAL_OD` de `steel_shapes` para obtener las
+    dimensiones nominales que el usuario puede seleccionar.
+    """
     if shape_type is None:
-        return sorted(AISC_V15_SHAPES)
-    return sorted(k for k, s in AISC_V15_SHAPES.items() if s.type == shape_type)
+        return sorted(ALL_SHAPES)
+    return sorted(k for k, s in ALL_SHAPES.items() if s.type == shape_type)

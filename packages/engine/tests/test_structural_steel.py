@@ -112,15 +112,23 @@ class TestAISCCatalog:
         assert s1 is s2 is s3
 
     def test_list_filters_by_type(self):
-        all_names   = list_shapes()
+        # `list_shapes()` ahora cubre AISC + europeos (DIN). PTE/PHR son
+        # parametricos y NO aparecen. Verificamos que el filtro por tipo
+        # funciona y que los prefijos estan bien.
         w_names     = list_shapes(ShapeType.W)
         hss_names   = list_shapes(ShapeType.HSS_RECT)
         pipe_names  = list_shapes(ShapeType.PIPE)
-        assert len(all_names) == len(AISC_V15_SHAPES)
-        assert all(n.startswith("W") for n in w_names)
+        ipe_names   = list_shapes(ShapeType.IPE)
+        hea_names   = list_shapes(ShapeType.HEA)
+        all_names   = list_shapes()
+
+        assert all(n.startswith("W")   for n in w_names)
         assert all(n.startswith("HSS") for n in hss_names)
         assert all(n.startswith("PIPE") for n in pipe_names)
-        assert len(w_names) + len(hss_names) + len(pipe_names) == len(all_names)
+        assert all(n.startswith("IPE-") for n in ipe_names)
+        assert all(n.startswith("HEA-") for n in hea_names)
+        # Total es >= AISC original + los europeos que agregamos.
+        assert len(all_names) >= len(AISC_V15_SHAPES) + len(ipe_names) + len(hea_names)
 
     def test_unknown_shape_raises_with_suggestion(self):
         with pytest.raises(KeyError, match="catalogo"):
@@ -264,3 +272,148 @@ class TestFiberPatches:
         patches = sec.patches(mat_tag=1)
         for p in patches:
             assert p.nf_y >= 1 and p.nf_z >= 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Catalogos europeos (IPE / HEA / HEB / HEM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEuropeanCatalog:
+
+    def test_ipe300_dimensiones_din(self):
+        """IPE-300 segun DIN 1025-5: h=300, b=150, tw=7.1, tf=10.7, m=42.2 kg/m."""
+        s = get_shape("IPE-300")
+        assert s.type == ShapeType.IPE
+        assert s.d  == 300.0
+        assert s.bf == 150.0
+        assert abs(s.tw - 7.1)  < 0.01
+        assert abs(s.tf - 10.7) < 0.01
+        assert abs(s.weight_kgm - 42.2) < 0.5
+        # Ix (eje fuerte) ≈ 8356 cm^4 = 8356e4 mm^4
+        assert abs(s.Ix - 8356e4) / 8356e4 < 0.01
+
+    def test_hea200_dimensiones_din(self):
+        """HEA-200: h=190, b=200, A=53.83 cm², m=42.3 kg/m."""
+        s = get_shape("HEA-200")
+        assert s.type == ShapeType.HEA
+        assert s.d  == 190.0
+        assert s.bf == 200.0
+        assert abs(s.A - 5383.0) / 5383.0 < 0.01
+        assert abs(s.weight_kgm - 42.3) < 0.3
+
+    def test_heb300_pesado(self):
+        """HEB-300 es columna estandar: h=b=300, 117 kg/m."""
+        s = get_shape("HEB-300")
+        assert s.type == ShapeType.HEB
+        assert s.d == 300.0 and s.bf == 300.0
+        assert abs(s.weight_kgm - 117.0) < 1.0
+
+    def test_hem_se_cargan(self):
+        """La serie HEM 100..600 esta disponible."""
+        for tag in (100, 200, 300, 400, 600):
+            s = get_shape(f"HEM-{tag}")
+            assert s.type == ShapeType.HEM
+
+    def test_normalizacion_nombres_europeos(self):
+        """Acepta `IPE300`, `IPE 300`, `ipe-300`, etc."""
+        a = get_shape("IPE-300")
+        b = get_shape("IPE300")
+        c = get_shape("ipe 300")
+        d = get_shape("ipe-300")
+        assert a is b is c is d
+
+    def test_ipe_patches_usan_w_logic(self):
+        """IPE/HEA/HEB/HEM reusan la discretizacion de perfil I (3 patches)."""
+        sec = make_steel_section("IPE-300", "A992")
+        patches = sec.patches(mat_tag=1)
+        assert len(patches) == 3  # flange sup, flange inf, alma
+
+    def test_hea_patches_usan_w_logic(self):
+        sec = make_steel_section("HEA-200", "A992")
+        patches = sec.patches(mat_tag=1)
+        assert len(patches) == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PTE y PHR parametricos (espesor libre)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestParametricTubes:
+
+    def test_pte_200x100x5_propiedades(self):
+        """PTE-200x100x5: tubo rect. hueco con pared constante t=5 mm.
+
+        A = 200*100 - 190*90 = 20000 - 17100 = 2900 mm².
+        Mass = 7850 * 2900e-6 = 22.77 kg/m.
+        Ix (eje fuerte, perpendicular a d=200): mayor por canto.
+        """
+        from engine.sections.steel_shapes import make_pte
+
+        p = make_pte(200.0, 100.0, 5.0)
+        assert p.type == ShapeType.PTE
+        assert p.name == "PTE-200x100x5"
+        assert p.d == 200.0 and p.bf == 100.0 and p.t_des == 5.0
+        assert abs(p.A - 2900.0) < 1.0
+        assert abs(p.weight_kgm - 22.77) < 0.1
+        # Eje fuerte Ix > eje debil Iy (d > b).
+        assert p.Ix > p.Iy
+        # Zx > Sx (plastico > elastico, siempre).
+        assert p.Zx > p.Sx
+
+    def test_phr_100x3_propiedades(self):
+        """PHR-100x3: tubo circular hueco OD=100, t=3 mm."""
+        from engine.sections.steel_shapes import make_phr
+        import math as m
+
+        p = make_phr(100.0, 3.0)
+        assert p.type == ShapeType.PHR
+        assert p.name == "PHR-100x3"
+        assert p.OD == 100.0 and p.t_des == 3.0
+        # A = pi/4 * (100^2 - 94^2) = pi/4 * (10000 - 8836) = pi/4 * 1164
+        A_expected = m.pi * (100.0**2 - 94.0**2) / 4.0
+        assert abs(p.A - A_expected) < 0.1
+        # J = 2 * I para seccion circular
+        assert abs(p.J - 2.0 * p.Ix) / p.J < 1e-6
+        # Ix == Iy por simetria axial
+        assert abs(p.Ix - p.Iy) < 1e-6
+
+    def test_phr_decimal_thickness(self):
+        """PHR acepta espesor 2.5 mm (default Perfitec)."""
+        from engine.sections.steel_shapes import make_phr
+        p = make_phr(75.0, 2.5)
+        assert p.name == "PHR-75x2.5"
+        assert p.t_des == 2.5
+
+    def test_pte_rechaza_espesor_invalido(self):
+        """PTE con 2t >= lado menor se rechaza."""
+        from engine.sections.steel_shapes import make_pte
+        with pytest.raises(ValueError, match="espesor"):
+            make_pte(100.0, 50.0, 30.0)  # 2*30 = 60 > 50
+
+    def test_phr_rechaza_espesor_invalido(self):
+        """PHR con 2t >= OD se rechaza."""
+        from engine.sections.steel_shapes import make_phr
+        with pytest.raises(ValueError, match="espesor"):
+            make_phr(50.0, 30.0)
+
+    def test_pte_patches_son_hss_rect(self):
+        """PTE reusa la discretizacion HSS rect (4 strips perimetrales)."""
+        from engine.sections.steel_section import make_pte_section
+        sec = make_pte_section(200.0, 100.0, 5.0)
+        patches = sec.patches(mat_tag=1)
+        assert len(patches) == 4
+
+    def test_phr_patches_son_pipe(self):
+        """PHR reusa la discretizacion Pipe (1 patch circular anular)."""
+        from engine.sections.steel_section import make_phr_section
+        sec = make_phr_section(100.0, 3.0)
+        patches = sec.patches(mat_tag=1)
+        assert len(patches) == 1
+
+    def test_pte_section_capacidades(self):
+        """Mp y Py de PTE deben ser positivos y plausibles (fy A500GrC = 345 MPa)."""
+        from engine.sections.steel_section import make_pte_section
+        sec = make_pte_section(200.0, 100.0, 5.0, grade="A500GrC-Rect")
+        assert sec.Py > 0 and sec.Mp_x > 0
+        # Py = A * fy → 2900 mm² * 345 MPa = 1000.5 kN
+        assert abs(sec.Py - 2900.0 * 345.0) / sec.Py < 0.01

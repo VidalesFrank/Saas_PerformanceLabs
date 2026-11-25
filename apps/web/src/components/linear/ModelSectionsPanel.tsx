@@ -13,10 +13,73 @@ interface SteelCatalogGrade {
   name: string; fy_mpa: number; fu_mpa: number;
   E_mpa: number; G_mpa: number; eps_y: number;
 }
+interface ParametricSize {
+  name: string;
+  d_mm?: number;
+  b_mm?: number;
+  OD_mm?: number;
+}
+interface ParametricShape {
+  label: string;
+  sizes: ParametricSize[];
+  default_thicknesses_mm: number[];
+  user_adjustable_thickness: boolean;
+}
 interface SteelCatalog {
   shapes_by_type: Record<string, SteelCatalogShape[]>;
+  parametric_shapes: Record<string, ParametricShape>;
   grades: SteelCatalogGrade[];
   total_shapes: number;
+}
+
+// Familias tabuladas (el usuario elige un perfil completo) y parametricas
+// (el usuario elige dimensiones nominales + espesor). Los literales de familia
+// coinciden con el ShapeType del engine (`engine.sections.steel_shapes`).
+type SteelFamilyTab = "W" | "HSS_RECT" | "PIPE" | "IPE" | "HEA" | "HEB" | "HEM";
+type SteelFamilyParam = "PTE" | "PHR";
+type SteelFamily = SteelFamilyTab | SteelFamilyParam;
+
+const TABULATED_FAMILIES: SteelFamilyTab[] = ["W", "IPE", "HEA", "HEB", "HEM", "HSS_RECT", "PIPE"];
+const PARAMETRIC_FAMILIES: SteelFamilyParam[] = ["PTE", "PHR"];
+
+const FAMILY_LABEL: Record<SteelFamily, string> = {
+  W:        "W (I)",
+  IPE:      "IPE",
+  HEA:      "HEA",
+  HEB:      "HEB",
+  HEM:      "HEM",
+  HSS_RECT: "HSS rect",
+  PIPE:     "Pipe",
+  PTE:      "PTE",
+  PHR:      "PHR",
+};
+
+// Densidad del acero estructural para masa calculada (debe coincidir con el
+// engine: packages/engine/src/engine/sections/steel_shapes.py).
+const STEEL_DENSITY_KG_M3 = 7850.0;
+
+// Propiedades geometricas calculadas para PTE (tubular rect. hueco).
+function computePteProps(d_mm: number, b_mm: number, t_mm: number) {
+  const d_in = d_mm - 2 * t_mm;
+  const b_in = b_mm - 2 * t_mm;
+  if (d_in <= 0 || b_in <= 0) return null;
+  const A    = d_mm * b_mm - d_in * b_in;
+  const Ix   = (b_mm * d_mm ** 3 - b_in * d_in ** 3) / 12;
+  const Iy   = (d_mm * b_mm ** 3 - d_in * b_in ** 3) / 12;
+  const Zx   = (b_mm * d_mm ** 2 - b_in * d_in ** 2) / 4;
+  const mass = STEEL_DENSITY_KG_M3 * (A * 1e-6);
+  return { A, Ix, Iy, Zx, mass };
+}
+
+// Propiedades geometricas calculadas para PHR (tubular circular hueco).
+function computePhrProps(OD_mm: number, t_mm: number) {
+  const ID = OD_mm - 2 * t_mm;
+  if (ID <= 0) return null;
+  const A    = Math.PI * (OD_mm ** 2 - ID ** 2) / 4;
+  const I    = Math.PI * (OD_mm ** 4 - ID ** 4) / 64;
+  const Z    = (OD_mm ** 3 - ID ** 3) / 6;
+  const mass = STEEL_DENSITY_KG_M3 * (A * 1e-6);
+  return { A, Ix: I, Iy: I, Zx: Z, mass };
 }
 
 // ── Preview sección transversal SVG ──────────────────────────────────────────
@@ -119,9 +182,10 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
   const [steelCatalog, setSteelCatalog] = useState<SteelCatalog | null>(null);
   const [steelForm, setSteelForm] = useState({
     name:       "",
-    shape_type: "W" as "W" | "HSS_RECT" | "PIPE",
-    shape_name: "",
+    family:     "W" as SteelFamily,
+    shape_name: "",         // selector dentro de la familia
     grade:      "A992",
+    thickness_mm: "",       // solo PTE/PHR; string para permitir input vacío
   });
 
   // Carga lazy al entrar en modo create-steel
@@ -134,21 +198,84 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
         const firstW = c.shapes_by_type["W"]?.[0]?.name ?? "";
         setSteelForm((f) => ({ ...f, shape_name: f.shape_name || firstW }));
       })
-      .catch((e) => setError(e instanceof Error ? e.message : "No se pudo cargar el catálogo AISC"));
+      .catch((e) => setError(e instanceof Error ? e.message : "No se pudo cargar el catálogo de acero"));
   }, [mode, steelCatalog]);
 
-  const steelShapesForType = useMemo(
-    () => steelCatalog?.shapes_by_type[steelForm.shape_type] ?? [],
-    [steelCatalog, steelForm.shape_type],
-  );
-  const steelShape = steelShapesForType.find((s) => s.name === steelForm.shape_name);
+  const isParametric = PARAMETRIC_FAMILIES.includes(steelForm.family as SteelFamilyParam);
+
+  const tabulatedShapes = useMemo(() => {
+    if (isParametric) return [];
+    return steelCatalog?.shapes_by_type[steelForm.family] ?? [];
+  }, [steelCatalog, steelForm.family, isParametric]);
+
+  const parametricInfo: ParametricShape | undefined = isParametric
+    ? steelCatalog?.parametric_shapes?.[steelForm.family]
+    : undefined;
+
+  const tabulatedShape = tabulatedShapes.find((s) => s.name === steelForm.shape_name);
+  const parametricSize = parametricInfo?.sizes.find((s) => s.name === steelForm.shape_name);
   const steelGrade = steelCatalog?.grades.find((g) => g.name === steelForm.grade);
 
+  // Propiedades mostradas en el preview (A, I, Z, mass).
+  const previewProps = useMemo(() => {
+    if (tabulatedShape) {
+      return {
+        A_mm2:    tabulatedShape.A_mm2,
+        Ix_mm4:   tabulatedShape.Ix_mm4,
+        Iy_mm4:   tabulatedShape.Iy_mm4,
+        Zx_mm3:   tabulatedShape.Zx_mm3,
+        mass_kgm: tabulatedShape.weight_kgm,
+        d_mm:     tabulatedShape.d_mm,
+        bf_mm:    tabulatedShape.bf_mm,
+      };
+    }
+    if (isParametric && parametricSize) {
+      const t = parseFloat(steelForm.thickness_mm);
+      if (!isFinite(t) || t <= 0) return null;
+      if (steelForm.family === "PTE" && parametricSize.d_mm && parametricSize.b_mm) {
+        const p = computePteProps(parametricSize.d_mm, parametricSize.b_mm, t);
+        if (!p) return null;
+        return {
+          A_mm2: p.A, Ix_mm4: p.Ix, Iy_mm4: p.Iy, Zx_mm3: p.Zx, mass_kgm: p.mass,
+          d_mm: parametricSize.d_mm, bf_mm: parametricSize.b_mm,
+        };
+      }
+      if (steelForm.family === "PHR" && parametricSize.OD_mm) {
+        const p = computePhrProps(parametricSize.OD_mm, t);
+        if (!p) return null;
+        return {
+          A_mm2: p.A, Ix_mm4: p.Ix, Iy_mm4: p.Iy, Zx_mm3: p.Zx, mass_kgm: p.mass,
+          d_mm: parametricSize.OD_mm, bf_mm: parametricSize.OD_mm,
+        };
+      }
+    }
+    return null;
+  }, [tabulatedShape, isParametric, parametricSize, steelForm.family, steelForm.thickness_mm]);
+
   function startCreateSteel() {
-    setSteelForm({ name: "", shape_type: "W", shape_name: "", grade: "A992" });
+    setSteelForm({ name: "", family: "W", shape_name: "", grade: "A992", thickness_mm: "" });
     setMode("create-steel");
     setError(null);
     setSuccess(null);
+  }
+
+  function selectFamily(fam: SteelFamily) {
+    if (!steelCatalog) return;
+    setSteelForm((f) => {
+      let next_shape = "";
+      let next_t = f.thickness_mm;
+      if (PARAMETRIC_FAMILIES.includes(fam as SteelFamilyParam)) {
+        const info = steelCatalog.parametric_shapes?.[fam];
+        next_shape = info?.sizes[0]?.name ?? "";
+        // espesor por default: primero de la lista (2.0 para PHR, 3.0 para PTE)
+        if (!next_t) {
+          next_t = (info?.default_thicknesses_mm?.[0] ?? "").toString();
+        }
+      } else {
+        next_shape = steelCatalog.shapes_by_type[fam]?.[0]?.name ?? "";
+      }
+      return { ...f, family: fam, shape_name: next_shape };
+    });
   }
 
   async function handleSaveSteel() {
@@ -156,13 +283,26 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
       setError("Completa nombre, perfil y grado.");
       return;
     }
+    if (isParametric) {
+      const t = parseFloat(steelForm.thickness_mm);
+      if (!isFinite(t) || t <= 0) {
+        setError("Especifica el espesor t (mm) para " + steelForm.family + ".");
+        return;
+      }
+    }
     setSaving(true); setError(null);
     try {
-      const r = await structuralEditorApi.createSteelSection(projectId, {
+      const payload: {
+        name: string; shape_name: string; grade: string; thickness_mm?: number;
+      } = {
         name:       steelForm.name.trim(),
         shape_name: steelForm.shape_name,
         grade:      steelForm.grade,
-      });
+      };
+      if (isParametric) {
+        payload.thickness_mm = parseFloat(steelForm.thickness_mm);
+      }
+      const r = await structuralEditorApi.createSteelSection(projectId, payload);
       setSuccess(`Sección "${r.name}" creada (material ${r.material_created})`);
       setMode("list");
       await onModelDataChange();
@@ -372,7 +512,7 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
     return (
       <div className="flex flex-col h-full">
         <div className="px-4 py-3 border-b border-border bg-surface-2 flex-shrink-0 flex items-center justify-between">
-          <p className="text-xs font-semibold text-text">Nueva sección de acero (AISC v15.0)</p>
+          <p className="text-xs font-semibold text-text">Nueva sección de acero (AISC + DIN + NSR-10)</p>
           <button onClick={cancel} className="text-[10px] text-text-muted hover:text-text">Cancelar</button>
         </div>
 
@@ -384,7 +524,7 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
           )}
 
           {!steelCatalog && (
-            <p className="text-xs text-text-muted">Cargando catálogo AISC…</p>
+            <p className="text-xs text-text-muted">Cargando catálogo de perfiles…</p>
           )}
 
           {steelCatalog && (
@@ -395,7 +535,7 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
                 </label>
                 <input
                   type="text"
-                  placeholder="ej. COL-W14X90"
+                  placeholder="ej. COL-W14X90 o VIG-IPE-300"
                   value={steelForm.name}
                   onChange={(e) => setSteelForm((f) => ({ ...f, name: e.target.value }))}
                   className="w-full text-xs rounded-lg border border-border bg-surface px-2.5 py-1.5 text-text focus:outline-none focus:border-accent"
@@ -406,24 +546,41 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
                 <label className="text-[10px] font-semibold uppercase tracking-widest text-text-muted block mb-1">
                   Familia de perfil
                 </label>
-                <div className="flex gap-1">
-                  {(["W", "HSS_RECT", "PIPE"] as const).map((t) => (
+                <div className="grid grid-cols-5 gap-1">
+                  {TABULATED_FAMILIES.map((t) => (
                     <button
                       key={t}
-                      onClick={() => {
-                        const first = steelCatalog.shapes_by_type[t]?.[0]?.name ?? "";
-                        setSteelForm((f) => ({ ...f, shape_type: t, shape_name: first }));
-                      }}
+                      onClick={() => selectFamily(t)}
                       className={[
-                        "flex-1 text-[11px] px-2.5 py-1.5 rounded-lg border transition-colors",
-                        steelForm.shape_type === t
+                        "text-[10px] px-1.5 py-1.5 rounded-lg border transition-colors",
+                        steelForm.family === t
                           ? "bg-indigo-600 text-white border-indigo-600"
                           : "bg-surface border-border text-text-muted hover:text-text",
                       ].join(" ")}
                     >
-                      {t === "W" ? "W (I)" : t === "HSS_RECT" ? "HSS rect" : "Pipe"}
-                      <span className="ml-1 opacity-60 text-[9px]">
+                      {FAMILY_LABEL[t]}
+                      <span className="ml-0.5 opacity-60 text-[9px]">
                         ({steelCatalog.shapes_by_type[t]?.length ?? 0})
+                      </span>
+                    </button>
+                  ))}
+                </div>
+                <div className="grid grid-cols-2 gap-1 mt-1">
+                  {PARAMETRIC_FAMILIES.map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => selectFamily(t)}
+                      className={[
+                        "text-[10px] px-1.5 py-1.5 rounded-lg border transition-colors",
+                        steelForm.family === t
+                          ? "bg-emerald-600 text-white border-emerald-600"
+                          : "bg-surface border-border text-text-muted hover:text-text",
+                      ].join(" ")}
+                      title={steelCatalog.parametric_shapes?.[t]?.label}
+                    >
+                      {FAMILY_LABEL[t]}
+                      <span className="ml-0.5 opacity-60 text-[9px]">
+                        ({steelCatalog.parametric_shapes?.[t]?.sizes.length ?? 0} tamaños · t libre)
                       </span>
                     </button>
                   ))}
@@ -432,14 +589,21 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
 
               <div>
                 <label className="text-[10px] font-semibold uppercase tracking-widest text-text-muted block mb-1">
-                  Perfil AISC
+                  {isParametric ? "Dimensión nominal" : "Perfil"}
                 </label>
                 <select
                   value={steelForm.shape_name}
                   onChange={(e) => setSteelForm((f) => ({ ...f, shape_name: e.target.value }))}
                   className="w-full text-xs rounded-lg border border-border bg-surface px-2.5 py-1.5 text-text font-mono focus:outline-none focus:border-accent"
                 >
-                  {steelShapesForType.map((s) => (
+                  {isParametric && parametricInfo?.sizes.map((s) => (
+                    <option key={s.name} value={s.name}>
+                      {s.name}  —  {steelForm.family === "PTE"
+                        ? `${s.d_mm} × ${s.b_mm} mm`
+                        : `OD ${s.OD_mm} mm`}
+                    </option>
+                  ))}
+                  {!isParametric && tabulatedShapes.map((s) => (
                     <option key={s.name} value={s.name}>
                       {s.name}  —  {s.weight_kgm.toFixed(1)} kg/m, d={s.d_mm.toFixed(0)} mm
                     </option>
@@ -447,9 +611,42 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
                 </select>
               </div>
 
+              {isParametric && parametricInfo && (
+                <div>
+                  <label className="text-[10px] font-semibold uppercase tracking-widest text-text-muted block mb-1">
+                    Espesor t (mm) *
+                  </label>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.1"
+                    placeholder={`ej. ${parametricInfo.default_thicknesses_mm[0] ?? 3}`}
+                    value={steelForm.thickness_mm}
+                    onChange={(e) => setSteelForm((f) => ({ ...f, thickness_mm: e.target.value }))}
+                    className="w-full text-xs rounded-lg border border-border bg-surface px-2.5 py-1.5 text-text font-mono focus:outline-none focus:border-accent"
+                  />
+                  <div className="flex gap-1 mt-1.5 flex-wrap">
+                    {parametricInfo.default_thicknesses_mm.map((t) => (
+                      <button
+                        key={t}
+                        onClick={() => setSteelForm((f) => ({ ...f, thickness_mm: String(t) }))}
+                        className={[
+                          "text-[10px] px-2 py-0.5 rounded border transition-colors font-mono",
+                          parseFloat(steelForm.thickness_mm) === t
+                            ? "bg-emerald-600/20 border-emerald-600 text-emerald-600"
+                            : "bg-surface border-border text-text-muted hover:text-text",
+                        ].join(" ")}
+                      >
+                        {t} mm
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div>
                 <label className="text-[10px] font-semibold uppercase tracking-widest text-text-muted block mb-1">
-                  Grado ASTM
+                  Grado del acero
                 </label>
                 <select
                   value={steelForm.grade}
@@ -465,18 +662,22 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
               </div>
 
               {/* Preview + propiedades */}
-              {steelShape && steelGrade && (
+              {previewProps && steelGrade && (
                 <div className="rounded-lg border border-border bg-surface-2 p-3 space-y-2">
-                  <p className="text-[10px] uppercase tracking-widest text-text-muted">Vista previa</p>
+                  <p className="text-[10px] uppercase tracking-widest text-text-muted">
+                    Vista previa — {steelForm.shape_name}
+                    {isParametric && steelForm.thickness_mm && ` × ${steelForm.thickness_mm} mm`}
+                  </p>
                   <div className="flex items-center gap-4">
-                    <SteelShapePreviewSVG type={steelForm.shape_type} s={steelShape} />
+                    <SteelShapePreviewSVG family={steelForm.family} d_mm={previewProps.d_mm} bf_mm={previewProps.bf_mm} t_mm={isParametric ? parseFloat(steelForm.thickness_mm) : undefined} />
                     <div className="flex-1 text-[11px] space-y-0.5">
-                      <PropRow label="A"    value={`${(steelShape.A_mm2 * 1e-2).toFixed(2)} cm²`} />
-                      <PropRow label="Ix"   value={`${(steelShape.Ix_mm4 * 1e-6).toFixed(1)}×10⁶ mm⁴`} />
-                      <PropRow label="Iy"   value={`${(steelShape.Iy_mm4 * 1e-6).toFixed(1)}×10⁶ mm⁴`} />
-                      <PropRow label="Zx"   value={`${(steelShape.Zx_mm3 * 1e-3).toFixed(1)} cm³`} />
-                      <PropRow label="Mp,x" value={`${(steelShape.Zx_mm3 * steelGrade.fy_mpa * 1e-6).toFixed(0)} kN·m`} />
-                      <PropRow label="Py"   value={`${(steelShape.A_mm2 * steelGrade.fy_mpa * 1e-3).toFixed(0)} kN`} />
+                      <PropRow label="A"    value={`${(previewProps.A_mm2 * 1e-2).toFixed(2)} cm²`} />
+                      <PropRow label="Masa" value={`${previewProps.mass_kgm.toFixed(1)} kg/m`} />
+                      <PropRow label="Ix"   value={`${(previewProps.Ix_mm4 * 1e-6).toFixed(1)}×10⁶ mm⁴`} />
+                      <PropRow label="Iy"   value={`${(previewProps.Iy_mm4 * 1e-6).toFixed(1)}×10⁶ mm⁴`} />
+                      <PropRow label="Zx"   value={`${(previewProps.Zx_mm3 * 1e-3).toFixed(1)} cm³`} />
+                      <PropRow label="Mp,x" value={`${(previewProps.Zx_mm3 * steelGrade.fy_mpa * 1e-6).toFixed(0)} kN·m`} />
+                      <PropRow label="Py"   value={`${(previewProps.A_mm2 * steelGrade.fy_mpa * 1e-3).toFixed(0)} kN`} />
                     </div>
                   </div>
                 </div>
@@ -484,7 +685,7 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
 
               <button
                 onClick={handleSaveSteel}
-                disabled={saving || !steelForm.name.trim() || !steelForm.shape_name}
+                disabled={saving || !steelForm.name.trim() || !steelForm.shape_name || (isParametric && !parseFloat(steelForm.thickness_mm))}
                 className="mt-2 text-xs px-3 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors font-medium disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {saving ? "Creando…" : "Crear sección metálica"}
@@ -636,38 +837,45 @@ export default function ModelSectionsPanel({ projectId, modelData, onModelDataCh
 // ── Preview SVG de perfil metálico (W, HSS rect, Pipe) ───────────────────────
 
 function SteelShapePreviewSVG({
-  type, s,
-}: { type: "W" | "HSS_RECT" | "PIPE"; s: SteelCatalogShape }) {
+  family, d_mm, bf_mm, t_mm,
+}: {
+  family: SteelFamily;
+  d_mm: number;
+  bf_mm: number;
+  t_mm?: number;   // espesor real para PTE/PHR
+}) {
   const SIZE = 90, PAD = 10;
-  const d  = s.d_mm;
-  const bf = s.bf_mm;
+  const d  = d_mm;
+  const bf = bf_mm;
   const maxDim = Math.max(d, bf);
   const scale = (SIZE - 2 * PAD) / maxDim;
   const cx = SIZE / 2;
   const cy = SIZE / 2;
 
-  if (type === "W") {
-    // Simplificacion: no tenemos tw/tf aqui, aproximamos como fracción del d
+  const isIFamily   = ["W", "IPE", "HEA", "HEB", "HEM"].includes(family);
+  const isBoxFamily = ["HSS_RECT", "PTE"].includes(family);
+  const isRoundTube = ["PIPE", "PHR"].includes(family);
+
+  if (isIFamily) {
     const h = d * scale;
     const w = bf * scale;
     const tf = Math.max(2, h * 0.08);
     const tw = Math.max(1.5, w * 0.06);
     return (
       <svg width={SIZE} height={SIZE} className="flex-shrink-0">
-        {/* Flange superior */}
         <rect x={cx - w / 2} y={cy - h / 2}   width={w}  height={tf} fill="#64748b" opacity="0.8" />
-        {/* Flange inferior */}
         <rect x={cx - w / 2} y={cy + h / 2 - tf} width={w} height={tf} fill="#64748b" opacity="0.8" />
-        {/* Alma */}
         <rect x={cx - tw / 2} y={cy - h / 2 + tf} width={tw} height={h - 2 * tf} fill="#64748b" opacity="0.8" />
       </svg>
     );
   }
 
-  if (type === "HSS_RECT") {
+  if (isBoxFamily) {
     const h = d * scale;
     const w = bf * scale;
-    const t = Math.max(1.5, Math.min(h, w) * 0.07);
+    const t = t_mm !== undefined && isFinite(t_mm) && t_mm > 0
+      ? Math.max(1.5, t_mm * scale)
+      : Math.max(1.5, Math.min(h, w) * 0.07);
     return (
       <svg width={SIZE} height={SIZE} className="flex-shrink-0">
         <rect x={cx - w / 2} y={cy - h / 2} width={w} height={h}
@@ -676,15 +884,20 @@ function SteelShapePreviewSVG({
     );
   }
 
-  // PIPE
-  const r = (d / 2) * scale;   // d = OD
-  const t = Math.max(1.5, r * 0.15);
-  return (
-    <svg width={SIZE} height={SIZE} className="flex-shrink-0">
-      <circle cx={cx} cy={cy} r={r}
-        fill="#64748b" fillOpacity="0.2" stroke="#64748b" strokeWidth={t} />
-    </svg>
-  );
+  if (isRoundTube) {
+    const r = (d / 2) * scale;   // d = OD
+    const t = t_mm !== undefined && isFinite(t_mm) && t_mm > 0
+      ? Math.max(1.5, t_mm * scale)
+      : Math.max(1.5, r * 0.15);
+    return (
+      <svg width={SIZE} height={SIZE} className="flex-shrink-0">
+        <circle cx={cx} cy={cy} r={r}
+          fill="#64748b" fillOpacity="0.2" stroke="#64748b" strokeWidth={t} />
+      </svg>
+    );
+  }
+
+  return <svg width={SIZE} height={SIZE} className="flex-shrink-0" />;
 }
 
 function PropRow({ label, value }: { label: string; value: string }) {

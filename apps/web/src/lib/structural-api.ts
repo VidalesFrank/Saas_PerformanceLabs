@@ -552,6 +552,21 @@ export const structuralEditorApi = {
   modelCheck: (projectId: string) =>
     req<ModelCheckResult>(`/${projectId}/model-check`),
 
+  /** Lista joints donde convergen frames de concreto y de acero (apoyos
+   *  de cubierta metálica, bases de columnas steel sobre dados RC, etc.). */
+  getMixedInterfaces: (projectId: string) =>
+    req<{
+      interfaces: Array<{
+        joint_id: string;
+        x: number; y: number; z: number;
+        elev_m: number;
+        concrete_frames: string[];
+        steel_frames: string[];
+        is_roof_support: boolean;
+      }>;
+      summary: { total: number; roof_supports: number; mid_transitions: number };
+    }>(`/${projectId}/model/mixed-interfaces`),
+
   // ── Secciones ────────────────────────────────────────────────────────────
 
   createSection: (projectId: string, name: string, data: Omit<SectionData, "A_m2" | "I33_m4" | "I22_m4" | "J_m4" | "E_mpa" | "G_mpa"> & Partial<Pick<SectionData, "A_m2" | "I33_m4" | "I22_m4" | "J_m4">>) =>
@@ -572,7 +587,8 @@ export const structuralEditorApi = {
       { method: "DELETE" },
     ),
 
-  /** Catálogo AISC v15.0 (perfiles + grados ASTM). */
+  /** Catálogo de perfiles metálicos (AISC + europeos DIN 1025 + colombianos
+   *  PTE/PHR paramétricos) + grados ASTM/DIN. */
   getSteelCatalog: () =>
     req<{
       shapes_by_type: Record<string, Array<{
@@ -580,6 +596,12 @@ export const structuralEditorApi = {
         weight_kgm: number; Ix_mm4: number; Iy_mm4: number;
         Zx_mm3: number; Zy_mm3: number;
       }>>;
+      parametric_shapes: Record<string, {
+        label: string;
+        sizes: Array<{ name: string; d_mm?: number; b_mm?: number; OD_mm?: number }>;
+        default_thicknesses_mm: number[];
+        user_adjustable_thickness: boolean;
+      }>;
       grades: Array<{
         name: string; fy_mpa: number; fu_mpa: number;
         E_mpa: number; G_mpa: number; eps_y: number;
@@ -587,11 +609,12 @@ export const structuralEditorApi = {
       total_shapes: number;
     }>(`/steel/catalog`),
 
-  /** Crea una sección metálica desde perfil AISC + grado ASTM. Auto-crea
-   *  el material de acero si no existe. */
+  /** Crea una sección metálica desde perfil (AISC, DIN o PTE/PHR colombiano)
+   *  + grado ASTM/DIN. Auto-crea el material de acero si no existe.
+   *  Para PTE/PHR, `thickness_mm` define el espesor del tubo. */
   createSteelSection: (
     projectId: string,
-    payload: { name: string; shape_name: string; grade: string },
+    payload: { name: string; shape_name: string; grade: string; thickness_mm?: number },
   ) =>
     req<{
       ok: boolean;
