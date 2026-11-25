@@ -132,7 +132,7 @@ function Hero({
     <section className="pl-hero-dark">
       {/* Controles superiores (theme + logout) flotando sobre el hero */}
       <div className="absolute right-6 top-5 z-10 flex items-center gap-2">
-        <ThemeToggle />
+        <ThemeToggle variant="on-hero" />
         <button
           type="button"
           onClick={onLogout}

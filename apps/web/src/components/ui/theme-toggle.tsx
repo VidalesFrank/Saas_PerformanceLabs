@@ -2,17 +2,28 @@
 
 import { useTheme } from "@/lib/theme";
 
-export function ThemeToggle() {
+interface ThemeToggleProps {
+  /** `"default"`: usa tokens `bg-surface-2`/`text-text-muted` (sigue el tema).
+   *  `"on-hero"`:  fija colores claros sobre fondo oscuro del hero dashboard —
+   *               el botón se mantiene visible aún en light mode porque el
+   *               hero es dark siempre. */
+  variant?: "default" | "on-hero";
+}
+
+export function ThemeToggle({ variant = "default" }: ThemeToggleProps = {}) {
   const { theme, toggle } = useTheme();
   const isDark = theme === "dark";
+
+  const className = variant === "on-hero"
+    ? "flex h-8 w-8 items-center justify-center rounded-lg border border-white/25 bg-white/10 text-slate-100 transition-colors hover:bg-white/20 hover:border-white/40"
+    : "flex h-8 w-8 items-center justify-center rounded-lg border border-border bg-surface-2 text-text-muted transition-colors hover:bg-border hover:text-text";
 
   return (
     <button
       type="button"
       onClick={toggle}
       title={isDark ? "Cambiar a tema claro" : "Cambiar a tema oscuro"}
-      className="flex h-8 w-8 items-center justify-center rounded-lg border border-border bg-surface-2 text-text-muted
-        transition-colors hover:bg-border hover:text-text"
+      className={className}
       aria-label={isDark ? "Tema claro" : "Tema oscuro"}
     >
       {isDark ? (
