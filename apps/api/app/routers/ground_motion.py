@@ -215,12 +215,15 @@ class RecordOut(BaseModel):
     id: str
     name: str
     source_file: str | None
+    owner_id: str | None = None
+    is_owner: bool = False
     dt: float | None
     n_samples: int | None
     duration: float | None
     acc_unit_original: str | None
     metadata_json: dict | None
     created_at: str
+    updated_at: str | None = None
 
 
 class ProcessRequest(BaseModel):
@@ -420,7 +423,7 @@ async def create_record(
     db.commit()
     db.refresh(record_db)
 
-    return _record_to_out(record_db)
+    return _record_to_out(record_db, current_user.id)
 
 
 # ── Endpoint: listar registros ────────────────────────────────────────────────
@@ -428,15 +431,17 @@ async def create_record(
 @router.get("/records", response_model=list[RecordOut])
 def list_records(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),  # noqa: ARG001 — auth gate
 ) -> list:
+    # Catalogo compartido: todos los usuarios autenticados ven todos los registros.
+    # La propiedad de un registro solo importa para operaciones de escritura
+    # (delete / process) — ver _assert_owner_or_403.
     records = (
         db.query(GroundMotionRecord)
-        .filter(GroundMotionRecord.owner_id == current_user.id)
         .order_by(GroundMotionRecord.created_at.desc())
         .all()
     )
-    return [_record_to_out(r) for r in records]
+    return [_record_to_out(r, current_user.id) for r in records]
 
 
 # ── Endpoint: obtener registro ────────────────────────────────────────────────
@@ -448,9 +453,9 @@ def get_record(
     current_user: User = Depends(get_current_user),
 ) -> dict:
     record_db = _get_record_or_404(record_id, current_user.id, db)
-    out = _record_to_out(record_db)
-    # Agregar jobs del registro
-    jobs = [_job_to_out(j) for j in record_db.jobs]
+    out = _record_to_out(record_db, current_user.id)
+    # Jobs del registro: solo los del usuario actual (los jobs son por-usuario).
+    jobs = [_job_to_out(j) for j in record_db.jobs if j.owner_id == current_user.id]
     out["jobs"] = jobs
     return out
 
@@ -464,6 +469,7 @@ def delete_record(
     current_user: User = Depends(get_current_user),
 ) -> None:
     record_db = _get_record_or_404(record_id, current_user.id, db)
+    _assert_owner_or_403(record_db, current_user.id)
     # Eliminar archivos del disco
     gm_dir = os.path.join(settings.base_data_dir, "ground_motion", record_id)
     import shutil
@@ -583,6 +589,7 @@ def process_signal(
 ) -> dict:
     """Aplica corrección de línea base o filtrado y guarda el resultado."""
     record_db = _get_record_or_404(record_id, current_user.id, db)
+    _assert_owner_or_403(record_db, current_user.id)
     gm_rec    = _load_record_data(record_db)
 
     acc_ch = gm_rec.get_acceleration_channel(req.component)
@@ -675,6 +682,7 @@ def recalibrate_record(
     Idempotente: siempre parte de raw_values, no de calibraciones anteriores.
     """
     record_db = _get_record_or_404(record_id, current_user.id, db)
+    _assert_owner_or_403(record_db, current_user.id)
     gm_rec = _load_record_data(record_db)
 
     try:
@@ -1082,6 +1090,194 @@ def export_spectrum_endpoint(
     )
 
 
+# ── Endpoint: exportar reporte completo (FFT + Welch + Arias + Espectros) ────
+
+def _build_full_report_xlsx(
+    record_db,
+    gm_rec,
+    req: "SpectrumRequest",
+    fft: dict,
+    welch: dict,
+    arias_cum: "np.ndarray",
+    arias_total: float,
+    time_vec: "np.ndarray",
+    spec: dict,
+) -> bytes:
+    """Reporte Excel único con 5 hojas:
+      - Resumen           Metadata del registro + parámetros usados
+      - FFT               freq (Hz), periodo (s), amplitud, fase
+      - Welch_PSD         freq (Hz), PSD
+      - Arias_Acumulada   t (s), Ia(t) [m/s], Ia(t)/Ia_total [%]
+      - Espectros         T (s), Sa(ξ) [g], Sd(ξ) [cm], Sv(ξ) [cm/s]
+    """
+    import xlsxwriter
+
+    buf = io.BytesIO()
+    wb = xlsxwriter.Workbook(buf, {"in_memory": True})
+
+    title_fmt   = wb.add_format({"bold": True, "font_size": 14, "font_color": "#0f172a"})
+    label_fmt   = wb.add_format({"bold": True, "bg_color": "#f1f5f9", "border": 1, "border_color": "#e2e8f0"})
+    value_fmt   = wb.add_format({"border": 1, "border_color": "#e2e8f0"})
+    header_fmt  = wb.add_format({
+        "bold": True, "bg_color": "#0f172a", "font_color": "#ffffff",
+        "align": "center", "valign": "vcenter", "border": 1, "border_color": "#0f172a",
+    })
+    period_fmt  = wb.add_format({"num_format": "0.000", "align": "right", "border": 1, "border_color": "#e2e8f0"})
+    number_fmt  = wb.add_format({"num_format": "0.00000", "align": "right", "border": 1, "border_color": "#e2e8f0"})
+    sci_fmt     = wb.add_format({"num_format": "0.000E+00", "align": "right", "border": 1, "border_color": "#e2e8f0"})
+
+    # ── Resumen ───────────────────────────────────────────────────────────────
+    ws = wb.add_worksheet("Resumen")
+    ws.set_column(0, 0, 28)
+    ws.set_column(1, 1, 60)
+    ws.write(0, 0, "Reporte completo — Análisis de acelerograma", title_fmt)
+    ws.write(1, 0, "PerformanceLabs")
+    meta = [
+        ("Registro",            record_db.name or ""),
+        ("Componente",          req.component or "default"),
+        ("Archivo origen",      record_db.source_file or ""),
+        ("dt (s)",              gm_rec.dt),
+        ("Muestras (npts)",     gm_rec.n_samples),
+        ("Duración (s)",        gm_rec.duration),
+        ("Nyquist (Hz)",        float(fft.get("nyquist_hz") or 0.0)),
+        ("Frec. dominante FFT (Hz)",   float(fft.get("dominant_freq_hz") or 0.0)),
+        ("Periodo dominante FFT (s)",  float(fft.get("dominant_period_s") or 0.0)),
+        ("Frec. dominante Welch (Hz)", float(welch.get("dominant_freq_hz") or 0.0)),
+        ("Intensidad de Arias total (m/s)", float(arias_total)),
+        ("T mín espectros (s)", req.T_min),
+        ("T máx espectros (s)", req.T_max),
+        ("Puntos del espectro", req.n_points),
+        ("Amortiguamientos ξ",  ", ".join(f"{xi * 100:g}%" for xi in req.xi_list)),
+        ("Método espectro",     "Newmark-β (β=1/4, γ=1/2, aceleración promedio constante)"),
+        ("Unidades",            "aceleración en m/s² (salvo Sa en g); Sd en cm; Sv en cm/s"),
+        ("Generado",            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+    ]
+    for i, (k, v) in enumerate(meta, start=3):
+        ws.write(i, 0, k, label_fmt)
+        ws.write(i, 1, v, value_fmt)
+
+    # ── FFT ───────────────────────────────────────────────────────────────────
+    ws = wb.add_worksheet("FFT")
+    ws.set_column(0, 3, 16)
+    ws.freeze_panes(1, 0)
+    for j, h in enumerate(["Frecuencia (Hz)", "Periodo (s)", "Amplitud (m/s²)", "Fase (rad)"]):
+        ws.write(0, j, h, header_fmt)
+    freqs = fft["freq"]
+    periods = fft["period"]
+    amps = fft["amplitude"]
+    phases = fft["phase"]
+    for i in range(len(freqs)):
+        ws.write_number(i + 1, 0, float(freqs[i]), number_fmt)
+        p = periods[i]
+        # Periodo = inf en freq=0 → dejamos en blanco para no romper el .xlsx.
+        if p is None or (isinstance(p, float) and (p == float("inf") or p != p)):
+            ws.write_blank(i + 1, 1, None, number_fmt)
+        else:
+            ws.write_number(i + 1, 1, float(p), number_fmt)
+        ws.write_number(i + 1, 2, float(amps[i]), sci_fmt)
+        ws.write_number(i + 1, 3, float(phases[i]), number_fmt)
+
+    # ── Welch PSD ─────────────────────────────────────────────────────────────
+    ws = wb.add_worksheet("Welch_PSD")
+    ws.set_column(0, 1, 18)
+    ws.freeze_panes(1, 0)
+    for j, h in enumerate(["Frecuencia (Hz)", "PSD ((m/s²)²/Hz)"]):
+        ws.write(0, j, h, header_fmt)
+    for i, (f_, p_) in enumerate(zip(welch["freq"], welch["psd"])):
+        ws.write_number(i + 1, 0, float(f_), number_fmt)
+        ws.write_number(i + 1, 1, float(p_), sci_fmt)
+
+    # ── Arias acumulada ───────────────────────────────────────────────────────
+    ws = wb.add_worksheet("Arias_Acumulada")
+    ws.set_column(0, 2, 18)
+    ws.freeze_panes(1, 0)
+    for j, h in enumerate(["t (s)", "Ia(t) (m/s)", "Ia(t)/Ia_total (%)"]):
+        ws.write(0, j, h, header_fmt)
+    ia_total_safe = float(arias_total) if arias_total > 1e-20 else 1.0
+    for i in range(len(time_vec)):
+        ws.write_number(i + 1, 0, float(time_vec[i]), number_fmt)
+        ws.write_number(i + 1, 1, float(arias_cum[i]), sci_fmt)
+        ws.write_number(i + 1, 2, float(arias_cum[i]) / ia_total_safe * 100.0, number_fmt)
+
+    # ── Espectros Sa, Sd, Sv (todos los ξ en una sola hoja) ───────────────────
+    ws = wb.add_worksheet("Espectros_Sa_Sd_Sv")
+    T = spec["T"]
+    xi_keys = sorted(spec["spectra"].keys(), key=lambda s: float(s))
+    n_xi = len(xi_keys)
+    ws.set_column(0, 0, 12)
+    ws.set_column(1, 1 + 3 * n_xi, 16)
+    ws.freeze_panes(1, 1)
+    ws.write(0, 0, "T (s)", header_fmt)
+    col = 1
+    for kind, unit, factor in [("Sa", "g", 1.0 / _G), ("Sd", "cm", 100.0), ("Sv", "cm/s", 100.0)]:
+        for xi_str in xi_keys:
+            xi = float(xi_str)
+            ws.write(0, col, f"{kind} {_xi_label(xi)} ({unit})", header_fmt)
+            col += 1
+    for i, t_val in enumerate(T, start=1):
+        ws.write_number(i, 0, float(t_val), period_fmt)
+        col = 1
+        for kind, _, factor in [("Sa", "g", 1.0 / _G), ("Sd", "cm", 100.0), ("Sv", "cm/s", 100.0)]:
+            for xi_str in xi_keys:
+                y = spec["spectra"][xi_str][kind][i - 1]
+                ws.write_number(i, col, float(y) * factor, number_fmt)
+                col += 1
+
+    wb.close()
+    return buf.getvalue()
+
+
+@router.post("/records/{record_id}/export-full-report")
+def export_full_report_endpoint(
+    record_id: str,
+    req: "SpectrumRequest",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Exporta un Excel con FFT, Welch PSD, Arias acumulada y espectros Sa/Sd/Sv.
+
+    Reusa los parámetros de ``SpectrumRequest`` (componente, xi_list, T_min/max,
+    n_points) para los espectros; FFT y Welch se calculan sobre la señal cruda
+    efectiva del canal elegido. Nombre de archivo:
+        {record}_reporte_completo.xlsx
+    """
+    from app.engine.ground_motion.analysis.intensity import (
+        compute_arias_cumulative, compute_arias_intensity,
+    )
+
+    record_db = _get_record_or_404(record_id, current_user.id, db)
+    gm_rec    = _load_record_data(record_db)
+
+    acc_ch = gm_rec.get_acceleration_channel(req.component)
+    if acc_ch is None:
+        raise HTTPException(404, "Canal de aceleración no encontrado.")
+    acc_ms2 = acc_ch.effective_values_si()
+
+    # 1. FFT  2. Welch PSD  3. Arias  4. Espectros
+    fft_data   = compute_fft(acc_ms2, gm_rec.dt)
+    welch_data = compute_psd_welch(acc_ms2, gm_rec.dt)
+    arias_cum  = compute_arias_cumulative(acc_ms2, gm_rec.dt)
+    arias_tot  = compute_arias_intensity(acc_ms2, gm_rec.dt)
+    time_vec   = np.arange(len(acc_ms2), dtype=float) * gm_rec.dt
+
+    T_array = default_period_array(req.T_min, req.T_max, req.n_points)
+    spec_result = response_spectrum_multi_xi(acc_ms2, gm_rec.dt, T_array, req.xi_list)
+
+    xlsx = _build_full_report_xlsx(
+        record_db, gm_rec, req,
+        fft_data, welch_data, arias_cum, arias_tot, time_vec, spec_result,
+    )
+
+    stem = _safe_filename(record_db.name)
+    comp = f"_{_safe_filename(req.component)}" if req.component else ""
+    filename = f"{stem}{comp}_reporte_completo.xlsx"
+    return StreamingResponse(
+        io.BytesIO(xlsx),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ── Endpoint: espectro de respuesta inelástica ───────────────────────────────
 
 @router.post("/records/{record_id}/inelastic-spectrum", response_model=dict)
@@ -1176,18 +1372,34 @@ def get_job_result(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _get_record_or_404(record_id: str, owner_id: str, db: Session) -> GroundMotionRecord:
+def _get_record_or_404(record_id: str, _user_id: str, db: Session) -> GroundMotionRecord:
+    """Lee cualquier registro existente (catalogo compartido).
+
+    `_user_id` se mantiene por retrocompatibilidad con todos los call sites del
+    router; la autorizacion de escritura vive en `_assert_owner_or_403`.
+    """
     rec = db.get(GroundMotionRecord, record_id)
-    if not rec or rec.owner_id != owner_id:
+    if not rec:
         raise HTTPException(404, "Registro de movimiento del suelo no encontrado.")
     return rec
 
 
-def _record_to_out(r: GroundMotionRecord) -> dict:
+def _assert_owner_or_403(rec: GroundMotionRecord, user_id: str) -> None:
+    """Rechaza si el usuario no es dueno del registro. Usar para delete/edit."""
+    if rec.owner_id != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Solo el propietario del registro puede modificarlo o eliminarlo.",
+        )
+
+
+def _record_to_out(r: GroundMotionRecord, current_user_id: str | None = None) -> dict:
     return {
         "id":                r.id,
         "name":              r.name,
         "source_file":       r.source_file,
+        "owner_id":          r.owner_id,
+        "is_owner":          (current_user_id is not None and r.owner_id == current_user_id),
         "dt":                r.dt,
         "n_samples":         r.n_samples,
         "duration":          r.duration,

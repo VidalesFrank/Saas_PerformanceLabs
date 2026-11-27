@@ -13,8 +13,10 @@ import {
 import {
   computeFFT,
   computeIntensity,
+  exportFullReport,
   getRecord,
   getTimeseries,
+  triggerDownload,
 } from '@/lib/ground-motion-api'
 import TimeHistoryPanel from '@/components/ground-motion/TimeHistoryPanel'
 import IntensityPanel from '@/components/ground-motion/IntensityPanel'
@@ -50,6 +52,20 @@ export default function GroundMotionDetailPage() {
   const [plotlyReady, setPlotlyReady] = useState(
     typeof window !== 'undefined' && !!(window as unknown as { Plotly?: unknown }).Plotly
   )
+  const [exporting, setExporting]   = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
+
+  const handleFullReport = async () => {
+    if (exporting) return
+    setExporting(true); setExportError(null)
+    try {
+      const { blob, filename } = await exportFullReport(id)
+      triggerDownload(blob, filename)
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : 'Error exportando reporte')
+    }
+    setExporting(false)
+  }
 
   const G = 9.80665
 
@@ -163,6 +179,26 @@ export default function GroundMotionDetailPage() {
               <SidebarStat label="Nyquist" value={record!.dt ? (0.5 / record!.dt).toFixed(1) + ' Hz' : '—'} />
               <SidebarStat label="Unidad" value={record!.acc_unit_original ?? '—'} />
               {pga_g_str !== '—' && <SidebarStat label="PGA" value={pga_g_str} accent />}
+            </div>
+
+            {/* Descarga de reporte completo */}
+            <div className="px-4 py-3 border-b border-[var(--border)]">
+              <button
+                onClick={handleFullReport}
+                disabled={exporting}
+                title="Excel con FFT, Welch PSD, Arias acumulada y espectros Sa/Sd/Sv en hojas separadas"
+                className="w-full px-3 py-2 rounded-lg text-xs font-semibold
+                           bg-[var(--accent)] text-white
+                           disabled:opacity-50 disabled:cursor-wait
+                           hover:opacity-90 transition-opacity shadow-sm
+                           flex items-center justify-center gap-2"
+              >
+                <span className="text-sm">⤓</span>
+                {exporting ? 'Generando Excel…' : 'Descargar reporte completo'}
+              </button>
+              {exportError && (
+                <p className="text-[11px] text-red-500 mt-2 leading-tight">{exportError}</p>
+              )}
             </div>
 
             {/* Navegación */}

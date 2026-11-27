@@ -193,6 +193,44 @@ export async function exportSpectrum(
   return { blob, filename }
 }
 
+export async function exportFullReport(
+  id: string,
+  params: {
+    component?: string
+    xi_list?: number[]
+    T_min?: number
+    T_max?: number
+    n_points?: number
+  } = {},
+): Promise<{ blob: Blob; filename: string }> {
+  const body = {
+    component: params.component ?? '',
+    xi_list:   params.xi_list   ?? [0.02, 0.05, 0.10],
+    T_min:     params.T_min     ?? 0.01,
+    T_max:     params.T_max     ?? 4.0,
+    n_points:  params.n_points  ?? 150,
+    multi_xi:  true,
+  }
+  const res = await fetch(`${BASE}/records/${id}/export-full-report`, {
+    method: 'POST',
+    headers: { ...authHeader(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`
+    try {
+      const b = await res.json()
+      msg = b.detail || b.message || msg
+    } catch {}
+    throw new Error(msg)
+  }
+  const dispo = res.headers.get('Content-Disposition') || ''
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(dispo)
+  const filename = match ? decodeURIComponent(match[1]) : `reporte_completo.xlsx`
+  const blob = await res.blob()
+  return { blob, filename }
+}
+
 export function triggerDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
