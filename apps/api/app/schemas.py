@@ -3,9 +3,26 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
-from app.models import Plan, ShapeType
+from app.models import Plan, ShapeType, UserRole
 
 # --- Auth ---
+
+# Modulos que un colaborador puede acceder. Cada entrada es un prefijo de ruta
+# del frontend (Next.js) que el guard `(app)/layout.tsx` compara contra
+# `pathname.startsWith(prefix)`. `admin` ve todo sin restriccion.
+COLLABORATOR_ALLOWED_MODULES: list[str] = [
+    "/dashboard",
+    "/ground-motion",
+    "/seismic",
+    "/catalog",
+]
+
+
+def allowed_modules_for(role: UserRole) -> list[str] | None:
+    """Devuelve la lista de prefijos permitidos, o None si no hay restriccion."""
+    if role == UserRole.admin:
+        return None
+    return list(COLLABORATOR_ALLOWED_MODULES)
 
 
 class UserCreate(BaseModel):
@@ -19,6 +36,8 @@ class UserOut(BaseModel):
     email: str
     full_name: str
     plan: Plan
+    role: UserRole
+    allowed_modules: list[str] | None = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

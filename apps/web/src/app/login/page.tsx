@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
 import { HeroShowcase3D } from "@/components/dashboard/HeroShowcase3D";
 import { ApiError, api } from "@/lib/api";
-import { setToken } from "@/lib/auth";
+import { CurrentUser, homeRouteFor, setMe, setToken } from "@/lib/auth";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -27,7 +27,15 @@ export default function LoginPage() {
         false,
       );
       setToken(access_token);
-      router.push("/dashboard");
+      // Traemos /me inmediatamente para saber el rol y decidir landing.
+      // Fallback a /dashboard si la peticion falla (el layout re-verifica).
+      try {
+        const me = await api.get<CurrentUser>("/api/v1/auth/me");
+        setMe(me);
+        router.push(homeRouteFor(me));
+      } catch {
+        router.push("/dashboard");
+      }
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "No se pudo iniciar sesión");
     } finally {

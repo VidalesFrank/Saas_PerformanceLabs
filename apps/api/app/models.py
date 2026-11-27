@@ -22,6 +22,11 @@ class Plan(str, enum.Enum):
     premium = "premium"
 
 
+class UserRole(str, enum.Enum):
+    admin = "admin"              # acceso total a toda la plataforma
+    collaborator = "collaborator"  # acceso limitado (gated por allowed_modules)
+
+
 class ShapeType(str, enum.Enum):
     rectangular = "rectangular"
     square = "square"
@@ -37,6 +42,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
     plan: Mapped[Plan] = mapped_column(Enum(Plan), default=Plan.free, nullable=False)
+    role: Mapped[UserRole] = mapped_column(Enum(UserRole), default=UserRole.admin, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     projects: Mapped[list["Project"]] = relationship(back_populates="owner", cascade="all, delete-orphan")

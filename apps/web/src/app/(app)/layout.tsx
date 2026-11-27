@@ -1,12 +1,14 @@
 "use client";
 
 import { Sidebar } from "@/components/sidebar";
-import { useRequireAuth } from "@/lib/use-require-auth";
+import { useAuthState } from "@/lib/use-require-auth";
 
 /** Shell compartido por todas las herramientas autenticadas: sidebar persistente
- * + guard de sesión centralizado (antes cada página llamaba useRequireAuth por su cuenta). */
+ * + guard de sesion centralizado. `useAuthState` tambien aplica el gating por
+ * rol: si un colaborador aterriza en una ruta fuera de `allowed_modules`, el
+ * hook redirige a su home antes de montar el contenido. */
 export default function AppGroupLayout({ children }: { children: React.ReactNode }) {
-  const ready = useRequireAuth();
+  const { ready } = useAuthState();
   if (!ready) return null;
 
   return (
