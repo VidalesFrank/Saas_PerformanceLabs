@@ -248,18 +248,33 @@ def library_available(db: Session, campaign: str = "colombia_2026_08_10") -> boo
     return bool(_build_catalog_sync(db, campaign))
 
 
+def _find_catalog_record(db: Session, record_name: str, campaign: str):
+    """Localiza el GroundMotionRecord del catálogo de forma determinística.
+
+    Filtra por ``metadata_json->>'campaign'`` para evitar colisiones con imports
+    manuales que usan el mismo ``name`` (p. ej. un usuario cargó CPER6_EW aparte).
+    Si aún así hay múltiples hits, devuelve el más antiguo (primer ``id`` lexicográfico).
+    """
+    from app.models import GroundMotionRecord
+    candidates = (
+        db.query(GroundMotionRecord)
+        .filter(GroundMotionRecord.name == record_name)
+        .order_by(GroundMotionRecord.created_at.asc(), GroundMotionRecord.id.asc())
+        .all()
+    )
+    for r in candidates:
+        if (r.metadata_json or {}).get("campaign") == campaign:
+            return r
+    return None
+
+
 def read_record_timeseries(
     db: Session, record_name: str, campaign: str = "colombia_2026_08_10",
     max_points: int = 600,
 ) -> dict:
     """Timeseries decimado para preview rápido en UI."""
-    from app.models import GroundMotionRecord
-    rec = (
-        db.query(GroundMotionRecord)
-        .filter(GroundMotionRecord.name == record_name)
-        .first()
-    )
-    if rec is None or (rec.metadata_json or {}).get("campaign") != campaign:
+    rec = _find_catalog_record(db, record_name, campaign)
+    if rec is None:
         raise FileNotFoundError(f"Registro {record_name} no encontrado en campaña {campaign}")
     dt_rec, ag = _load_signal(rec)
     n_full = int(len(ag))
@@ -332,29 +347,25 @@ def compute_scale_for_pair(
     )
 
 
-def get_record_path(record_name: str, db: Session) -> str:
+def get_record_path(
+    record_name: str, db: Session,
+    campaign: str = "colombia_2026_08_10",
+) -> str:
     """Ruta absoluta al archivo .AT2 de un registro (usado por el task Celery)."""
-    from app.models import GroundMotionRecord
-    rec = (
-        db.query(GroundMotionRecord)
-        .filter(GroundMotionRecord.name == record_name)
-        .first()
-    )
+    rec = _find_catalog_record(db, record_name, campaign)
     if rec is None:
-        raise FileNotFoundError(f"Registro {record_name} no encontrado en DB.")
+        raise FileNotFoundError(f"Registro {record_name} no encontrado en campaña {campaign}.")
     if not rec.source_file or not os.path.exists(rec.source_file):
         raise FileNotFoundError(f"source_file faltante para {record_name}: {rec.source_file}")
     return rec.source_file
 
 
-def get_record_dt(record_name: str, db: Session) -> float:
+def get_record_dt(
+    record_name: str, db: Session,
+    campaign: str = "colombia_2026_08_10",
+) -> float:
     """dt (s) de un registro (leído de la DB)."""
-    from app.models import GroundMotionRecord
-    rec = (
-        db.query(GroundMotionRecord)
-        .filter(GroundMotionRecord.name == record_name)
-        .first()
-    )
+    rec = _find_catalog_record(db, record_name, campaign)
     if rec is None or rec.dt is None:
-        raise ValueError(f"dt no disponible para {record_name}")
+        raise ValueError(f"dt no disponible para {record_name} en campaña {campaign}")
     return float(rec.dt)

@@ -60,10 +60,12 @@ _FEMA_DT: list[float] = [
 ]
 
 # Períodos para el espectro de respuesta precomputado (s).
-# Resolución suficiente para selección visual + línea de T1 del edificio.
+# 200 puntos log-spaced entre 0.05 s y 4.0 s para que el pico Sa se localice
+# con precisión (la grilla previa de 18 puntos tenía huecos de hasta 500 ms
+# entre T=1.5 y T=4.0 — dejaba picos reales invisibles para el usuario).
 _SPECTRUM_PERIODS: list[float] = [
-    0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50,
-    0.60, 0.75, 1.00, 1.25, 1.50, 2.00, 2.50, 3.00, 3.50, 4.00,
+    round(float(T), 5)
+    for T in np.logspace(np.log10(0.05), np.log10(4.0), 200)
 ]
 
 # Directorio donde viven los 44 .txt dentro del container.
